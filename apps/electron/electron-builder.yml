@@ -1,5 +1,5 @@
 appId: com.lukilabs.craft-agent
-productName: Craft Agents
+productName: AgentNative
 copyright: Copyright © 2025 Craft Docs Ltd.
 
 electronVersion: "39.2.7"
@@ -99,7 +99,7 @@ dmg:
   # Use app icon as the mounted volume icon in Finder
   icon: resources/icon.icns
   iconSize: 80
-  title: "Craft Agents"
+  title: "AgentNative"
   contents:
     - x: 130
       y: 200

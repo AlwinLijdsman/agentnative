@@ -40,8 +40,9 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 # Finder (MacOS) folder config
 .DS_Store
 
-# Claude Code local settings (user-specific)
+# Claude Code local settings (user-specific, do not commit)
 .claude/settings.local.json
+# Note: plan.md at project root is intentionally git-tracked
 
 # Accidental literal tilde directories (Node.js doesn't expand ~)
 ~/

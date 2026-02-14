@@ -1,14 +1,19 @@
 /**
  * Cross-platform electron dev script
  * Replaces platform-specific npm scripts with a unified TypeScript solution
+ * Ported from Bun to Node.js/tsx for Windows ARM64 compatibility
  */
 
-import { spawn, type Subprocess } from "bun";
+import { spawn, execSync, type ChildProcess } from "child_process";
 import { existsSync, rmSync, cpSync, readFileSync, statSync, mkdirSync } from "fs";
-import { join, basename } from "path";
+import { join, basename, dirname } from "path";
+import { fileURLToPath } from "url";
 import * as esbuild from "esbuild";
 
-const ROOT_DIR = join(import.meta.dir, "..");
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+const ROOT_DIR = join(__dirname, "..");
 const ELECTRON_DIR = join(ROOT_DIR, "apps/electron");
 const DIST_DIR = join(ELECTRON_DIR, "dist");
 
@@ -18,16 +23,18 @@ const SESSION_SERVER_OUTPUT = join(SESSION_SERVER_DIR, "dist/index.js");
 const BRIDGE_SERVER_DIR = join(ROOT_DIR, "packages/bridge-mcp-server");
 const BRIDGE_SERVER_OUTPUT = join(BRIDGE_SERVER_DIR, "dist/index.js");
 
-// Platform-specific binary paths (bun creates .exe on Windows, no extension on Unix)
+// Platform-specific binary paths
 const IS_WINDOWS = process.platform === "win32";
-const BIN_EXT = IS_WINDOWS ? ".exe" : "";
+const BIN_EXT = IS_WINDOWS ? ".cmd" : "";
 const VITE_BIN = join(ROOT_DIR, `node_modules/.bin/vite${BIN_EXT}`);
 const ELECTRON_BIN = join(ROOT_DIR, `node_modules/.bin/electron${BIN_EXT}`);
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 // Multi-instance detection (matches detect-instance.sh logic)
-// Detects instance number from folder name suffix (e.g., craft-agents-1 → instance 1)
 function detectInstance(): void {
-  // Don't override if already set (e.g., by sourcing detect-instance.sh first)
   if (process.env.CRAFT_VITE_PORT) return;
 
   const folderName = basename(ROOT_DIR);
@@ -37,8 +44,8 @@ function detectInstance(): void {
     const instanceNum = match[1];
     process.env.CRAFT_INSTANCE_NUMBER = instanceNum;
     process.env.CRAFT_VITE_PORT = `${instanceNum}173`;
-    process.env.CRAFT_APP_NAME = `Craft Agents [${instanceNum}]`;
-    process.env.CRAFT_CONFIG_DIR = join(process.env.HOME || "", `.craft-agent-${instanceNum}`);
+    process.env.CRAFT_APP_NAME = `AgentNative [${instanceNum}]`;
+    process.env.CRAFT_CONFIG_DIR = join(process.env.HOME || process.env.USERPROFILE || "", `.craft-agent-${instanceNum}`);
     process.env.CRAFT_DEEPLINK_SCHEME = `craftagents${instanceNum}`;
     console.log(`🔢 Instance ${instanceNum} detected: port=${process.env.CRAFT_VITE_PORT}, config=${process.env.CRAFT_CONFIG_DIR}`);
   }
@@ -56,7 +63,6 @@ function loadEnvFile(): void {
         if (eqIndex > 0) {
           const key = trimmed.slice(0, eqIndex).trim();
           let value = trimmed.slice(eqIndex + 1).trim();
-          // Remove surrounding quotes if present
           if ((value.startsWith('"') && value.endsWith('"')) ||
               (value.startsWith("'") && value.endsWith("'"))) {
             value = value.slice(1, -1);
@@ -71,20 +77,9 @@ function loadEnvFile(): void {
 
 // Kill any process using the specified port
 async function killProcessOnPort(port: string): Promise<void> {
-  const isWindows = process.platform === "win32";
-
   try {
-    if (isWindows) {
-      // Windows: use netstat to find PID, then taskkill
-      const netstat = spawn({
-        cmd: ["cmd", "/c", `netstat -ano | findstr :${port}`],
-        stdout: "pipe",
-        stderr: "pipe",
-      });
-      const output = await new Response(netstat.stdout).text();
-      await netstat.exited;
-
-      // Parse PIDs from netstat output (last column)
+    if (IS_WINDOWS) {
+      const output = execSync(`netstat -ano | findstr :${port}`, { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }).toString();
       const pids = new Set<string>();
       for (const line of output.split("\n")) {
         const parts = line.trim().split(/\s+/);
@@ -95,33 +90,18 @@ async function killProcessOnPort(port: string): Promise<void> {
           }
         }
       }
-
-      // Kill each PID
       for (const pid of pids) {
-        const kill = spawn({
-          cmd: ["taskkill", "/PID", pid, "/F"],
-          stdout: "pipe",
-          stderr: "pipe",
-        });
-        await kill.exited;
+        try {
+          execSync(`taskkill /PID ${pid} /F`, { stdio: "pipe" });
+        } catch {
+          // Process may already be dead
+        }
       }
-
       if (pids.size > 0) {
         console.log(`🔪 Killed ${pids.size} process(es) on port ${port}`);
       }
     } else {
-      // Mac/Linux: use lsof and kill
-      const lsof = spawn({
-        cmd: ["sh", "-c", `lsof -ti:${port} | xargs kill -9 2>/dev/null || true`],
-        stdout: "pipe",
-        stderr: "pipe",
-      });
-      const output = await new Response(lsof.stdout).text();
-      await lsof.exited;
-
-      if (output.trim()) {
-        console.log(`🔪 Killed process(es) on port ${port}`);
-      }
+      execSync(`lsof -ti:${port} | xargs kill -9 2>/dev/null || true`, { stdio: "pipe" });
     }
   } catch {
     // Ignore errors - port may not be in use
@@ -147,17 +127,15 @@ function copyResources(): void {
   }
 }
 
-// Build MCP servers for Codex sessions (one-time, no watch needed)
+// Build MCP servers for Codex sessions
 async function buildMcpServers(): Promise<void> {
   console.log("🌉 Building MCP servers for Codex sessions...");
 
-  // Ensure dist directories exist
   const sessionDistDir = join(SESSION_SERVER_DIR, "dist");
   const bridgeDistDir = join(BRIDGE_SERVER_DIR, "dist");
   if (!existsSync(sessionDistDir)) mkdirSync(sessionDistDir, { recursive: true });
   if (!existsSync(bridgeDistDir)) mkdirSync(bridgeDistDir, { recursive: true });
 
-  // Build both servers in parallel
   const [sessionResult, bridgeResult] = await Promise.all([
     runEsbuild(
       "packages/session-mcp-server/src/index.ts",
@@ -209,15 +187,11 @@ function getOAuthDefines(): Record<string, string> {
 function getElectronEnv(): Record<string, string> {
   const vitePort = process.env.CRAFT_VITE_PORT || "5173";
 
-  // Codex binary path is resolved at runtime by the binary-resolver module.
-  // It checks: CODEX_PATH env var > bundled binary > local dev fork > system PATH.
-  // You can override with CODEX_PATH env var if needed for debugging.
-
   return {
     ...process.env as Record<string, string>,
     VITE_DEV_SERVER_URL: `http://localhost:${vitePort}`,
     CRAFT_CONFIG_DIR: process.env.CRAFT_CONFIG_DIR || "",
-    CRAFT_APP_NAME: process.env.CRAFT_APP_NAME || "Craft Agents",
+    CRAFT_APP_NAME: process.env.CRAFT_APP_NAME || "AgentNative",
     CRAFT_DEEPLINK_SCHEME: process.env.CRAFT_DEEPLINK_SCHEME || "craftagents",
     CRAFT_INSTANCE_NUMBER: process.env.CRAFT_INSTANCE_NUMBER || "",
   };
@@ -248,22 +222,15 @@ async function runEsbuild(
   }
 }
 
-// Verify a JavaScript file exists and has content.
-// Note: We don't use `node --check` because it evaluates module-level code,
-// which fails for Electron-specific packages like @sentry/electron that
-// require Electron's runtime. esbuild's successful build already guarantees
-// valid JavaScript syntax.
+// Verify a JavaScript file exists and has content
 async function verifyJsFile(filePath: string): Promise<{ valid: boolean; error?: string }> {
   if (!existsSync(filePath)) {
     return { valid: false, error: "File does not exist" };
   }
-
-  // Check file has content
   const stats = statSync(filePath);
   if (stats.size === 0) {
     return { valid: false, error: "File is empty" };
   }
-
   return { valid: true };
 }
 
@@ -275,14 +242,13 @@ async function waitForFileStable(filePath: string, timeoutMs = 10000): Promise<b
 
   while (Date.now() - startTime < timeoutMs) {
     if (!existsSync(filePath)) {
-      await Bun.sleep(100);
+      await sleep(100);
       continue;
     }
 
     const stats = statSync(filePath);
     if (stats.size === lastSize) {
       stableCount++;
-      // File size unchanged for 3 checks (300ms) - consider it stable
       if (stableCount >= 3) {
         return true;
       }
@@ -291,7 +257,7 @@ async function waitForFileStable(filePath: string, timeoutMs = 10000): Promise<b
       lastSize = stats.size;
     }
 
-    await Bun.sleep(100);
+    await sleep(100);
   }
 
   return false;
@@ -305,20 +271,16 @@ async function main(): Promise<void> {
   loadEnvFile();
   cleanViteCache();
 
-  // Ensure dist directory exists
   if (!existsSync(DIST_DIR)) {
     mkdirSync(DIST_DIR, { recursive: true });
   }
 
   copyResources();
-
-  // Build MCP servers for Codex sessions
   await buildMcpServers();
 
   const vitePort = process.env.CRAFT_VITE_PORT || "5173";
   const oauthDefines = getOAuthDefines();
 
-  // Kill any existing process on the Vite port
   await killProcessOnPort(vitePort);
 
   // =========================================================
@@ -329,11 +291,9 @@ async function main(): Promise<void> {
   const mainCjsPath = join(DIST_DIR, "main.cjs");
   const preloadCjsPath = join(DIST_DIR, "preload.cjs");
 
-  // Remove old build files to ensure fresh build
   if (existsSync(mainCjsPath)) rmSync(mainCjsPath);
   if (existsSync(preloadCjsPath)) rmSync(preloadCjsPath);
 
-  // Build main and preload in parallel
   const [mainResult, preloadResult] = await Promise.all([
     runEsbuild(
       "apps/electron/src/main/index.ts",
@@ -356,7 +316,6 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // Wait for files to stabilize (filesystem flush)
   console.log("⏳ Waiting for build files to stabilize...");
   const [mainStable, preloadStable] = await Promise.all([
     waitForFileStable(mainCjsPath),
@@ -368,7 +327,6 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // Verify the built files are valid JavaScript
   console.log("🔍 Verifying build output...");
   const [mainValid, preloadValid] = await Promise.all([
     verifyJsFile(mainCjsPath),
@@ -392,21 +350,19 @@ async function main(): Promise<void> {
   // =========================================================
   console.log("📡 Starting dev servers...\n");
 
-  const processes: Subprocess[] = [];
+  const childProcesses: ChildProcess[] = [];
   const esbuildContexts: esbuild.BuildContext[] = [];
 
-  // 1. Vite dev server (strictPort ensures we don't silently switch ports)
-  const viteProc = spawn({
-    cmd: [VITE_BIN, "dev", "--config", "apps/electron/vite.config.ts", "--port", vitePort, "--strictPort"],
+  // 1. Vite dev server
+  const viteProc = spawn(VITE_BIN, ["dev", "--config", "apps/electron/vite.config.ts", "--port", vitePort, "--strictPort"], {
     cwd: ROOT_DIR,
-    stdin: "ignore",
-    stdout: "inherit",
-    stderr: "inherit",
+    stdio: ["ignore", "inherit", "inherit"],
     env: process.env as Record<string, string>,
+    shell: IS_WINDOWS,
   });
-  processes.push(viteProc);
+  childProcesses.push(viteProc);
 
-  // 2. Main process watcher (using esbuild watch API)
+  // 2. Main process watcher
   const mainContext = await esbuild.context({
     entryPoints: [join(ROOT_DIR, "apps/electron/src/main/index.ts")],
     bundle: true,
@@ -421,7 +377,7 @@ async function main(): Promise<void> {
   esbuildContexts.push(mainContext);
   console.log("👀 Watching main process...");
 
-  // 3. Preload watcher (using esbuild watch API)
+  // 3. Preload watcher
   const preloadContext = await esbuild.context({
     entryPoints: [join(ROOT_DIR, "apps/electron/src/preload/index.ts")],
     bundle: true,
@@ -435,23 +391,20 @@ async function main(): Promise<void> {
   esbuildContexts.push(preloadContext);
   console.log("👀 Watching preload...");
 
-  // 4. Start Electron (build already verified)
+  // 4. Start Electron
   console.log("🚀 Starting Electron...\n");
 
-  const electronProc = spawn({
-    cmd: [ELECTRON_BIN, "apps/electron"],
+  const electronProc = spawn(ELECTRON_BIN, ["apps/electron"], {
     cwd: ROOT_DIR,
-    stdin: "ignore",
-    stdout: "inherit",
-    stderr: "inherit",
+    stdio: ["ignore", "inherit", "inherit"],
     env: getElectronEnv(),
+    shell: IS_WINDOWS,
   });
-  processes.push(electronProc);
+  childProcesses.push(electronProc);
 
   // Handle cleanup on exit
   const cleanup = async () => {
     console.log("\n🛑 Shutting down...");
-    // Dispose esbuild contexts
     for (const ctx of esbuildContexts) {
       try {
         await ctx.dispose();
@@ -459,8 +412,7 @@ async function main(): Promise<void> {
         // Context may already be disposed
       }
     }
-    // Kill subprocesses
-    for (const proc of processes) {
+    for (const proc of childProcesses) {
       try {
         proc.kill();
       } catch {
@@ -473,14 +425,12 @@ async function main(): Promise<void> {
   process.on("SIGINT", () => cleanup());
   process.on("SIGTERM", () => cleanup());
 
-  // Windows doesn't have SIGINT/SIGTERM in the same way
   if (process.platform === "win32") {
     process.on("SIGHUP", () => cleanup());
   }
 
-  // Wait for electron to exit (main process)
-  await electronProc.exited;
-  await cleanup();
+  // Wait for electron to exit
+  electronProc.on("exit", () => cleanup());
 }
 
 main().catch((err) => {

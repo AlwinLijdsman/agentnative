@@ -11,9 +11,11 @@
  */
 
 import { existsSync, cpSync, mkdirSync } from "fs";
-import { join } from "path";
+import { join, dirname } from "path";
+import { fileURLToPath } from "url";
 
-const ROOT_DIR = join(import.meta.dir, "..");
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const ROOT_DIR = join(__dirname, "..");
 const ELECTRON_DIR = join(ROOT_DIR, "apps/electron");
 
 const srcDir = join(ROOT_DIR, "packages/shared/assets/docs");

@@ -2096,6 +2096,20 @@ export class ClaudeAgent extends BaseAgent {
         canRetry: true,
         retryDelayMs: 2000,
       },
+      'max_output_tokens': {
+        code: 'invalid_request',
+        title: 'Output Limit Reached',
+        message: 'The response exceeded the maximum output token limit.',
+        details: [
+          'The model generated more output than allowed',
+          'Try breaking your request into smaller parts',
+        ],
+        actions: [
+          { key: 'r', label: 'Retry', action: 'retry' },
+        ],
+        canRetry: true,
+        retryDelayMs: 1000,
+      },
       'unknown': {
         code: 'unknown_error',
         title: 'Unknown Error',

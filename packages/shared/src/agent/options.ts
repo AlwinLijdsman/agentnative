@@ -197,17 +197,26 @@ export function getDefaultOptions(): Partial<Options> {
     if (customPathToClaudeCodeExecutable) {
         const executableArgs = [envFileFlag];
         // Add interceptor preload if path is set (needed for cache TTL patching)
+        // --preload is Bun-only; for Node.js use --require (CJS) but skip .ts files
         if (customInterceptorPath) {
-            executableArgs.push('--preload', customInterceptorPath);
+            const isBunExecutable = (customExecutable || '').includes('bun');
+            if (isBunExecutable) {
+                executableArgs.push('--preload', customInterceptorPath);
+            } else if (customInterceptorPath.endsWith('.cjs') || customInterceptorPath.endsWith('.js')) {
+                executableArgs.push('--require', customInterceptorPath);
+            }
+            // Skip .ts interceptors under Node.js — they require a TypeScript loader
         }
         return {
             pathToClaudeCodeExecutable: customPathToClaudeCodeExecutable,
-            // Use custom executable if set, otherwise default to 'bun'
-            executable: (customExecutable || 'bun') as 'bun',
+            // Use custom executable if set, otherwise default to 'node'
+            executable: (customExecutable || 'node') as 'bun',
             executableArgs,
             env: {
                 ...process.env,
                 ... optionsEnv,
+                // Prevent "nested session" detection when launched from a Claude Code CLI session
+                CLAUDECODE: '',
                 // Propagate debug mode from argv flag OR existing env var
                 CRAFT_DEBUG: (process.argv.includes('--debug') || process.env.CRAFT_DEBUG === '1') ? '1' : '0',
             }
@@ -228,6 +237,8 @@ export function getDefaultOptions(): Partial<Options> {
                 ...process.env,
                 BUN_BE_BUN: '1',
                 ... optionsEnv,
+                // Prevent "nested session" detection when launched from a Claude Code CLI session
+                CLAUDECODE: '',
                 // Propagate debug mode from argv flag OR existing env var
                 CRAFT_DEBUG: (process.argv.includes('--debug') || process.env.CRAFT_DEBUG === '1') ? '1' : '0',
             }
@@ -238,6 +249,8 @@ export function getDefaultOptions(): Partial<Options> {
         env: {
             ... process.env,
             ... optionsEnv,
+            // Prevent "nested session" detection when launched from a Claude Code CLI session
+            CLAUDECODE: '',
             // Propagate debug mode from argv flag OR existing env var
             CRAFT_DEBUG: (process.argv.includes('--debug') || process.env.CRAFT_DEBUG === '1') ? '1' : '0',
         }

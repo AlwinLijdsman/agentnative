@@ -1,12 +1,17 @@
 /**
  * Cross-platform renderer build script
+ * Modified for Node.js/tsx compatibility (Windows ARM64 support)
  */
 
-import { spawn } from "bun";
+import { spawn } from "child_process";
 import { existsSync, rmSync } from "fs";
-import { join } from "path";
+import { join, dirname } from "path";
+import { fileURLToPath } from "url";
 
-const ROOT_DIR = join(import.meta.dir, "..");
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+const ROOT_DIR = join(__dirname, "..");
 const ELECTRON_DIR = join(ROOT_DIR, "apps/electron");
 
 // Clean renderer dist first
@@ -15,12 +20,21 @@ if (existsSync(rendererDir)) {
   rmSync(rendererDir, { recursive: true, force: true });
 }
 
-const proc = spawn({
-  cmd: ["bun", "run", "vite", "build", "--config", "apps/electron/vite.config.ts"],
-  cwd: ROOT_DIR,
-  stdout: "inherit",
-  stderr: "inherit",
-});
+function runCommand(cmd: string, args: string[], cwd: string = ROOT_DIR): Promise<number> {
+  return new Promise((resolve) => {
+    const child = spawn(cmd, args, {
+      cwd,
+      stdio: "inherit",
+      shell: true,
+    });
+    child.on("close", (code) => resolve(code ?? 1));
+    child.on("error", () => resolve(1));
+  });
+}
 
-const exitCode = await proc.exited;
-process.exit(exitCode);
+async function main(): Promise<void> {
+  const exitCode = await runCommand("npx", ["vite", "build", "--config", "apps/electron/vite.config.ts"]);
+  process.exit(exitCode);
+}
+
+main();
