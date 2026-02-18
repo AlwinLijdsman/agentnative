@@ -1,71 +1,64 @@
-# Plan: Auto-Enable Agent-Required Sources on Agent Mention
+# Plan: Git Branch Hygiene & Commit/Push Workflow in Copilot Agents
 
-> Status markers: [ ] pending | [x] done | [~] in progress | [-] skipped
-> Predecessor: Archived to plans/260218-generic-e2e-test-framework.md
+> Status markers: `[ ]` pending | `[x]` done | `[~]` in progress | `[-]` skipped
+> Predecessor: Archived to `plans/260218-auto-enable-agent-sources.md`
 
 ## Goal
 
-When a user sends a message that mentions an agent (e.g. `[agent:isa-deep-research]`), automatically add the agent's required sources (declared in AGENT.md frontmatter) to the session's `enabledSourceSlugs` **before** source servers are built. This eliminates the agent wasting 5+ tool calls discovering and activating its own sources at runtime via `onSourceActivationRequest`.
+Update the `.github/agents/` agent definitions so that:
+
+1. **Plan Changes** (`research-and-plan`) — before researching, checks the current git branch and ensures we're not developing on `main`. Creates or switches to a feature branch if needed.
+2. **Build Continuously** (`carefully-implement-full-phased-plan`) — after all phases pass and user confirms, archives `plan.md`, commits all changes, and pushes to the feature branch.
+3. **Build Step-by-Step** (`carefully-implement-phased-plan`) — same commit/push finalization as Build Continuously, but triggered after the last phase is approved.
 
 ## Analysis
 
-### Problem
+### Agents to Modify
 
-The `isa-deep-research` agent declares `sources: [{ slug: isa-knowledge-base, required: true }]` in its AGENT.md, but when invoked via `[agent:isa-deep-research]`, the session only has `["agentnative"]` in `enabledSourceSlugs` (from workspace defaults). The agent wastes token-expensive tool calls discovering the ISA knowledge base source is inactive, checking its config, testing the connection, and activating it — all before starting its actual Stage 0 work.
+| Agent File | Role | Change |
+|---|---|---|
+| `research-and-plan.agent.md` | Plan Changes | Add "Branch Check" step before research. Detect current branch, warn if on `main`, offer to create feature branch |
+| `carefully-implement-full-phased-plan.agent.md` | Build Continuously | Add "Finalize & Push" step after all phases. Archive plan, commit, push |
+| `carefully-implement-phased-plan.agent.md` | Build Step-by-Step | Add "Finalize & Push" step after last phase approved. Archive plan, commit, push |
 
-### Key Findings
+### Agents NOT Modified
 
-1. **Agent source declarations already parsed** — `AgentMetadata.sources` (type `AgentSourceBinding[]`) is populated from AGENT.md YAML frontmatter by `parseAgentFile()` in `packages/shared/src/agents/storage.ts`. The `isa-deep-research` agent declares `isa-knowledge-base` as `required: true`.
-
-2. **Session `enabledSourceSlugs`** is set from workspace config defaults during `createSession()` in `apps/electron/src/main/sessions.ts` — no agent-awareness at session creation time.
-
-3. **Reactive fallback** exists via `onSourceActivationRequest` — when agent hits an inactive source tool, it auto-enables it. This works but wastes tokens on discovery overhead.
-
-4. **Correct hook point** is in `sendMessage()`, after `sendSpan.mark('sources.loaded')` and before the `if (managed.enabledSourceSlugs?.length)` block. At this point, `workspaceRootPath` is declared and any new slugs added to `managed.enabledSourceSlugs` will feed directly into the existing source-building block.
-
-5. **`loadWorkspaceAgents` needs top-level import** — currently only used via dynamic import elsewhere.
-
-6. **Early exit guard** — only load agents if message text contains `[agent:` to avoid unnecessary I/O on every message.
-
-### Key Files
-
-| File | Role | Changes |
-|------|------|---------|
-| `apps/electron/src/main/sessions.ts` | SessionManager | Add top-level import + agent source auto-enable in `sendMessage()` |
-| `packages/shared/src/agents/storage.ts` | Agent loading | No changes needed |
-| `packages/shared/src/agents/types.ts` | AgentSourceBinding type | No changes needed |
-| `packages/shared/src/mentions/index.ts` | Mention parsing | No changes needed |
+| Agent File | Why |
+|---|---|
+| `adversarial-reviewer.agent.md` | Read-only agent — no git operations |
+| `code-researcher.agent.md` | Read-only agent — no git operations |
+| `e2e-test-runner.agent.md` | Test runner — doesn't own the commit lifecycle |
 
 ---
 
 ## Phases
 
-### Phase 1: Auto-Enable Agent Required Sources in sendMessage
+### Phase 1: Update `research-and-plan.agent.md` — Branch Check
 
-- [x] Add top-level import for `loadWorkspaceAgents` from `@craft-agent/shared/agents`
-- [x] Add top-level import for `parseMentions` from `@craft-agent/shared/mentions`
-- [x] In `sendMessage()`, insert auto-enable block after `sendSpan.mark('sources.loaded')` and before `if (managed.enabledSourceSlugs?.length)`:
-  - Early exit guard: `if (!message.includes('[agent:'))` — skip the entire block
-  - Load workspace agents, extract slugs, parse mentions
-  - For each detected agent, check `metadata.sources` for `required: true` bindings
-  - Auto-add usable required sources to `managed.enabledSourceSlugs`
-  - Emit `sources_changed` event and persist session if any sources added
-- [x] Validate: `pnpm run typecheck:all`
-- [x] Validate: `pnpm run lint` (0 new errors — 5 pre-existing errors unrelated to this change)
+- [ ] Insert "Step 0.5: Branch & Git Check" between Step 0 and Step 1
+- [ ] Validate: agent file loads in VS Code Copilot Chat
 
-### Phase 2: Testing
+### Phase 2: Update `carefully-implement-full-phased-plan.agent.md` — Finalize & Push
 
-- [ ] Manual test: Send `[agent:isa-deep-research] test query` to a new session with only `["agentnative"]` enabled
-- [ ] Verify `isa-knowledge-base` appears in `enabledSourceSlugs` before the first tool call
-- [ ] Verify the agent proceeds directly to Stage 0 without source discovery overhead
-- [ ] Verify sessions that already have the source enabled aren't affected
-- [ ] Verify messages without `[agent:` don't trigger any agent loading
+- [ ] Insert "Step 5: Finalize & Push" after Step 4
+- [ ] Validate: agent file loads in VS Code Copilot Chat
+
+### Phase 3: Update `carefully-implement-phased-plan.agent.md` — Finalize & Push
+
+- [ ] Insert "Step 5: Finalize & Push" after Step 4
+- [ ] Validate: agent file loads in VS Code Copilot Chat
+
+### Phase 4: Smoke Test
+
+- [ ] Verify all 3 modified agent files have no syntax errors
+- [ ] Commit and push changes
 
 ## Risks & Considerations
 
 | Risk | Mitigation |
-|------|-----------|
-| Source may not be usable (disabled/needs auth) | Only auto-enable sources that pass `isSourceUsable()` check; log warning for unusable required sources |
-| Performance: loading agents on every message | Early exit guard `message.includes('[agent:')` means zero I/O for non-agent messages |
-| Agent mentioned but not actually invoked | Acceptable — source would get enabled via `onSourceActivationRequest` anyway |
-| Multiple agents with overlapping required sources | Merge using Set semantics — duplicates handled naturally |
+|---|---|
+| Agent tries to commit secrets | Pre-commit check scans staged file names for session/credential patterns |
+| `nul` files on Windows block `git add -A` | `.gitignore` already excludes `nul`; agent catches error and skips |
+| User doesn't want to commit yet | Always ask before committing; "no" is a clean exit |
+| Branch already exists remotely | `git push` will just update it; no force-push |
+| Plan title has special characters | Slugify: lowercase, replace spaces with hyphens, strip non-alphanumeric |
