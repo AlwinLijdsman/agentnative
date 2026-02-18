@@ -128,6 +128,38 @@ After the last phase:
 
 Present files modified, validation results, and next steps (review handoff).
 
+### Step 5: Finalize & Push
+
+After the final summary, ask the user:
+
+> "All phases complete and validated. Ready to commit and push to the current branch? (yes / no)"
+
+**If user says yes**, execute this sequence:
+
+1. **Branch safety check**: Run `git branch --show-current`
+   - If on `main` — **WARN**: "You're on main. It's safer to create a feature branch first. Continue anyway? (yes / create branch)"
+   - If user wants a branch → `git checkout -b feature/{plan-slug}`
+2. **Archive plan.md**: Copy `./plan.md` → `./plans/YYMMDD-{slug}.md` (use current date)
+3. **Clean plan.md**: Replace contents with a stub:
+   ```
+   # Plan
+   > No active plan. Use the Plan Changes agent to create one.
+   ```
+4. **Stage changes**: Run `git add -A`
+   - If `git add` fails (e.g., `nul` file on Windows), retry with explicit paths excluding `nul`
+5. **Secrets scan**: Run `git diff --staged --name-only` and check for files matching patterns: `session.jsonl`, `credentials`, `secret`, `*.pem`, `*.key`
+   - If found, **WARN**: "These staged files may contain secrets: [list]. Remove them from staging? (yes / no)"
+   - If yes → `git reset HEAD -- {files}` for each
+6. **Show staged summary**: Run `git diff --staged --stat` and display to user
+7. **Generate commit message**: Derive from plan title — format: `feat: {plan-title-slug}`
+   - Show to user: "Commit message: `feat: {title}`. OK or amend?"
+   - If user amends → use their message
+8. **Commit**: Run `git commit -m "{message}"`
+9. **Push**: Run `git push -u origin {branch}` (the `-u` sets upstream for new branches)
+10. **Report result**: Show the push output and confirm success
+
+**If user says no**, skip this step entirely and end.
+
 ## Error Handling
 
 | Situation | Action |

@@ -61,6 +61,27 @@ Before writing a new plan, check the state of the existing `./plan.md`:
    - If ALL `[ ]`  plan was never started. Overwrite it.
 4. **Archival**  when archiving, move to `./plans/YYMMDD-{slug}.md`
 
+### Step 0.5: Branch & Git Check
+
+Before any research, verify you are on the correct git branch:
+
+1. **Check current branch**: Run `git branch --show-current`
+2. **If on `main`**:
+   - **WARN the user**:
+     > "You're on `main`. Feature work should happen on a branch. Suggested branch: `feature/{slug-from-request}`."
+     > "Should I create it? (yes / use a different name / stay on main)"
+   - If user approves → run `git checkout -b feature/{slug}`
+   - If user provides a different name → run `git checkout -b {user-name}`
+   - If user says stay on main → proceed but add a warning header to the plan:
+     > `⚠️ WARNING: Developed on main — no feature branch created`
+3. **If on a feature branch**: Confirm it's appropriate:
+   > "You're on `{branch}`. Continue planning on this branch? (yes / switch)"
+4. **Check for uncommitted changes**: Run `git status --short`
+   - If there are uncommitted changes, warn:
+     > "There are N uncommitted changes. Consider committing or stashing before starting a new plan."
+   - Do NOT block — just warn. The user may have intentional WIP.
+5. **Slugify convention**: `feature/{slug}` where slug is the plan topic in lowercase with hyphens (e.g., `feature/auto-enable-agent-sources`). Strip non-alphanumeric characters except hyphens.
+
 ### Step 1: Receive Request
 
 1. Read `CLAUDE.md` at project root
