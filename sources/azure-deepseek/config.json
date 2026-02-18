@@ -1,0 +1,21 @@
+{
+  "id": "azure-deepseek_f6c0d5e7",
+  "name": "Azure DeepSeek R1",
+  "slug": "azure-deepseek",
+  "enabled": true,
+  "provider": "azure-ai",
+  "type": "api",
+  "icon": "🧠",
+  "tagline": "DeepSeek R1 reasoning model via Azure AI Model Catalog",
+  "api": {
+    "baseUrl": "https://DeepSeek-R1-rpbgqb.northcentralus.models.ai.azure.com/",
+    "authType": "header",
+    "headerName": "api-key",
+    "testEndpoint": {
+      "method": "GET",
+      "path": "info"
+    }
+  },
+  "createdAt": 1739548800000,
+  "updatedAt": 1739548800000
+}

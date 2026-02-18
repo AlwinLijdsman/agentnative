@@ -9,7 +9,8 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "npx tsx --test src/handlers/__tests__/*.test.ts"
   },
   "dependencies": {
     "@craft-agent/mermaid": "workspace:*",

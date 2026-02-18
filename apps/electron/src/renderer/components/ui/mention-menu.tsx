@@ -4,12 +4,13 @@ import { FadingText } from '@/components/ui/fading-text'
 import { SkillAvatar } from '@/components/ui/skill-avatar'
 import { SourceAvatar } from '@/components/ui/source-avatar'
 import type { LoadedSkill, LoadedSource, FileSearchResult } from '../../../shared/types'
+import type { LoadedAgent } from '@craft-agent/shared/agents'
 
 // ============================================================================
 // Types
 // ============================================================================
 
-export type MentionItemType = 'skill' | 'source' | 'file' | 'folder'
+export type MentionItemType = 'skill' | 'source' | 'file' | 'folder' | 'agent'
 
 export interface MentionItem {
   id: string
@@ -294,6 +295,13 @@ export function InlineMentionMenu({
             >
               {/* Icon based on type */}
               <div className="shrink-0">
+                {item.type === 'agent' && (
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" className="text-muted-foreground">
+                    <circle cx="12" cy="12" r="8" />
+                    <path d="M12 2v2M12 20v2M2 12h2M20 12h2" />
+                    <circle cx="12" cy="12" r="3" />
+                  </svg>
+                )}
                 {item.type === 'skill' && item.skill && (
                   <SkillAvatar skill={item.skill} size="sm" workspaceId={workspaceId} />
                 )}
@@ -328,7 +336,7 @@ export function InlineMentionMenu({
                     <span className="truncate block">{item.label}</span>
                   </div>
                   <span className={MENU_TYPE_BADGE}>
-                    {item.type === 'skill' ? 'Skill' : 'Source'}
+                    {item.type === 'agent' ? 'Agent' : item.type === 'skill' ? 'Skill' : 'Source'}
                   </span>
                 </>
               )}
@@ -418,6 +426,8 @@ export interface UseInlineMentionOptions {
   inputRef: React.RefObject<MentionInputElement | null>
   skills: LoadedSkill[]
   sources: LoadedSource[]
+  /** Available agents for @mention autocomplete */
+  agents?: LoadedAgent[]
   /** Base path for file search (working directory) */
   basePath?: string
   onSelect: (item: MentionItem) => void
@@ -441,6 +451,7 @@ export function useInlineMention({
   inputRef,
   skills,
   sources,
+  agents,
   basePath,
   onSelect,
   workspaceId,
@@ -471,9 +482,23 @@ export function useInlineMention({
     }
   }, [])
 
-  // Build sections from available data (skills, sources, and file search results)
+  // Build sections from available data (agents, skills, sources, and file search results)
   const sections = React.useMemo((): MentionSection[] => {
     const result: MentionSection[] = []
+
+    // Agents section (above Skills — agents are first-class entities)
+    if (agents && agents.length > 0) {
+      result.push({
+        id: 'agents',
+        label: 'Agents',
+        items: agents.map(agent => ({
+          id: agent.slug,
+          type: 'agent' as const,
+          label: agent.metadata.name,
+          description: agent.metadata.description,
+        })),
+      })
+    }
 
     // Skills section
     if (skills.length > 0) {
@@ -517,7 +542,7 @@ export function useInlineMention({
     }
 
     return result
-  }, [skills, sources, fileResults])
+  }, [agents, skills, sources, fileResults])
 
   const handleInputChange = React.useCallback((value: string, cursorPosition: number) => {
     // Store current state for handleSelect
@@ -632,7 +657,11 @@ export function useInlineMention({
       // Skills use fully-qualified names (workspaceId:slug) because the SDK's
       // Skill tool requires this format to resolve workspace-scoped skills.
       let mentionText: string
-      if (item.type === 'skill') {
+      if (item.type === 'agent') {
+        // Agents use [agent:workspaceId:slug] — first-class mention path
+        const qualifiedName = workspaceId ? `${workspaceId}:${item.id}` : item.id
+        mentionText = `[agent:${qualifiedName}] `
+      } else if (item.type === 'skill') {
         // Use fully-qualified name for skills: [skill:workspaceId:slug]
         const qualifiedName = workspaceId ? `${workspaceId}:${item.id}` : item.id
         mentionText = `[skill:${qualifiedName}] `

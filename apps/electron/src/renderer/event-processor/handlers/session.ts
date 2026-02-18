@@ -76,6 +76,7 @@ export function handleComplete(
         ...session,
         messages: updatedMessages,
         isProcessing: false,
+        pausedAgent: undefined,
         currentStatus: undefined,  // Clear any lingering status
         // Update tokenUsage from complete event (for real-time context counter updates)
         tokenUsage: event.tokenUsage ?? session.tokenUsage,

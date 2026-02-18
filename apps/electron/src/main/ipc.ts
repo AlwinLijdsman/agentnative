@@ -1418,6 +1418,12 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
     return manager.checkHealth()
   })
 
+  // Auth diagnostics — returns sanitized auth environment snapshot (never exposes secrets)
+  ipcMain.handle(IPC_CHANNELS.AUTH_DIAGNOSTICS, async () => {
+    const { getAuthDiagnostics } = await import('@craft-agent/shared/auth/state')
+    return getAuthDiagnostics()
+  })
+
   // Unified handler for LLM connection setup
   ipcMain.handle(IPC_CHANNELS.SETUP_LLM_CONNECTION, async (_event, setup: LlmConnectionSetup): Promise<{ success: boolean; error?: string }> => {
     try {
@@ -2918,6 +2924,7 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
           command: source.config.mcp.command,
           args: source.config.mcp.args,
           env: source.config.mcp.env,
+          cwd: source.config.mcp.cwd,
         })
       } else {
         // HTTP/SSE transport - connect to remote MCP server
@@ -3134,6 +3141,203 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
     const skillsDir = getWorkspaceSkillsPath(workspace.rootPath)
     const skillDir = join(skillsDir, skillSlug)
     await shell.showItemInFolder(skillDir)
+  })
+
+  // ============================================================
+  // Agents (Workspace-scoped definitions, Session-scoped runs)
+  // ============================================================
+
+  /**
+   * Validates a slug/identifier to prevent path traversal attacks.
+   * Only allows lowercase alphanumeric characters, hyphens, and underscores.
+   * Rejects empty strings, '..' sequences, path separators, and other dangerous patterns.
+   */
+  function validateSlugParam(value: string, paramName: string): void {
+    if (!value || typeof value !== 'string') {
+      throw new Error(`${paramName} is required`)
+    }
+    // Allow only lowercase alphanumeric, hyphens, underscores, and dots (but not '..')
+    if (!/^[a-z0-9][a-z0-9._-]*$/.test(value)) {
+      throw new Error(`Invalid ${paramName}: must start with alphanumeric and contain only lowercase letters, numbers, hyphens, underscores, or dots`)
+    }
+    if (value.includes('..')) {
+      throw new Error(`Invalid ${paramName}: path traversal not allowed`)
+    }
+    if (value.length > 200) {
+      throw new Error(`Invalid ${paramName}: too long (max 200 characters)`)
+    }
+  }
+
+  // Get all agents for a workspace
+  ipcMain.handle(IPC_CHANNELS.AGENTS_GET, async (_event, workspaceId: string) => {
+    ipcLog.info(`AGENTS_GET: Loading agents for workspace: ${workspaceId}`)
+    const workspace = getWorkspaceByNameOrId(workspaceId)
+    if (!workspace) {
+      ipcLog.error(`AGENTS_GET: Workspace not found: ${workspaceId}`)
+      return []
+    }
+    const { loadWorkspaceAgents } = await import('@craft-agent/shared/agents')
+    const agents = loadWorkspaceAgents(workspace.rootPath)
+    ipcLog.info(`AGENTS_GET: Loaded ${agents.length} agents from ${workspace.rootPath}`)
+    return agents
+  })
+
+  // Delete an agent from a workspace
+  ipcMain.handle(IPC_CHANNELS.AGENTS_DELETE, async (_event, workspaceId: string, agentSlug: string) => {
+    validateSlugParam(agentSlug, 'agentSlug')
+    const workspace = getWorkspaceByNameOrId(workspaceId)
+    if (!workspace) throw new Error('Workspace not found')
+
+    const { deleteAgent } = await import('@craft-agent/shared/agents')
+    deleteAgent(workspace.rootPath, agentSlug)
+    ipcLog.info(`Deleted agent: ${agentSlug}`)
+  })
+
+  // Get agent run summaries (session-scoped)
+  ipcMain.handle(IPC_CHANNELS.AGENTS_GET_RUNS, async (_event, sessionId: string, agentSlug: string) => {
+    validateSlugParam(agentSlug, 'agentSlug')
+    const sessionPath = sessionManager.getSessionPath(sessionId)
+    if (!sessionPath) throw new Error(`Session not found: ${sessionId}`)
+
+    const runsDir = join(sessionPath, 'data', 'agents', agentSlug, 'runs')
+    if (!existsSync(runsDir)) return []
+
+    const { readdirSync, statSync } = await import('fs')
+    const entries = readdirSync(runsDir, { withFileTypes: true })
+      .filter(e => e.isDirectory() && e.name.startsWith('run-'))
+      .sort((a, b) => b.name.localeCompare(a.name))
+
+    const summaries: Array<{
+      runId: string
+      startedAt: string
+      depthMode: string
+      toolCallCount: number
+    }> = []
+
+    for (const entry of entries) {
+      const stateFile = join(runsDir, entry.name, 'run-state.json')
+      const currentStateFile = join(sessionPath, 'data', 'agents', agentSlug, 'current-run-state.json')
+
+      // Try run-level state first, then fall back to current-run-state if it matches
+      let state: Record<string, unknown> | null = null
+      if (existsSync(stateFile)) {
+        try { state = JSON.parse(readFileSync(stateFile, 'utf-8')) } catch (err) {
+          ipcLog.warn(`AGENTS_GET_RUNS: Failed to parse ${stateFile}:`, err)
+        }
+      } else if (existsSync(currentStateFile)) {
+        try {
+          const current = JSON.parse(readFileSync(currentStateFile, 'utf-8'))
+          if (current.runId === entry.name) state = current
+        } catch (err) {
+          ipcLog.warn(`AGENTS_GET_RUNS: Failed to parse ${currentStateFile}:`, err)
+        }
+      }
+
+      summaries.push({
+        runId: entry.name,
+        startedAt: (state?.startedAt as string) ?? '',
+        depthMode: (state?.depthMode as string) ?? 'standard',
+        toolCallCount: (state?.toolCallCount as number) ?? 0,
+      })
+    }
+
+    return summaries
+  })
+
+  // Get agent run detail (session-scoped)
+  ipcMain.handle(IPC_CHANNELS.AGENTS_GET_RUN_DETAIL, async (_event, sessionId: string, agentSlug: string, runId: string) => {
+    validateSlugParam(agentSlug, 'agentSlug')
+    validateSlugParam(runId, 'runId')
+    const sessionPath = sessionManager.getSessionPath(sessionId)
+    if (!sessionPath) throw new Error(`Session not found: ${sessionId}`)
+
+    const agentDataDir = join(sessionPath, 'data', 'agents', agentSlug)
+    const runDir = join(agentDataDir, 'runs', runId)
+
+    if (!existsSync(runDir)) throw new Error(`Run not found: ${runId}`)
+
+    // Read current-run-state if it matches, otherwise look for run-level state
+    let state: Record<string, unknown> = {}
+    const currentStateFile = join(agentDataDir, 'current-run-state.json')
+    if (existsSync(currentStateFile)) {
+      try {
+        const current = JSON.parse(readFileSync(currentStateFile, 'utf-8'))
+        if (current.runId === runId) state = current
+      } catch (err) {
+        ipcLog.warn(`AGENTS_GET_RUN_DETAIL: Failed to parse run state for ${runId}:`, err)
+      }
+    }
+
+    // Read events
+    const eventsFile = join(agentDataDir, 'agent-events.jsonl')
+    let events: Array<Record<string, unknown>> = []
+    if (existsSync(eventsFile)) {
+      try {
+        const lines = readFileSync(eventsFile, 'utf-8').split('\n').filter(Boolean)
+        events = lines
+          .map(line => { try { return JSON.parse(line) } catch { return null } })
+          .filter((e): e is Record<string, unknown> => e !== null && e.runId === runId)
+      } catch (err) {
+        ipcLog.warn(`AGENTS_GET_RUN_DETAIL: Failed to parse events for ${runId}:`, err)
+      }
+    }
+
+    // Read evidence intermediates
+    const intermediatesDir = join(runDir, 'evidence', 'intermediates')
+    const intermediates: Record<string, Record<string, unknown>> = {}
+    if (existsSync(intermediatesDir)) {
+      try {
+        const files = (await readdir(intermediatesDir)).filter(f => f.endsWith('.json'))
+        for (const file of files) {
+          try {
+            intermediates[file] = JSON.parse(readFileSync(join(intermediatesDir, file), 'utf-8'))
+          } catch (err) {
+            ipcLog.warn(`AGENTS_GET_RUN_DETAIL: Failed to parse intermediate ${file}:`, err)
+          }
+        }
+      } catch (err) {
+        ipcLog.warn(`AGENTS_GET_RUN_DETAIL: Failed to read intermediates dir:`, err)
+      }
+    }
+
+    return {
+      runId,
+      startedAt: (state.startedAt as string) ?? '',
+      depthMode: (state.depthMode as string) ?? 'standard',
+      toolCallCount: (state.toolCallCount as number) ?? 0,
+      completedStages: (state.completedStages as number[]) ?? [],
+      currentStage: (state.currentStage as number) ?? -1,
+      events,
+      evidence: { intermediates },
+    }
+  })
+
+  // Update agent config (workspace-scoped)
+  ipcMain.handle(IPC_CHANNELS.AGENTS_UPDATE_CONFIG, async (_event, workspaceId: string, agentSlug: string, updates: Record<string, unknown>) => {
+    validateSlugParam(agentSlug, 'agentSlug')
+    const workspace = getWorkspaceByNameOrId(workspaceId)
+    if (!workspace) throw new Error('Workspace not found')
+
+    const { updateAgentConfig, loadAgent } = await import('@craft-agent/shared/agents')
+    const agent = loadAgent(workspace.rootPath, agentSlug)
+    if (!agent) throw new Error(`Agent not found: ${agentSlug}`)
+
+    updateAgentConfig(agent.path, updates)
+    ipcLog.info(`Agent config updated: ${agentSlug} keys=${Object.keys(updates).join(',')}`)
+    return { success: true }
+  })
+
+  // Open agent directory in system file explorer
+  ipcMain.handle(IPC_CHANNELS.AGENTS_OPEN_FINDER, async (_event, workspaceId: string, agentSlug: string) => {
+    validateSlugParam(agentSlug, 'agentSlug')
+    const workspace = getWorkspaceByNameOrId(workspaceId)
+    if (!workspace) throw new Error('Workspace not found')
+
+    const { getWorkspaceAgentsPath } = await import('@craft-agent/shared/agents')
+
+    const agentsDir = getWorkspaceAgentsPath(workspace.rootPath)
+    const agentDir = join(agentsDir, agentSlug)
+    await shell.showItemInFolder(agentDir)
   })
 
   // ============================================================

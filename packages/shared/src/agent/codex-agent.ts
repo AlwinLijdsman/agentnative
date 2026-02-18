@@ -230,7 +230,7 @@ export class CodexAgent extends BaseAgent {
   onChatGptAuthRequired: ((reason: string) => void) | null = null;
 
   /**
-   * Callback when a plan is submitted via SubmitPlan MCP tool.
+   * Callback when a plan is submitted via submit_plan MCP tool.
    * Called when the session-mcp-server sends plan_submitted callback.
    * The UI should display the plan and pause execution.
    */

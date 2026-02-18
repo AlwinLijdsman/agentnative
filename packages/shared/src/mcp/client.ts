@@ -26,6 +26,7 @@ export interface StdioMcpClientConfig {
   command: string;
   args?: string[];
   env?: Record<string, string>;
+  cwd?: string;
 }
 
 /**
@@ -82,6 +83,7 @@ export class CraftMcpClient {
         command: config.command,
         args: config.args,
         env: { ...processEnv, ...config.env },
+        cwd: config.cwd,
       });
     } else {
       // HTTP transport for remote MCP servers

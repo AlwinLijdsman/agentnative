@@ -7,7 +7,7 @@
  * feature parity with Claude's session-scoped tools.
  *
  * Callback Communication:
- * Tools that need to communicate with the main Electron process (e.g., SubmitPlan
+ * Tools that need to communicate with the main Electron process (e.g., submit_plan
  * triggering a plan display, OAuth triggers pausing execution) send structured
  * JSON messages to stderr with a "__CALLBACK__" prefix. The main process monitors
  * stderr and handles these callbacks.
@@ -49,6 +49,9 @@ import {
   handleSlackOAuthTrigger,
   handleMicrosoftOAuthTrigger,
   handleCredentialPrompt,
+  handleAgentStageGate,
+  handleAgentState,
+  handleAgentValidate,
   // Helpers
   loadSourceConfig as loadSourceConfigFromHelpers,
   errorResponse,
@@ -189,6 +192,20 @@ function createCodexContext(config: SessionConfig): SessionToolContext {
         ...request,
       });
     },
+    onAgentStagePause: (args: { agentSlug: string; stage: number; runId: string; data: Record<string, unknown> }) => {
+      sendCallback({
+        __callback__: 'agent_stage_pause',
+        sessionId,
+        ...args,
+      });
+    },
+    onAgentEvent: (event: { type: string; agentSlug: string; runId: string; data: Record<string, unknown> }) => {
+      sendCallback({
+        __callback__: 'agent_event',
+        sessionId,
+        ...event,
+      });
+    },
   };
 
   // Create credential manager that reads from cache files
@@ -200,6 +217,7 @@ function createCodexContext(config: SessionConfig): SessionToolContext {
     workspacePath: workspaceRootPath,
     get sourcesPath() { return join(workspaceRootPath, 'sources'); },
     get skillsPath() { return join(workspaceRootPath, 'skills'); },
+    get agentsPath() { return join(workspaceRootPath, 'agents'); },
     plansFolderPath,
     callbacks,
     fs,
@@ -222,7 +240,7 @@ function createCodexContext(config: SessionConfig): SessionToolContext {
 function createTools(): Tool[] {
   return [
     {
-      name: 'SubmitPlan',
+      name: 'submit_plan',
       description: `Submit a plan for user review.
 
 Call this after you have written your plan to a markdown file using the Write tool.
@@ -438,6 +456,70 @@ Uses @craft-agent/mermaid parser for accurate validation.`,
         required: ['sourceSlug'],
       },
     },
+    {
+      name: 'agent_stage_gate',
+      description: `Control flow enforcement for multi-stage agent workflows. MUST be called before/after each stage. Returns allowed: true/false. If pauseRequired is true, execution will be automatically paused for user review.`,
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          agentSlug: {
+            type: 'string',
+            description: 'The slug of the agent to control',
+          },
+          action: {
+            type: 'string',
+            enum: ['start', 'complete', 'repair', 'start_repair_unit', 'end_repair_unit', 'status', 'reset', 'resume'],
+            description: 'Stage gate action to perform',
+          },
+          stage: {
+            type: 'number',
+            description: 'Stage ID (required for start/complete)',
+          },
+          data: {
+            type: 'object',
+            description: 'Stage-specific data (output, toolCalls, error, etc.)',
+          },
+        },
+        required: ['agentSlug', 'action'],
+      },
+    },
+    {
+      name: 'agent_state',
+      description: `Read and update accumulated agent state persisted across runs. Actions: init (create empty), read (return current), update (replace-all semantics on top-level keys).`,
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          agentSlug: {
+            type: 'string',
+            description: 'The slug of the agent',
+          },
+          action: {
+            type: 'string',
+            enum: ['read', 'update', 'init'],
+            description: 'State action to perform',
+          },
+          data: {
+            type: 'object',
+            description: 'Data to merge (required for update). Uses replace-all semantics.',
+          },
+        },
+        required: ['agentSlug', 'action'],
+      },
+    },
+    {
+      name: 'agent_validate',
+      description: `Validate an agent's AGENT.md and config.json for correct format, required fields, stage ID consistency, repair unit validity, and source bindings.`,
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          agentSlug: {
+            type: 'string',
+            description: 'The slug of the agent to validate',
+          },
+        },
+        required: ['agentSlug'],
+      },
+    },
   ];
 }
 
@@ -519,7 +601,7 @@ async function main() {
 
     try {
       switch (name) {
-        case 'SubmitPlan':
+        case 'submit_plan':
           return await handleSubmitPlan(ctx, toolArgs as { planPath: string });
 
         case 'config_validate':
@@ -555,6 +637,24 @@ async function main() {
 
         case 'source_test':
           return await handleSourceTest(ctx, toolArgs as { sourceSlug: string });
+
+        case 'agent_stage_gate':
+          return await handleAgentStageGate(ctx, toolArgs as {
+            agentSlug: string;
+            action: 'start' | 'complete' | 'repair' | 'start_repair_unit' | 'end_repair_unit' | 'status' | 'reset' | 'resume';
+            stage?: number;
+            data?: Record<string, unknown>;
+          });
+
+        case 'agent_state':
+          return await handleAgentState(ctx, toolArgs as {
+            agentSlug: string;
+            action: 'read' | 'update' | 'init';
+            data?: Record<string, unknown>;
+          });
+
+        case 'agent_validate':
+          return await handleAgentValidate(ctx, toolArgs as { agentSlug: string });
 
         default:
           return errorResponse(`Unknown tool: ${name}`);

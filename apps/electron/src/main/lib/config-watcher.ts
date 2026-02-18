@@ -39,7 +39,7 @@ import {
 import { permissionsConfigCache, getAppPermissionsDir } from '@craft-agent/shared/agent';
 import { getWorkspacePath, getWorkspaceSourcesPath, getWorkspaceSkillsPath } from '@craft-agent/shared/workspaces';
 import type { LoadedSkill } from '@craft-agent/shared/skills';
-import { loadSkill, loadWorkspaceSkills, skillNeedsIconDownload, downloadSkillIcon } from '@craft-agent/shared/skills';
+import { loadSkill, loadWorkspaceSkills, loadAllSkills, skillNeedsIconDownload, downloadSkillIcon } from '@craft-agent/shared/skills';
 import {
   loadStatusConfig,
   statusNeedsIconDownload,
@@ -101,6 +101,12 @@ export interface ConfigWatcherCallbacks {
   onSkillChange?: (slug: string, skill: LoadedSkill | null) => void;
   /** Called when the skills list changes (add/remove folders) */
   onSkillsListChange?: (skills: LoadedSkill[]) => void;
+
+  // Agent callbacks
+  /** Called when a specific agent changes (null if deleted) */
+  onAgentChange?: (slug: string, agent: import('@craft-agent/shared/agents').LoadedAgent | null) => void;
+  /** Called when the agents list changes (add/remove folders) */
+  onAgentsListChange?: (agents: import('@craft-agent/shared/agents').LoadedAgent[]) => void;
 
   // Permissions callbacks
   /** Called when app-level default permissions change (~/.craft-agent/permissions/default.json) */
@@ -177,12 +183,14 @@ export class ConfigWatcher {
   // Track known items for detecting adds/removes
   private knownSources: Set<string> = new Set();
   private knownSkills: Set<string> = new Set();
+  private knownAgents: Set<string> = new Set();
   private knownThemes: Set<string> = new Set();
 
   // Computed paths
   private workspaceDir: string;
   private sourcesDir: string;
   private skillsDir: string;
+  private agentsDir: string;
 
   constructor(workspaceIdOrPath: string, callbacks: ConfigWatcherCallbacks) {
     this.callbacks = callbacks;
@@ -199,6 +207,7 @@ export class ConfigWatcher {
     }
     this.sourcesDir = getWorkspaceSourcesPath(this.workspaceDir);
     this.skillsDir = getWorkspaceSkillsPath(this.workspaceDir);
+    this.agentsDir = join(this.workspaceDir, 'agents');
   }
 
   /**
@@ -243,12 +252,15 @@ export class ConfigWatcher {
     this.watchAppPermissionsDir();
     span.mark('watchAppPermissionsDir');
 
-    // Initial scan to populate known sources, skills, and themes
+    // Initial scan to populate known sources, skills, agents, and themes
     this.scanSources();
     span.mark('scanSources');
 
     this.scanSkills();
     span.mark('scanSkills');
+
+    this.scanAgents();
+    span.mark('scanAgents');
 
     this.scanAppThemes();
     span.mark('scanAppThemes');
@@ -281,6 +293,7 @@ export class ConfigWatcher {
 
     this.knownSources.clear();
     this.knownSkills.clear();
+    this.knownAgents.clear();
     this.knownThemes.clear();
 
     debug('[ConfigWatcher] Stopped');
@@ -400,6 +413,26 @@ export class ConfigWatcher {
       } else if (file && /^icon\.(svg|png|jpg|jpeg)$/i.test(file)) {
         // Icon file changes also trigger a skill change (to update iconPath)
         this.debounce(`skill-icon:${slug}`, () => this.handleSkillChange(slug));
+      }
+      return;
+    }
+
+    // Agents changes: agents/{slug}/...
+    if (parts[0] === 'agents' && parts.length >= 2) {
+      const slug = parts[1]!;  // Safe: checked parts.length >= 2
+      const file = parts[2];
+
+      // Directory-level changes (new/removed agent folders)
+      if (parts.length === 2) {
+        this.debounce('agents-dir', () => this.handleAgentsDirChange());
+        return;
+      }
+
+      // File-level changes
+      if (file === 'AGENT.md' || file === 'config.json') {
+        this.debounce(`agent:${slug}`, () => this.handleAgentChange(slug));
+      } else if (file && /^icon\.(svg|png|jpg|jpeg)$/i.test(file)) {
+        this.debounce(`agent-icon:${slug}`, () => this.handleAgentChange(slug));
       }
       return;
     }
@@ -713,8 +746,8 @@ export class ConfigWatcher {
         }
       }
 
-      // Notify list change
-      const allSkills = loadWorkspaceSkills(this.workspaceDir);
+      // Notify list change (use loadAllSkills to include agent→skill bridge)
+      const allSkills = loadAllSkills(this.workspaceDir);
       this.callbacks.onSkillsListChange?.(allSkills);
     } catch (error) {
       debug('[ConfigWatcher] Error handling skills dir change:', error);
@@ -752,6 +785,119 @@ export class ConfigWatcher {
           debug('[ConfigWatcher] Icon download failed for skill:', slug, error);
         });
     }
+  }
+
+  // ============================================================
+  // Agent Methods (mirrors skills pattern)
+  // ============================================================
+
+  private scanAgents(): void {
+    if (!existsSync(this.agentsDir)) {
+      return; // Don't create agents dir — only workspace and skills dirs are auto-created
+    }
+
+    try {
+      const entries = readdirSync(this.agentsDir);
+
+      for (const entry of entries) {
+        const entryPath = join(this.agentsDir, entry);
+        if (statSync(entryPath).isDirectory() && !entry.startsWith('_')) {
+          this.knownAgents.add(entry);
+        }
+      }
+
+      debug('[ConfigWatcher] Known agents:', Array.from(this.knownAgents));
+    } catch (error) {
+      debug('[ConfigWatcher] Error scanning agents:', error);
+    }
+  }
+
+  private handleAgentsDirChange(): void {
+    debug('[ConfigWatcher] Agents directory changed');
+
+    if (!existsSync(this.agentsDir)) {
+      const removed = Array.from(this.knownAgents);
+      this.knownAgents.clear();
+
+      for (const slug of removed) {
+        this.callbacks.onAgentChange?.(slug, null);
+      }
+
+      this.callbacks.onAgentsListChange?.([]);
+      return;
+    }
+
+    try {
+      const entries = readdirSync(this.agentsDir);
+      const currentFolders = new Set<string>();
+
+      for (const entry of entries) {
+        const entryPath = join(this.agentsDir, entry);
+        if (statSync(entryPath).isDirectory() && !entry.startsWith('_')) {
+          currentFolders.add(entry);
+        }
+      }
+
+      // Find added folders
+      for (const folder of currentFolders) {
+        if (!this.knownAgents.has(folder)) {
+          debug('[ConfigWatcher] New agent folder:', folder);
+          this.knownAgents.add(folder);
+
+          // Lazy-import to avoid circular dependency at module load time
+          import('@craft-agent/shared/agents').then(({ loadAgent }) => {
+            const agent = loadAgent(this.workspaceDir, folder);
+            if (agent) {
+              this.callbacks.onAgentChange?.(folder, agent);
+            }
+          }).catch(() => { /* ignore */ });
+        }
+      }
+
+      // Find removed folders
+      for (const folder of this.knownAgents) {
+        if (!currentFolders.has(folder)) {
+          debug('[ConfigWatcher] Removed agent folder:', folder);
+          this.knownAgents.delete(folder);
+          this.callbacks.onAgentChange?.(folder, null);
+        }
+      }
+
+      // Notify list change
+      import('@craft-agent/shared/agents').then(({ loadWorkspaceAgents }) => {
+        const allAgents = loadWorkspaceAgents(this.workspaceDir);
+        this.callbacks.onAgentsListChange?.(allAgents);
+      }).catch(() => { /* ignore */ });
+    } catch (error) {
+      debug('[ConfigWatcher] Error handling agents dir change:', error);
+      this.callbacks.onError?.('agents/', error as Error);
+    }
+  }
+
+  private handleAgentChange(slug: string): void {
+    debug('[ConfigWatcher] Agent changed:', slug);
+
+    import('@craft-agent/shared/agents').then(({ loadAgent, agentNeedsIconDownload, downloadAgentIcon }) => {
+      const agent = loadAgent(this.workspaceDir, slug);
+      this.callbacks.onAgentChange?.(slug, agent);
+
+      // Check if we need to download an icon from URL
+      if (agent && agentNeedsIconDownload(agent)) {
+        debug('[ConfigWatcher] Agent needs icon download:', slug, agent.metadata.icon);
+
+        downloadAgentIcon(agent.path, agent.metadata.icon!)
+          .then((iconPath) => {
+            if (iconPath) {
+              const updatedAgent = loadAgent(this.workspaceDir, slug);
+              debug('[ConfigWatcher] Icon downloaded, emitting updated agent:', slug);
+              this.callbacks.onAgentChange?.(slug, updatedAgent);
+            }
+          })
+          .catch((error) => {
+            debug('[ConfigWatcher] Icon download failed for agent:', slug, error);
+          });
+      }
+    }).catch(() => { /* ignore */ });
   }
 
   // ============================================================

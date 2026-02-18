@@ -58,12 +58,14 @@ import {
   isSourcesNavigation,
   isSettingsNavigation,
   isSkillsNavigation,
+  isAgentsNavigation,
   DEFAULT_NAVIGATION_STATE,
 } from '../../shared/types'
 import { isValidSettingsSubpage, type SettingsSubpage } from '../../shared/settings-registry'
 import { sessionMetaMapAtom, updateSessionMetaAtom, type SessionMeta } from '@/atoms/sessions'
 import { sourcesAtom } from '@/atoms/sources'
 import { skillsAtom } from '@/atoms/skills'
+import { agentsAtom } from '@/atoms/agents'
 
 // Re-export routes for convenience
 export { routes }
@@ -71,7 +73,7 @@ export type { Route }
 
 // Re-export navigation state types for consumers
 export type { NavigationState, SessionFilter }
-export { isSessionsNavigation, isSourcesNavigation, isSettingsNavigation, isSkillsNavigation }
+export { isSessionsNavigation, isSourcesNavigation, isSettingsNavigation, isSkillsNavigation, isAgentsNavigation }
 
 interface NavigationContextValue {
   /** Navigate to a route */
@@ -134,6 +136,9 @@ export function NavigationProvider({
 
   // Read skills from atom (populated by AppShell)
   const skills = useAtomValue(skillsAtom)
+
+  // Read agents from atom (populated by AppShell)
+  const agents = useAtomValue(agentsAtom)
 
   // UNIFIED NAVIGATION STATE - single source of truth for all 3 panels
   const [navigationState, setNavigationState] = useState<NavigationState>(DEFAULT_NAVIGATION_STATE)
@@ -249,6 +254,14 @@ export function NavigationProvider({
       return skills[0]?.slug ?? null
     },
     [skills]
+  )
+
+  // Helper: Get first agent slug
+  const getFirstAgentSlug = useCallback(
+    (): string | null => {
+      return agents[0]?.slug ?? null
+    },
+    [agents]
   )
 
   // Handle action navigation (side effects that don't change navigation state)
@@ -487,6 +500,22 @@ export function NavigationProvider({
         }
       }
 
+      // For agents: auto-select first agent if no details provided
+      if (isAgentsNavigation(nextState) && !nextState.details) {
+        const firstAgentSlug = getFirstAgentSlug()
+        if (firstAgentSlug) {
+          const stateWithSelection: NavigationState = {
+            ...nextState,
+            details: { type: 'agent', agentSlug: firstAgentSlug },
+          }
+          setNavigationState(stateWithSelection)
+          return stateWithSelection
+        } else {
+          setNavigationState(nextState)
+          return nextState
+        }
+      }
+
       // For chats with explicit session: update session selection
       if (isSessionsNavigation(nextState) && nextState.details) {
         if (workspaceId) {
@@ -499,7 +528,7 @@ export function NavigationProvider({
       setNavigationState(nextState)
       return nextState
     },
-    [getFirstSessionId, getLastSelectedSessionId, getFirstSourceSlug, getFirstSkillSlug, setSession, store, workspaceId]
+    [getFirstSessionId, getLastSelectedSessionId, getFirstSourceSlug, getFirstSkillSlug, getFirstAgentSlug, setSession, store, workspaceId]
   )
 
   // Main navigate function - unified approach using NavigationState
@@ -616,8 +645,16 @@ export function NavigationProvider({
       return true
     }
 
+    if (isAgentsNavigation(navState) && navState.details) {
+      if (navState.details.type === 'agent') {
+        const { agentSlug } = navState.details
+        return agents.some(a => a.slug === agentSlug)
+      }
+      return true
+    }
+
     return true // Routes without details are always valid
-  }, [sessionMetaMap, sources, skills])
+  }, [sessionMetaMap, sources, skills, agents])
 
   // Go back in history (using our custom stack)
   // When encountering invalid entries (deleted sessions/sources), remove them from the stack

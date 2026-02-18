@@ -3,6 +3,7 @@
  *
  * Mention types:
  * - Skills:  [skill:slug]
+ * - Agents:  [agent:slug]
  * - Sources: [source:slug]
  *
  * Bracket syntax allows mentions anywhere in text without word boundaries.
@@ -48,12 +49,14 @@ export interface MentionMatch {
  * @param text - The message text to search
  * @param availableSkillSlugs - Valid skill slugs
  * @param availableSourceSlugs - Valid source slugs
+ * @param availableAgentSlugs - Valid agent slugs
  * @returns Array of mention matches with positions
  */
 export function findMentionMatches(
   text: string,
   availableSkillSlugs: string[],
-  availableSourceSlugs: string[]
+  availableSourceSlugs: string[],
+  availableAgentSlugs: string[] = []
 ): MentionMatch[] {
   const matches: MentionMatch[] = []
 
@@ -81,6 +84,20 @@ export function findMentionMatches(
     if (availableSkillSlugs.includes(slug)) {
       matches.push({
         type: 'skill',
+        id: slug,
+        fullMatch: match[1],
+        startIndex: match.index,
+      })
+    }
+  }
+
+  // Match agent mentions: [agent:slug] or [agent:workspaceId:slug]
+  const agentPattern = new RegExp(`(\\[agent:(?:${WS_ID_CHARS}+:)?([\\w-]+)\\])`, 'g')
+  while ((match = agentPattern.exec(text)) !== null) {
+    const slug = match[2]
+    if (availableAgentSlugs.includes(slug)) {
+      matches.push({
+        type: 'agent',
         id: slug,
         fullMatch: match[1],
         startIndex: match.index,
@@ -134,6 +151,10 @@ export function removeMention(text: string, type: MentionItemType, id: string): 
       break
     case 'folder':
       pattern = new RegExp(`\\[folder:${escapeRegExp(id)}\\]`, 'g')
+      break
+    case 'agent':
+      // Match both [agent:slug] and [agent:workspaceId:slug]
+      pattern = new RegExp(`\\[agent:(?:${WS_ID_CHARS}+:)?${escapeRegExp(id)}\\]`, 'g')
       break
     case 'skill':
     default:
@@ -197,24 +218,33 @@ export function stripSkillMentions(text: string): string {
  * @param skills - Available skills (for label lookup)
  * @param sources - Available sources (for label lookup)
  * @param workspaceId - Workspace ID (for icon lookup)
+ * @param agentSlugs - Available agent slugs (agents are bridged as skills for SDK resolution, but detected separately for badge display)
  * @returns Array of ContentBadge objects
  */
 export function extractBadges(
   text: string,
   skills: LoadedSkill[],
   sources: LoadedSource[],
-  workspaceId: string
+  workspaceId: string,
+  agentSlugs: string[] = []
 ): ContentBadge[] {
   const skillSlugs = skills.map(s => s.slug)
   const sourceSlugs = sources.map(s => s.config.slug)
-  const matches = findMentionMatches(text, skillSlugs, sourceSlugs)
+  const matches = findMentionMatches(text, skillSlugs, sourceSlugs, agentSlugs)
 
   return matches.map(match => {
     let label = match.id
     let iconDataUrl: string | undefined
     let filePath: string | undefined
 
-    if (match.type === 'skill') {
+    if (match.type === 'agent') {
+      // Agents are bridged as synthetic skills — look up in skills list for metadata
+      const agentAsSkill = skills.find(s => s.slug === match.id)
+      label = agentAsSkill?.metadata.name || match.id
+
+      // Agent icons use the same cache as skills (bridged via loadAllSkills)
+      iconDataUrl = getSkillIconSync(workspaceId, match.id) ?? undefined
+    } else if (match.type === 'skill') {
       const skill = skills.find(s => s.slug === match.id)
       label = skill?.metadata.name || match.id
 
@@ -236,16 +266,18 @@ export function extractBadges(
       filePath = match.id
     }
 
-    // For skills, create fully-qualified rawText (workspaceId:slug) so the agent
+    // For skills and agents, create fully-qualified rawText (workspaceId:slug) so the agent
     // receives the correct format for the SDK's Skill tool. The SDK requires
-    // fully-qualified names to resolve skills. Display label stays as the friendly name.
+    // fully-qualified names to resolve skills/agents. Display label stays as the friendly name.
     let rawText = match.fullMatch
     if (match.type === 'skill') {
       rawText = `[skill:${workspaceId}:${match.id}]`
+    } else if (match.type === 'agent') {
+      rawText = `[agent:${workspaceId}:${match.id}]`
     }
 
     return {
-      type: match.type as 'source' | 'skill' | 'file' | 'folder',
+      type: match.type as ContentBadge['type'],
       label,
       rawText,
       iconDataUrl,

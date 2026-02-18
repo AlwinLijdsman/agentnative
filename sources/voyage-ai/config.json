@@ -1,0 +1,24 @@
+{
+  "id": "voyage-ai_b8e2f9a4",
+  "name": "Voyage AI",
+  "slug": "voyage-ai",
+  "enabled": true,
+  "provider": "voyage",
+  "type": "api",
+  "icon": "🚀",
+  "tagline": "Text embeddings for semantic search, legal text, and code via Voyage AI",
+  "api": {
+    "baseUrl": "https://api.voyageai.com/v1/",
+    "authType": "bearer",
+    "testEndpoint": {
+      "method": "POST",
+      "path": "embeddings",
+      "body": {
+        "input": "test",
+        "model": "voyage-3-lite"
+      }
+    }
+  },
+  "createdAt": 1739548800000,
+  "updatedAt": 1739548800000
+}

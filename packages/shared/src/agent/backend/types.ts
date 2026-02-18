@@ -84,6 +84,29 @@ export type SourceChangeCallback = (slug: string, source: LoadedSource | null) =
  */
 export type SourceActivationCallback = (sourceSlug: string) => Promise<boolean>;
 
+/**
+ * Agent stage gate pause callback.
+ * Called when a stage gate requires human approval before proceeding.
+ */
+export type AgentStagePauseCallback = (args: {
+  agentSlug: string;
+  stage: number;
+  runId: string;
+  data: Record<string, unknown>;
+}) => void;
+
+/**
+ * Agent event callback.
+ * Called for real-time agent stage progress events (stage started, completed, etc.).
+ * Does NOT pause execution — purely informational for live UI updates.
+ */
+export type AgentEventCallback = (event: {
+  type: string;
+  agentSlug: string;
+  runId: string;
+  data: Record<string, unknown>;
+}) => void;
+
 // ============================================================
 // Backend Interface
 // ============================================================
@@ -371,7 +394,7 @@ export interface BackendConfig {
 
   /**
    * Path to session-mcp-server executable (stdio MCP server for session-scoped tools).
-   * Provides SubmitPlan, config_validate, source_test, source_oauth_trigger, etc.
+   * Provides submit_plan, config_validate, source_test, source_oauth_trigger, etc.
    * Used by Codex (via config.toml) and Copilot (via mcpServers runtime config).
    */
   sessionServerPath?: string;

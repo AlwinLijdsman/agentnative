@@ -8,7 +8,7 @@
  * @craft-agent/session-tools-core for use with the Claude SDK.
  *
  * Tools included:
- * - SubmitPlan: Submit a plan file for user review/display
+ * - submit_plan: Submit a plan file for user review/display
  * - config_validate: Validate configuration files
  * - skill_validate: Validate skill SKILL.md files
  * - mermaid_validate: Validate Mermaid diagram syntax
@@ -19,6 +19,7 @@
  * - source_microsoft_oauth_trigger: Start Microsoft OAuth authentication
  * - source_credential_prompt: Prompt user for API credentials
  * - transform_data: Transform data files via script for datatable/spreadsheet blocks
+ * - agent_stage_gate: Control flow enforcement for multi-stage agent workflows
  */
 
 import { createSdkMcpServer, tool } from '@anthropic-ai/claude-agent-sdk';
@@ -44,6 +45,9 @@ import {
   handleSlackOAuthTrigger,
   handleMicrosoftOAuthTrigger,
   handleCredentialPrompt,
+  handleAgentStageGate,
+  handleAgentState,
+  handleAgentValidate,
   // Types
   type ToolResult,
   type AuthRequest,
@@ -74,7 +78,7 @@ export type {
  */
 export interface SessionScopedToolCallbacks {
   /**
-   * Called when a plan is submitted via SubmitPlan tool.
+   * Called when a plan is submitted via submit_plan tool.
    * Receives the path to the plan markdown file.
    */
   onPlanSubmitted?: (planPath: string) => void;
@@ -84,6 +88,24 @@ export interface SessionScopedToolCallbacks {
    * The auth UI should be shown and execution paused.
    */
   onAuthRequest?: (request: AuthRequest) => void;
+
+  /**
+   * Called when an agent stage gate requires human approval (pause enforcement).
+   * Triggers forceAbort to pause execution until user reviews and continues.
+   */
+  onAgentStagePause?: (args: { agentSlug: string; stage: number; runId: string; data: Record<string, unknown> }) => void;
+
+  /**
+   * Called when an agent event occurs (stage progress, tool calls, etc.).
+   * Used for real-time UI updates without pausing execution.
+   */
+  onAgentEvent?: (event: { type: string; agentSlug: string; runId: string; data: Record<string, unknown> }) => void;
+
+  /**
+   * Returns true if the pipeline was just paused in this turn.
+   * Blocks LLM self-resume in the same response batch as complete.
+   */
+  isPauseLocked?: () => boolean;
 }
 
 // Registry of callbacks keyed by sessionId
@@ -238,6 +260,24 @@ const credentialPromptSchema = {
   passwordRequired: z.boolean().optional().describe('For basic auth: whether password is required'),
 };
 
+const agentStageGateSchema = {
+  agentSlug: z.string().describe('The slug of the agent to control'),
+  action: z.enum(['start', 'complete', 'repair', 'start_repair_unit', 'end_repair_unit', 'status', 'reset', 'resume'])
+    .describe('Stage gate action to perform'),
+  stage: z.number().optional().describe('Stage ID (required for start/complete)'),
+  data: z.record(z.string(), z.unknown()).optional().describe('Stage-specific data (output, toolCalls, error, etc.)'),
+};
+
+const agentStateSchema = {
+  agentSlug: z.string().describe('The slug of the agent'),
+  action: z.enum(['read', 'update', 'init']).describe('State action to perform'),
+  data: z.record(z.string(), z.unknown()).optional().describe('Data to merge (required for update action). Uses replace-all semantics on top-level keys.'),
+};
+
+const agentValidateSchema = {
+  agentSlug: z.string().describe('The slug of the agent to validate'),
+};
+
 const transformDataSchema = {
   language: z.enum(['python3', 'node', 'bun']).describe('Script runtime to use'),
   script: z.string().describe('Transform script source code. Receives input file paths as command-line args (sys.argv[1:] or process.argv.slice(2)), last arg is the output file path.'),
@@ -250,7 +290,7 @@ const transformDataSchema = {
 // ============================================================
 
 const TOOL_DESCRIPTIONS = {
-  SubmitPlan: `Submit a plan for user review.
+  submit_plan: `Submit a plan for user review.
 
 Call this after you have written your plan to a markdown file using the Write tool.
 The plan will be displayed to the user in a special formatted view.
@@ -259,7 +299,7 @@ The plan will be displayed to the user in a special formatted view.
 - Execution will be **automatically paused** to present the plan to the user
 - No further tool calls or text output will be processed after this tool returns
 - The conversation will resume when the user responds (accept, modify, or reject the plan)
-- Do NOT include any text or tool calls after SubmitPlan - they will not be executed`,
+- Do NOT include any text or tool calls after submit_plan - they will not be executed`,
 
   config_validate: `Validate Craft Agent configuration files.
 
@@ -358,6 +398,39 @@ Use this tool when you need to transform large datasets (20+ rows) into structur
 - Output must be valid JSON: \`{"title": "...", "columns": [...], "rows": [...]}\`
 
 **Security:** Runs in an isolated subprocess with no access to API keys or credentials. 30-second timeout.`,
+
+  agent_stage_gate: `Control flow enforcement for multi-stage agent workflows. MUST be called before/after each stage. Returns allowed: true/false.
+
+**CRITICAL PAUSE RULE:** If the result contains \`pauseRequired: true\` and \`allowed: false\`, you MUST stop immediately. Do NOT call resume, start, or any other tool. Follow the pause instructions in the tool result \`reason\` field EXACTLY — especially output format constraints. Your pause response must be 2-5 sentences maximum. Do NOT produce tables, bullet lists of sub-queries, or verbose analysis. Wait for the user's next message. Only after the user responds should you call resume then start.
+
+**Actions:**
+- \`start(stage=0)\`: Start a new run. Creates run directory and initializes state.
+- \`start(stage=N)\`: Start stage N. Validates N-1 is completed.
+- \`complete(stage=N, data)\`: Complete stage N. Writes intermediates, tracks tool calls. If stage is in pauseAfterStages, returns allowed: false with pauseRequired: true — you MUST stop and wait for user input.
+- \`start_repair_unit\`: Activate repair loop for current stage pair.
+- \`repair\`: Iterate repair loop. Resets completed stages in the pair.
+- \`end_repair_unit\`: Deactivate repair loop.
+- \`status\`: Return current pipeline state with staleness check.
+- \`reset\`: Clear run state (for error recovery).
+- \`resume\`: Resume after a pause with a structured decision. Requires \`data.decision\`: \`"proceed"\` (continue), \`"modify"\` (adjust plan — include \`data.modifications\`), or \`"abort"\` (cancel pipeline). Only call this AFTER the user has responded.`,
+
+  agent_state: `Read and update accumulated agent state persisted across runs.
+
+**Actions:**
+- \`init\`: Create empty state.json for an agent. Fails if already exists.
+- \`read\`: Return current state (or { initialized: false } if none).
+- \`update\`: Replace-all semantics — Object.assign(currentState, data). Top-level keys from data overwrite current state. The agent is responsible for reading first, merging as needed, then writing back.`,
+
+  agent_validate: `Validate an agent's AGENT.md and config.json for correct format, required fields, and structural consistency.
+
+**Checks:**
+- AGENT.md exists with valid YAML frontmatter (name, description required)
+- config.json parses as valid JSON with controlFlow section
+- Stage IDs are sequential starting at 0
+- repairUnits reference valid stage pairs
+- pauseAfterStages reference valid stage IDs
+- Verification thresholds are numeric 0-1
+- Required sources exist in the workspace`,
 
   source_credential_prompt: `Prompt the user to enter credentials for a source.
 
@@ -558,12 +631,24 @@ export function getSessionScopedTools(
       const callbacks = getSessionScopedToolCallbacks(sessionId);
       callbacks?.onAuthRequest?.(request as AuthRequest);
     },
+    onAgentStagePause: (args: { agentSlug: string; stage: number; runId: string; data: Record<string, unknown> }) => {
+      const callbacks = getSessionScopedToolCallbacks(sessionId);
+      callbacks?.onAgentStagePause?.(args);
+    },
+    onAgentEvent: (event: { type: string; agentSlug: string; runId: string; data: Record<string, unknown> }) => {
+      const callbacks = getSessionScopedToolCallbacks(sessionId);
+      callbacks?.onAgentEvent?.(event);
+    },
+    isPauseLocked: () => {
+      const callbacks = getSessionScopedToolCallbacks(sessionId);
+      return callbacks?.isPauseLocked?.() ?? false;
+    },
   });
 
   // Create tools using shared handlers
   const tools = [
-    // SubmitPlan
-    tool('SubmitPlan', TOOL_DESCRIPTIONS.SubmitPlan, submitPlanSchema, async (args) => {
+    // submit_plan
+    tool('submit_plan', TOOL_DESCRIPTIONS.submit_plan, submitPlanSchema, async (args) => {
       const result = await handleSubmitPlan(ctx, args);
       return convertResult(result);
     }),
@@ -626,6 +711,24 @@ export function getSessionScopedTools(
         hint?: string;
         passwordRequired?: boolean;
       });
+      return convertResult(result);
+    }),
+
+    // agent_stage_gate
+    tool('agent_stage_gate', TOOL_DESCRIPTIONS.agent_stage_gate, agentStageGateSchema, async (args) => {
+      const result = await handleAgentStageGate(ctx, args);
+      return convertResult(result);
+    }),
+
+    // agent_state
+    tool('agent_state', TOOL_DESCRIPTIONS.agent_state, agentStateSchema, async (args) => {
+      const result = await handleAgentState(ctx, args);
+      return convertResult(result);
+    }),
+
+    // agent_validate
+    tool('agent_validate', TOOL_DESCRIPTIONS.agent_validate, agentValidateSchema, async (args) => {
+      const result = await handleAgentValidate(ctx, args);
       return convertResult(result);
     }),
 

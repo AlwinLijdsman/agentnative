@@ -40,6 +40,9 @@ export enum AbortReason {
 
   /** Internal error requiring abort */
   InternalError = 'internal_error',
+
+  /** Agent stage gate requires human approval before proceeding */
+  AgentStageGatePause = 'agent_stage_gate_pause',
 }
 
 /**

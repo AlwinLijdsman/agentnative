@@ -17,6 +17,7 @@ import { join } from 'path';
 import matter from 'gray-matter';
 import type { LoadedSkill, SkillMetadata, SkillSource } from './types.ts';
 import { getWorkspaceSkillsPath } from '../workspaces/storage.ts';
+import { loadAllAgents } from '../agents/storage.ts';
 import {
   validateIconValue,
   findIconFile,
@@ -192,6 +193,30 @@ export function loadAllSkills(workspaceRoot: string, projectRoot?: string): Load
     for (const skill of loadSkillsFromDir(projectSkillsDir, 'project')) {
       skillsBySlug.set(skill.slug, skill);
     }
+  }
+
+  // 4. Agent → Skill bridge: load agents as synthetic skills so the SDK's
+  //    native Skill tool can resolve them. If an agent slug collides with
+  //    a skill slug at the same priority level, the agent wins (set after
+  //    skills in the Map). At different priority levels, normal precedence
+  //    applies since loadAllAgents() resolves priority internally.
+  //
+  // DEPRECATED: This bridge exists for backward compatibility with existing
+  // skill-based @mention resolution. New code should use LoadedAgent[] and
+  // [agent:] mention syntax directly via the agent mention pipeline.
+  for (const agent of loadAllAgents(workspaceRoot, projectRoot)) {
+    skillsBySlug.set(agent.slug, {
+      slug: agent.slug,
+      metadata: {
+        name: agent.metadata.name,
+        description: agent.metadata.description,
+        icon: agent.metadata.icon,
+      },
+      content: agent.content,
+      iconPath: agent.iconPath,
+      path: agent.path,
+      source: agent.source,
+    });
   }
 
   return Array.from(skillsBySlug.values());

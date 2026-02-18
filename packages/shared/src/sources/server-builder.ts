@@ -11,6 +11,7 @@
  * - SourceServerBuilder: handles server configuration
  */
 
+import { resolve, isAbsolute } from 'node:path';
 import type { LoadedSource, ApiConfig } from './types.ts';
 import type { ApiCredential } from './credential-manager.ts';
 import { isSourceUsable } from './storage.ts';
@@ -33,7 +34,7 @@ export const SERVER_BUILD_ERRORS = {
  */
 export type McpServerConfig =
   | { type: 'http' | 'sse'; url: string; headers?: Record<string, string> }
-  | { type: 'stdio'; command: string; args?: string[]; env?: Record<string, string> };
+  | { type: 'stdio'; command: string; args?: string[]; env?: Record<string, string>; cwd?: string };
 
 /**
  * Source with its credential pre-loaded
@@ -94,11 +95,16 @@ export class SourceServerBuilder {
         debug(`[SourceServerBuilder] Stdio source ${source.config.slug} missing command`);
         return null;
       }
+      // Resolve relative cwd against the workspace root so config files stay portable
+      const resolvedCwd = mcp.cwd
+        ? (isAbsolute(mcp.cwd) ? mcp.cwd : resolve(source.workspaceRootPath, mcp.cwd))
+        : undefined;
       return {
         type: 'stdio',
         command: mcp.command,
         args: mcp.args,
         env: mcp.env,
+        cwd: resolvedCwd,
       };
     }
 

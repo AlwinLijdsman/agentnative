@@ -1,0 +1,21 @@
+{
+  "id": "anthropic_c4e8f2a1",
+  "name": "Anthropic",
+  "slug": "anthropic",
+  "enabled": true,
+  "provider": "anthropic",
+  "type": "api",
+  "icon": "🔮",
+  "tagline": "Claude AI models API - completions, messages, and model management",
+  "api": {
+    "baseUrl": "https://api.anthropic.com/v1/",
+    "authType": "header",
+    "headerName": "x-api-key",
+    "testEndpoint": {
+      "method": "GET",
+      "path": "models"
+    }
+  },
+  "createdAt": 1739548800000,
+  "updatedAt": 1739548800000
+}

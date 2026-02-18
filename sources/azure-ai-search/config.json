@@ -1,0 +1,21 @@
+{
+  "id": "azure-ai-search_c9f3a0b5",
+  "name": "Azure AI Search",
+  "slug": "azure-ai-search",
+  "enabled": true,
+  "provider": "azure-search",
+  "type": "api",
+  "icon": "🔍",
+  "tagline": "Full-text and vector search over document indexes (digitalauditor-search)",
+  "api": {
+    "baseUrl": "https://digitalauditor-search.search.windows.net/",
+    "authType": "header",
+    "headerName": "api-key",
+    "testEndpoint": {
+      "method": "GET",
+      "path": "indexes?api-version=2024-07-01"
+    }
+  },
+  "createdAt": 1739548800000,
+  "updatedAt": 1739548800000
+}

@@ -1,0 +1,21 @@
+{
+  "id": "azure-openai-swiss_d4a8f1c2",
+  "name": "Azure OpenAI (Swiss)",
+  "slug": "azure-openai-swiss",
+  "enabled": true,
+  "provider": "azure-openai",
+  "type": "api",
+  "icon": "🤖",
+  "tagline": "GPT models via Azure OpenAI - Swiss instance (swiss-gpt-instance)",
+  "api": {
+    "baseUrl": "https://swiss-gpt-instance.openai.azure.com/",
+    "authType": "header",
+    "headerName": "api-key",
+    "testEndpoint": {
+      "method": "GET",
+      "path": "openai/models?api-version=2024-10-21"
+    }
+  },
+  "createdAt": 1739548800000,
+  "updatedAt": 1739548800000
+}

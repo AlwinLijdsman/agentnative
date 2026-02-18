@@ -1,0 +1,22 @@
+{
+  "id": "isa-knowledge-base_a4c2e8f1",
+  "name": "ISA Knowledge Base",
+  "slug": "isa-knowledge-base",
+  "enabled": true,
+  "provider": "isa-kb",
+  "type": "mcp",
+  "icon": "📚",
+  "tagline": "ISA standards knowledge base with hybrid search, graph traversal, and verification",
+  "mcp": {
+    "transport": "stdio",
+    "command": "isa-kb-mcp-server/.venv/Scripts/python.exe",
+    "args": ["-m", "isa_kb_mcp_server"],
+    "cwd": "isa-kb-mcp-server",
+    "env": {
+      "PYTHONPATH": "src"
+    },
+    "authType": "none"
+  },
+  "createdAt": 1739548800000,
+  "updatedAt": 1739548800000
+}

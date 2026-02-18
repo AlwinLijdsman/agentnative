@@ -83,7 +83,7 @@ export interface MessageAttachment {
  */
 export interface ContentBadge {
   /** Badge type - used for fallback icon if iconBase64 not available */
-  type: 'source' | 'skill' | 'context' | 'command' | 'file' | 'folder';
+  type: 'source' | 'skill' | 'agent' | 'context' | 'command' | 'file' | 'folder';
   /** Display label (e.g., "Linear", "Commit") */
   label: string;
   /** Original text pattern (e.g., "@linear", "@commit") */

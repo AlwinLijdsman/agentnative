@@ -1,0 +1,21 @@
+{
+  "id": "azure-doc-intelligence_d0a4b1c6",
+  "name": "Azure Doc Intelligence",
+  "slug": "azure-doc-intelligence",
+  "enabled": true,
+  "provider": "azure-doc-intelligence",
+  "type": "api",
+  "icon": "📑",
+  "tagline": "Document analysis, OCR, and form extraction via Azure Document Intelligence",
+  "api": {
+    "baseUrl": "https://digitalauditor-docintel.cognitiveservices.azure.com/",
+    "authType": "header",
+    "headerName": "Ocp-Apim-Subscription-Key",
+    "testEndpoint": {
+      "method": "GET",
+      "path": "formrecognizer/documentModels?api-version=2024-11-30"
+    }
+  },
+  "createdAt": 1739548800000,
+  "updatedAt": 1739548800000
+}

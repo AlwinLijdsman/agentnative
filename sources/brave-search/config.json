@@ -1,0 +1,21 @@
+{
+  "id": "brave-search_a7d1e8f3",
+  "name": "Brave Search",
+  "slug": "brave-search",
+  "enabled": true,
+  "provider": "brave",
+  "type": "api",
+  "icon": "https://brave.com/static-assets/images/brave-logo-sans-text.svg",
+  "tagline": "Web search, news, and image search via Brave Search API",
+  "api": {
+    "baseUrl": "https://api.search.brave.com/res/v1/",
+    "authType": "header",
+    "headerName": "X-Subscription-Token",
+    "testEndpoint": {
+      "method": "GET",
+      "path": "web/search?q=test&count=1"
+    }
+  },
+  "createdAt": 1739548800000,
+  "updatedAt": 1739548800000
+}

@@ -249,6 +249,12 @@ export interface McpSourceConfig {
    * Environment variables for the spawned process.
    */
   env?: Record<string, string>;
+
+  /**
+   * Working directory for the spawned process.
+   * If not specified, inherits the parent process cwd.
+   */
+  cwd?: string;
 }
 
 /**

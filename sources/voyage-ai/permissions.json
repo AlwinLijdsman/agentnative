@@ -1,0 +1,5 @@
+{
+  "allowedApiEndpoints": [
+    { "method": "POST", "path": "^embeddings$", "comment": "Embeddings are read-only (no side effects)" }
+  ]
+}

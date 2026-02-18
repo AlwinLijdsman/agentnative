@@ -1489,7 +1489,7 @@ const ALWAYS_ALLOWED_TOOLS = new Set([
   'Task', 'TaskOutput',             // Agent orchestration
   'WebFetch', 'WebSearch',          // Web research
   'TodoWrite',                       // Task tracking
-  'SubmitPlan',                     // Plan submission
+  'submit_plan',                    // Plan submission
   'LSP',                            // Language server (read-only)
 ]);
 
@@ -1548,7 +1548,7 @@ export function shouldAllowToolInMode(
     return { allowed: true };
   }
 
-  // Check if tool name ends with an always-allowed tool (for MCP variants like mcp__plan__SubmitPlan)
+  // Check if tool name ends with an always-allowed tool (for MCP variants like mcp__plan__submit_plan)
   for (const allowedTool of ALWAYS_ALLOWED_TOOLS) {
     if (toolName.endsWith(`__${allowedTool}`)) {
       return { allowed: true };
@@ -1750,12 +1750,15 @@ export function shouldAllowToolInMode(
       // Read-only session tools - always allowed in Explore mode
       // These tools don't modify state, they only read/validate/invoke secondary models
       const readOnlySessionTools = [
-        'mcp__session__SubmitPlan',
+        'mcp__session__submit_plan',
         'mcp__session__config_validate',
         'mcp__session__skill_validate',
         'mcp__session__mermaid_validate',
         'mcp__session__source_test',
         'mcp__session__transform_data',
+        'mcp__session__agent_stage_gate',
+        'mcp__session__agent_state',
+        'mcp__session__agent_validate',
       ];
       if (readOnlySessionTools.includes(toolName)) {
         return { allowed: true };

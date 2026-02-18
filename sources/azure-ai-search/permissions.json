@@ -1,0 +1,6 @@
+{
+  "allowedApiEndpoints": [
+    { "method": "GET", "path": ".*", "comment": "All GET requests (list indexes, search documents)" },
+    { "method": "POST", "path": "docs/search", "comment": "Search endpoint (read-only despite POST)" }
+  ]
+}

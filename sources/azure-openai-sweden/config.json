@@ -1,0 +1,21 @@
+{
+  "id": "azure-openai-sweden_e5b9c3d4",
+  "name": "Azure OpenAI (Sweden)",
+  "slug": "azure-openai-sweden",
+  "enabled": true,
+  "provider": "azure-openai",
+  "type": "api",
+  "icon": "🤖",
+  "tagline": "GPT models via Azure OpenAI - Sweden instance (gptogether-sweden)",
+  "api": {
+    "baseUrl": "https://gptogether-sweden-azureopenai.openai.azure.com/",
+    "authType": "header",
+    "headerName": "api-key",
+    "testEndpoint": {
+      "method": "GET",
+      "path": "openai/models?api-version=2024-10-21"
+    }
+  },
+  "createdAt": 1739548800000,
+  "updatedAt": 1739548800000
+}

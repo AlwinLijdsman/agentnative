@@ -1,0 +1,143 @@
+{
+  "controlFlow": {
+    "stages": [
+      {
+        "id": 0,
+        "name": "analyze_query",
+        "description": "Decompose query and optionally calibrate with web search",
+        "pauseInstructions": "Look at the clarity_score and recommended_action in your Stage 0 output and respond in ONE of two modes — do not mix them.\n\nFORMAT RULES (both modes):\n- First line is EXACTLY the word READY or CLARIFYING (nothing else on that line)\n- Then a blank line\n- Then your narrative paragraph(s)\n- Then a blank line before each question\n- Each question is a single line ending with a question mark, followed by numbered options — one per line, formatted as: N. Option label — short explanation\n- No tables, no bullet lists outside options, no sub-query breakdown, no depth/scope labels, no 'shall I proceed?'\n- The user can reply with just the numbers (e.g. '2' or '2, 1, 3') plus optional free text\n\nMODE A — Intent is clear (clarity_score >= 0.7 OR recommended_action = 'proceed'):\nWrite your understanding of what you will research and your key assumptions in 1-3 sentences. Then add ONE specific question about the single thing that would most improve the research (scope, depth, or a key assumption), with 2-3 numbered options.\n\nExample:\nREADY\n\nI'll focus on ISA 540 (Revised) as the core framework for auditing insurance reserve estimates, covering risk assessment through substantive testing and documentation — including ISA 230 and ISA 330. My key assumption is that you want both testwork procedures and documentation requirements from the auditor's perspective.\n\nShould I also cover evaluating a management-appointed actuary's work?\n1. Yes — include ISA 620 management expert evaluation alongside direct testing\n2. No — keep the focus on the auditor's direct testing and documentation duties only\n\nMODE B — Intent is genuinely ambiguous (clarity_score < 0.7 OR recommended_action = 'clarify'):\nState what makes the query ambiguous in 1-2 sentences. Then ask one or more focused questions, each with 2-3 numbered options on separate lines. If you need to clarify multiple independent dimensions, use a separate question block for each.\n\nExample:\nCLARIFYING\n\nYour question touches on several areas where I need your input to deliver the most useful research.\n\nWhat scope of ISA standards should I cover?\n1. ISA 540 (Revised) only — focused on accounting estimates\n2. Cross-standard — ISA 540, 230, 330, 620 and their interactions\n3. Full thematic — all ISAs relevant to insurance audit engagements\n\nWhat depth of coverage do you want for testwork procedures?\n1. High-level overview — key procedures and their purpose\n2. Detailed walkthrough — step-by-step with examples and common pitfalls\n3. Comprehensive — include edge cases, firm-specific adaptations, and regulatory overlaps"
+      },
+      { "id": 1, "name": "retrieve", "description": "Hybrid search + graph traversal + context formatting" },
+      { "id": 2, "name": "synthesize", "description": "Generate structured answer from XML context" },
+      { "id": 3, "name": "verify", "description": "4-axis verification (EG, CA, RP, CD)" },
+      { "id": 4, "name": "output", "description": "Format final output with progressive disclosure" }
+    ],
+    "repairUnits": [
+      {
+        "stages": [2, 3],
+        "maxIterations": 2,
+        "feedbackField": "repair_instructions"
+      }
+    ],
+    "pauseAfterStages": [0],
+    "autoAdvance": true,
+    "pauseOnErrors": ["auth", "config"],
+    "stageOutputSchemas": {
+      "0": {
+        "required": ["query_plan"],
+        "properties": {
+          "query_plan": {
+            "type": "object",
+            "required": ["original_query", "sub_queries", "depth_mode"],
+            "properties": {
+              "original_query": { "type": "string" },
+              "sub_queries": { "type": "array", "minItems": 1 },
+              "depth_mode": { "type": "string", "enum": ["quick", "standard", "deep"] },
+              "assumptions": { "type": "array" },
+              "alternative_interpretations": { "type": "array" },
+              "recommended_action": { "type": "string", "enum": ["proceed", "clarify"] }
+            }
+          }
+        }
+      },
+      "1": {
+        "required": ["retrieval_summary"],
+        "properties": {
+          "retrieval_summary": {
+            "type": "object",
+            "required": ["total_paragraphs_found", "unique_after_dedup", "standards_covered"],
+            "properties": {
+              "total_paragraphs_found": { "type": "number" },
+              "unique_after_dedup": { "type": "number" },
+              "standards_covered": { "type": "array", "minItems": 1 }
+            }
+          }
+        }
+      },
+      "2": {
+        "required": ["synthesis", "citations_used"],
+        "properties": {
+          "synthesis": { "type": "string" },
+          "citations_used": { "type": "array", "minItems": 1 }
+        }
+      },
+      "3": {
+        "required": ["verification_scores", "all_passed"],
+        "properties": {
+          "verification_scores": { "type": "object" },
+          "all_passed": { "type": "boolean" }
+        }
+      },
+      "4": {
+        "required": ["answer_delivered"],
+        "properties": {
+          "answer_delivered": { "type": "boolean" },
+          "total_citations": { "type": "number" }
+        }
+      }
+    },
+    "webSearch": {
+      "enabled": true,
+      "provider": "brave",
+      "maxQueries": 5,
+      "preferredDomains": [
+        "ifac.org",
+        "iaasb.org",
+        "pcaobus.org",
+        "aicpa.org",
+        "accountancyeurope.eu"
+      ]
+    }
+  },
+  "depthModes": {
+    "quick": {
+      "maxSubQueries": 3,
+      "maxParagraphsPerQuery": 10,
+      "maxRepairIterations": 0,
+      "contextTokenBudget": 4000,
+      "enableWebSearch": false
+    },
+    "standard": {
+      "maxSubQueries": 8,
+      "maxParagraphsPerQuery": 20,
+      "maxRepairIterations": 2,
+      "contextTokenBudget": 8000,
+      "enableWebSearch": true
+    },
+    "deep": {
+      "maxSubQueries": 15,
+      "maxParagraphsPerQuery": 30,
+      "maxRepairIterations": 3,
+      "contextTokenBudget": 16000,
+      "enableWebSearch": true
+    }
+  },
+  "verification": {
+    "entityGrounding": { "threshold": 0.80 },
+    "relationPreservation": { "threshold": 0.70 },
+    "citationAccuracy": { "threshold": 0.75 },
+    "contradictions": { "maxUnresolved": 0 }
+  },
+  "logging": {
+    "level": "verbose",
+    "persistIntermediates": true,
+    "costTracking": true
+  },
+  "followUp": {
+    "enabled": true,
+    "deltaRetrieval": true,
+    "maxAccumulatedSections": 30
+  },
+  "output": {
+    "progressiveDisclosure": true,
+    "citationFormat": "ISA {number}.{paragraph}"
+  },
+  "debug": {
+    "enabled": false,
+    "maxParagraphs": 5,
+    "maxToolCalls": 10,
+    "skipVerification": false,
+    "skipWebSearch": true,
+    "useFixtures": false
+  }
+}

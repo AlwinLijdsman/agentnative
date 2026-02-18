@@ -99,7 +99,7 @@ import { getSystemPrompt } from '../prompts/system.ts';
 // Credential manager for token storage
 import { getCredentialManager } from '../credentials/manager.ts';
 
-// Session-scoped tool callbacks (for SubmitPlan, source auth, etc.)
+// Session-scoped tool callbacks (for submit_plan, source auth, etc.)
 import {
   registerSessionScopedToolCallbacks,
   unregisterSessionScopedToolCallbacks,
@@ -344,7 +344,7 @@ export class CopilotAgent extends BaseAgent {
     this.currentUserMessage = message;
     this.adapter.startTurn();
 
-    // Register session-scoped tool callbacks (for SubmitPlan, source auth, etc.)
+    // Register session-scoped tool callbacks (for submit_plan, source auth, etc.)
     const sessionId = this.config.session?.id;
     if (sessionId) {
       registerSessionScopedToolCallbacks(sessionId, {
@@ -607,7 +607,7 @@ export class CopilotAgent extends BaseAgent {
     }
 
     // ============================================================
-    // Detect session MCP tool completions (SubmitPlan, auth tools)
+    // Detect session MCP tool completions (submit_plan, auth tools)
     // ============================================================
     // WHY: Session-scoped tools run in an external MCP server subprocess
     // (packages/session-mcp-server) which can't trigger callbacks cross-process.
@@ -632,7 +632,7 @@ export class CopilotAgent extends BaseAgent {
     }
 
     // Step 2: On successful completion, fire the appropriate callback
-    // (e.g., onPlanSubmitted for SubmitPlan, onAuthRequest for auth tools)
+    // (e.g., onPlanSubmitted for submit_plan, onAuthRequest for auth tools)
     if (event.type === 'tool.execution_complete') {
       const data = event.data as { toolCallId: string; success: boolean };
       const pending = this.pendingSessionToolCalls.get(data.toolCallId);
@@ -1003,7 +1003,7 @@ export class CopilotAgent extends BaseAgent {
       }
     }
 
-    // Add session-scoped MCP server (provides SubmitPlan, config_validate, source_test, etc.)
+    // Add session-scoped MCP server (provides submit_plan, config_validate, source_test, etc.)
     if (this.config.sessionServerPath) {
       const sessionId = this.config.session?.id;
       const workspaceRootPath = this.config.workspace.rootPath;

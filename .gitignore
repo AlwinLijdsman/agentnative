@@ -63,3 +63,12 @@ id_ed25519*
 # Credentials files
 credentials.enc
 *.credentials
+nul
+
+# Session logs (contain secrets from tool calls/API responses)
+sessions/
+
+# Source configs with embedded credentials
+sources/onedrive-server/
+sources/outlook-server/
+sources/pdf-server/

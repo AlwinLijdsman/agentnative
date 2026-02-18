@@ -82,7 +82,7 @@ export const BUILT_IN_TOOLS = new Set([
   'MultiEdit',
   'NotebookEdit',
   'KillShell',
-  'SubmitPlan',
+  'submit_plan',
   'Skill',
   'SlashCommand',
   'TaskStop',

@@ -31,6 +31,8 @@ import type {
   AuthCallback,
   SourceChangeCallback,
   SourceActivationCallback,
+  AgentStagePauseCallback,
+  AgentEventCallback,
   SdkMcpServerConfig,
   BackendConfig,
 } from './backend/types.ts';
@@ -56,9 +58,10 @@ import {
   type HandleLargeResponseResult,
 } from '../utils/large-response.ts';
 
-// Skill extraction for Codex/Copilot backends (Claude uses native SDK Skill tool)
+// Skill/agent extraction for Codex/Copilot backends (Claude uses native SDK Skill tool)
 import { parseMentions, stripAllMentions } from '../mentions/index.ts';
 import { loadWorkspaceSkills } from '../skills/storage.ts';
+import { loadWorkspaceAgents } from '../agents/storage.ts';
 
 // ============================================================
 // Mini Agent Configuration
@@ -147,6 +150,13 @@ export abstract class BaseAgent implements AgentBackend {
   onPermissionModeChange: ((mode: PermissionMode) => void) | null = null;
   onDebug: ((message: string) => void) | null = null;
   onSourceActivationRequest: SourceActivationCallback | null = null;
+  onAgentStagePause: AgentStagePauseCallback | null = null;
+  onAgentEvent: AgentEventCallback | null = null;
+  /**
+   * Returns true if the pipeline was just paused in this turn (same LLM response batch).
+   * Used by handler guards to block LLM self-resume.
+   */
+  isPauseLocked: (() => boolean) | null = null;
   onUsageUpdate: ((update: UsageUpdate) => void) | null = null;
 
   // ============================================================
@@ -263,11 +273,11 @@ export abstract class BaseAgent implements AgentBackend {
   // ============================================================
 
   /**
-   * Handle successful completion of a session MCP tool (SubmitPlan, auth tools).
+   * Handle successful completion of a session MCP tool (submit_plan, auth tools).
    *
    * WHY THIS IS ON BaseAgent:
    * -------------------------
-   * Session-scoped tools (SubmitPlan, source_oauth_trigger, etc.) run in an
+   * Session-scoped tools (submit_plan, source_oauth_trigger, etc.) run in an
    * EXTERNAL MCP server subprocess (packages/session-mcp-server). That subprocess
    * has its own process memory, so when it calls getSessionScopedToolCallbacks(),
    * the callback registry is empty — it was populated in THIS process, not the subprocess.
@@ -280,7 +290,7 @@ export abstract class BaseAgent implements AgentBackend {
    * via Claude Agent SDK, so the callback registry works directly.
    *
    * CALLBACKS FIRED:
-   * - SubmitPlan → this.onPlanSubmitted(planPath)
+   * - submit_plan → this.onPlanSubmitted(planPath)
    *   → Electron reads plan file, shows plan card, calls forceAbort(PlanSubmitted)
    * - Auth tools → this.onAuthRequest(authRequest)
    *   → Electron shows auth dialog, calls forceAbort(AuthRequest)
@@ -289,14 +299,14 @@ export abstract class BaseAgent implements AgentBackend {
     toolName: string,
     args: Record<string, unknown>
   ): void {
-    // SubmitPlan — trigger plan view in the UI.
+    // submit_plan — trigger plan view in the UI.
     // The Electron SessionManager's onPlanSubmitted callback will:
     //   1. Read the plan file content
     //   2. Create a plan message (role: 'plan')
     //   3. Send plan_submitted event to renderer
     //   4. Call forceAbort(AbortReason.PlanSubmitted) → turn terminates
-    if (toolName === 'SubmitPlan' && args.planPath) {
-      this.debug(`SubmitPlan completed: ${args.planPath}`);
+    if (toolName === 'submit_plan' && args.planPath) {
+      this.debug(`submit_plan completed: ${args.planPath}`);
       this.onPlanSubmitted?.(args.planPath as string);
       return;
     }
@@ -707,10 +717,15 @@ Please continue the conversation naturally from where we left off.
     const skills = loadWorkspaceSkills(workspaceRoot);
     const skillSlugs = skills.map(s => s.slug);
 
-    this.debug(`[extractSkillContent] Available skills: ${skillSlugs.join(', ')}`);
+    // Also load agents for [agent:slug] mention detection
+    const agents = loadWorkspaceAgents(workspaceRoot);
+    const agentSlugs = agents.map(a => a.slug);
 
-    const parsed = parseMentions(message, skillSlugs, []);
-    this.debug(`[extractSkillContent] Parsed skills: ${JSON.stringify(parsed.skills)}`);
+    this.debug(`[extractSkillContent] Available skills: ${skillSlugs.join(', ')}`);
+    this.debug(`[extractSkillContent] Available agents: ${agentSlugs.join(', ')}`);
+
+    const parsed = parseMentions(message, skillSlugs, [], agentSlugs);
+    this.debug(`[extractSkillContent] Parsed skills: ${JSON.stringify(parsed.skills)}, agents: ${JSON.stringify(parsed.agents)}`);
 
     // Read matched SKILL.md files and wrap in XML tags
     const skillContents: string[] = [];
@@ -727,15 +742,24 @@ Please continue the conversation naturally from where we left off.
       }
     }
 
+    // Read matched AGENT.md content and wrap in <agent> XML tags
+    for (const slug of parsed.agents) {
+      const agent = agents.find(a => a.slug === slug);
+      if (agent) {
+        this.debug(`[extractSkillContent] Loaded agent ${agent.slug} (${agent.content.length} chars)`);
+        skillContents.push(`<agent name="${agent.slug}">\n${agent.content}\n</agent>`);
+      }
+    }
+
     // Strip all bracket mentions from the message text
     const stripped = stripAllMentions(message).trim();
 
-    // If user sent only skill mentions with no other text, add a directive
+    // If user sent only skill/agent mentions with no other text, add a directive
     const cleanMessage = (!stripped && skillContents.length > 0)
       ? 'Follow the skill instructions above.'
       : stripped;
 
-    this.debug(`[extractSkillContent] Clean message: "${cleanMessage.slice(0, 100)}...", skills: ${skillContents.length}`);
+    this.debug(`[extractSkillContent] Clean message: "${cleanMessage.slice(0, 100)}...", skills+agents: ${skillContents.length}`);
 
     return { skillContents, cleanMessage };
   }

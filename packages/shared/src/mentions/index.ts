@@ -6,6 +6,7 @@
  *
  * Mention types:
  * - Skills:  [skill:slug] or [skill:workspaceId:slug]
+ * - Agents:  [agent:slug] or [agent:workspaceId:slug]
  * - Sources: [source:slug]
  * - Files:   [file:path]
  * - Folders: [folder:path]
@@ -26,6 +27,8 @@ export const WS_ID_CHARS = '[\\w .-]'
 export interface ParsedMentions {
   /** Skill slugs mentioned via [skill:slug] */
   skills: string[]
+  /** Agent slugs mentioned via [agent:slug] */
+  agents: string[]
   /** Source slugs mentioned via [source:slug] */
   sources: string[]
   /** File paths mentioned via [file:path] */
@@ -44,19 +47,22 @@ export interface ParsedMentions {
  * @param text - The message text to parse
  * @param availableSkillSlugs - Valid skill slugs to match against
  * @param availableSourceSlugs - Valid source slugs to match against
+ * @param availableAgentSlugs - Valid agent slugs to match against
  * @returns Parsed mentions by type
  *
  * @example
  * parseMentions('[skill:commit] [source:linear]', ['commit'], ['linear'])
- * // Returns: { skills: ['commit'], sources: ['linear'] }
+ * // Returns: { skills: ['commit'], agents: [], sources: ['linear'] }
  */
 export function parseMentions(
   text: string,
   availableSkillSlugs: string[],
-  availableSourceSlugs: string[]
+  availableSourceSlugs: string[],
+  availableAgentSlugs: string[] = []
 ): ParsedMentions {
   const result: ParsedMentions = {
     skills: [],
+    agents: [],
     sources: [],
     files: [],
     folders: [],
@@ -80,6 +86,16 @@ export function parseMentions(
     const slug = match[1]!
     if (availableSkillSlugs.includes(slug) && !result.skills.includes(slug)) {
       result.skills.push(slug)
+    }
+  }
+
+  // Match agent mentions: [agent:slug] or [agent:workspaceId:slug]
+  // Same pattern as skills but with agent: prefix
+  const agentPattern = new RegExp(`\\[agent:(?:${WS_ID_CHARS}+:)?([\\w-]+)\\]`, 'g')
+  while ((match = agentPattern.exec(text)) !== null) {
+    const slug = match[1]!
+    if (availableAgentSlugs.includes(slug) && !result.agents.includes(slug)) {
+      result.agents.push(slug)
     }
   }
 
@@ -117,6 +133,8 @@ export function stripAllMentions(text: string): string {
     // Remove [skill:slug] or [skill:workspaceId:slug]
     // Workspace IDs can contain spaces, hyphens, underscores, and dots
     .replace(new RegExp(`\\[skill:(?:${WS_ID_CHARS}+:)?[\\w-]+\\]`, 'g'), '')
+    // Remove [agent:slug] or [agent:workspaceId:slug]
+    .replace(new RegExp(`\\[agent:(?:${WS_ID_CHARS}+:)?[\\w-]+\\]`, 'g'), '')
     // Remove [file:path]
     .replace(/\[file:[^\]]+\]/g, '')
     // Remove [folder:path]

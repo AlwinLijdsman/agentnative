@@ -156,6 +156,16 @@ export const routes = {
       return `skills/skill/${skillSlug}` as const
     },
 
+    /** Agents view (agents navigator). Pass a slug for agent detail, or slug+runId for run detail. */
+    agents: (agentSlug?: string) => {
+      if (!agentSlug) return 'agents' as const
+      return `agents/agent/${agentSlug}` as const
+    },
+
+    /** Agent run detail view. */
+    agentRun: (agentSlug: string, runId: string) =>
+      `agents/agent/${agentSlug}/run/${runId}` as const,
+
     /** Settings view (settings navigator) - uses SettingsSubpage from registry */
     settings: (subpage?: SettingsSubpage) =>
       subpage

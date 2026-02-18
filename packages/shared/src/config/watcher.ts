@@ -107,6 +107,12 @@ export interface ConfigWatcherCallbacks {
   /** Called when the skills list changes (add/remove folders) */
   onSkillsListChange?: (skills: LoadedSkill[]) => void;
 
+  // Agent callbacks
+  /** Called when a specific agent changes (null if deleted) */
+  onAgentChange?: (slug: string, agent: import('../agents/types.ts').LoadedAgent | null) => void;
+  /** Called when the agents list changes (add/remove folders) */
+  onAgentsListChange?: (agents: import('../agents/types.ts').LoadedAgent[]) => void;
+
   // Permissions callbacks
   /** Called when app-level default permissions change (~/.craft-agent/permissions/default.json) */
   onDefaultPermissionsChange?: () => void;

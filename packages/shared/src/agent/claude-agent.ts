@@ -314,7 +314,7 @@ function getPreferencesServer(_unused?: boolean): ReturnType<typeof createSdkMcp
  */
 export type SdkMcpServerConfig =
   | { type: 'http' | 'sse'; url: string; headers?: Record<string, string> }
-  | { type: 'stdio'; command: string; args?: string[]; env?: Record<string, string> };
+  | { type: 'stdio'; command: string; args?: string[]; env?: Record<string, string>; cwd?: string };
 
 /**
  * Detect the Windows ENOENT .claude/skills directory error from the Claude Code SDK.
@@ -415,7 +415,7 @@ export class ClaudeAgent extends BaseAgent {
   public onPlanSubmitted: ((planPath: string) => void) | null = null;
 
   // Callback when authentication is requested (unified auth flow)
-  // This follows the SubmitPlan pattern:
+  // This follows the submit_plan pattern:
   // 1. Tool calls onAuthRequest
   // 2. Session manager creates auth-request message and calls forceAbort
   // 3. User completes auth in UI
@@ -426,7 +426,8 @@ export class ClaudeAgent extends BaseAgent {
   // Callback when a source config changes (hot-reload from file watcher)
   public onSourceChange: ((slug: string, source: LoadedSource | null) => void) | null = null;
 
-  // onSourcesListChange, onConfigValidationError, and onSourceActivationRequest are inherited from BaseAgent
+  // onSourcesListChange, onConfigValidationError, onSourceActivationRequest,
+  // onAgentStagePause, and isPauseLocked are inherited from BaseAgent
 
   // Callback when token usage is updated (for context window display).
   // Note: Full UsageTracker integration is planned for Phase 4 refactoring.
@@ -493,6 +494,15 @@ export class ClaudeAgent extends BaseAgent {
         this.onDebug?.(`[ClaudeAgent] onAuthRequest received: ${request.sourceSlug} (type: ${request.type})`);
         this.onAuthRequest?.(request);
       },
+      onAgentStagePause: (args) => {
+        this.onDebug?.(`[ClaudeAgent] onAgentStagePause: agent=${args.agentSlug} stage=${args.stage} run=${args.runId}`);
+        this.onAgentStagePause?.(args);
+      },
+      onAgentEvent: (event) => {
+        this.onDebug?.(`[ClaudeAgent] onAgentEvent: type=${event.type} agent=${event.agentSlug} run=${event.runId}`);
+        this.onAgentEvent?.(event);
+      },
+      isPauseLocked: () => this.isPauseLocked?.() ?? false,
     });
 
     // Start config watcher for hot-reloading source changes
@@ -660,7 +670,7 @@ export class ClaudeAgent extends BaseAgent {
       // Build full MCP servers set first, then filter for mini agents
       const fullMcpServers: Options['mcpServers'] = {
         preferences: getPreferencesServer(false),
-        // Session-scoped tools (SubmitPlan, source_test, etc.)
+        // Session-scoped tools (submit_plan, source_test, etc.)
         session: getSessionScopedTools(sessionId, this.workspaceRootPath),
         // Craft Agents documentation - always available for searching setup guides
         // This is a public Mintlify MCP server, no auth needed
@@ -885,7 +895,7 @@ export class ClaudeAgent extends BaseAgent {
                 if (parts.length >= 3 && serverName) {
                   // Built-in MCP servers that are always available (not user sources)
                   // - preferences: user preferences storage
-                  // - session: session-scoped tools (SubmitPlan, source_test, etc.)
+                  // - session: session-scoped tools (submit_plan, source_test, etc.)
                   // - craft-agents-docs: always-available documentation search
                   const builtInMcpServers = new Set(['preferences', 'session', 'craft-agents-docs']);
 
@@ -1263,8 +1273,14 @@ export class ClaudeAgent extends BaseAgent {
           }],
           SubagentStop: [{
             hooks: [async (input, _toolUseID) => {
-              const typedInput = input as { agent_id?: string };
-              debug(`[ClaudeAgent] SubagentStop: agent_id=${typedInput.agent_id}`);
+              const typedInput = input as { agent_id?: string; agent_type?: string };
+              debug(`[ClaudeAgent] SubagentStop: agent_id=${typedInput.agent_id}, type=${typedInput.agent_type ?? 'unknown'}`);
+              // Warn on potential silent failure — if the SDK returns a subagent stop
+              // but the subagent produced no usable output, downstream tool_result
+              // will be empty. This helps diagnose 0-byte output crashes (see bold-fjord session).
+              if (!typedInput.agent_id) {
+                debug(`[ClaudeAgent] WARNING: SubagentStop with no agent_id — possible silent subagent failure`);
+              }
               return { continue: true };
             }],
           }],
@@ -1799,7 +1815,19 @@ export class ClaudeAgent extends BaseAgent {
       // emit complete even on error so application knows we're done
       yield { type: 'complete' };
     } finally {
+      // Cleanup safety net for normal completion (no forceAbort called).
+      // When forceAbort() WAS called: this.currentQuery is already null (forceAbort nulled it
+      // and scheduled a delayed close), so queryRef is null and close() is not called again.
+      // When forceAbort() was NOT called: close the query to prevent orphaned CLI subprocesses.
+      const queryRef = this.currentQuery;
       this.currentQuery = null;
+      if (queryRef) {
+        try {
+          queryRef.close();
+        } catch {
+          // Query may already be cleaned up — safe to ignore
+        }
+      }
       // Reset ultrathink override after query completes (single-shot per-message boost)
       // Note: thinkingLevel is NOT reset - it's sticky for the session
       this._ultrathinkOverride = false;
@@ -2589,17 +2617,44 @@ export class ClaudeAgent extends BaseAgent {
 
   /**
    * Force-abort the current query using the SDK's AbortController.
-   * This immediately stops processing (SIGTERM/SIGKILL) without waiting for graceful shutdown.
-   * Use this when you need instant termination (e.g., queuing a new message).
+   *
+   * Two-phase termination:
+   * 1. abort(reason) — sends SIGTERM to CLI subprocess, sets abort signal so the
+   *    `for await` loop in chat() throws AbortError on next iteration. This preserves
+   *    the existing error handling path (session ID cleanup, reason tracking, etc.).
+   * 2. Delayed close() (2s) — if SIGTERM failed (e.g., subprocess blocked on an API call
+   *    with extended thinking), close() sends SIGTERM again + SIGKILL after 5s, and cleans
+   *    up pending MCP requests/transports. The 2s delay gives SIGTERM time to produce
+   *    AbortError first, and allows the MCP tool handler to send its response.
    *
    * @param reason - Why the abort is happening (affects UI feedback)
    */
   forceAbort(reason: AbortReason = AbortReason.UserStop): void {
+    debug('[ClaudeAgent] forceAbort: reason=%s, hasQuery=%s, hasAbortController=%s', reason, !!this.currentQuery, !!this.currentQueryAbortController);
     this.lastAbortReason = reason;
+
+    // Phase 1: SIGTERM via abort signal — triggers AbortError in the for-await loop
     if (this.currentQueryAbortController) {
       this.currentQueryAbortController.abort(reason);
       this.currentQueryAbortController = null;
     }
+
+    // Phase 2: Delayed close() — SIGKILL fallback if SIGTERM didn't kill the process.
+    // Must be delayed to preserve the AbortError catch path (immediate close() calls
+    // inputStream.done() which ends the iterator normally, bypassing AbortError).
+    // Also avoids closing the MCP transport before the tool handler sends its response.
+    const queryRef = this.currentQuery;
+    if (queryRef) {
+      debug('[ClaudeAgent] forceAbort: scheduled delayed close() in 2s for SIGKILL fallback');
+      setTimeout(() => {
+        try {
+          queryRef.close();
+        } catch {
+          // Query may already be cleaned up — safe to ignore
+        }
+      }, 2000);
+    }
+
     this.currentQuery = null;
   }
 

@@ -1,0 +1,15 @@
+{
+  "id": "agentnative_f7e3a1b9",
+  "name": "AgentNative",
+  "slug": "agentnative",
+  "enabled": true,
+  "provider": "agentnative",
+  "type": "local",
+  "icon": "🏗️",
+  "tagline": "AgentNative monorepo - Craft Agent desktop app codebase",
+  "local": {
+    "path": "C:\\dev\\deving\\agentnative"
+  },
+  "createdAt": 1739610120000,
+  "updatedAt": 1739610120000
+}

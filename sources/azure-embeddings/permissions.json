@@ -1,0 +1,6 @@
+{
+  "allowedApiEndpoints": [
+    { "method": "GET", "path": ".*", "comment": "All GET requests (list models)" },
+    { "method": "POST", "path": "embeddings", "comment": "Embeddings are read-only (no side effects)" }
+  ]
+}

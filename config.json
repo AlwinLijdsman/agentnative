@@ -1,0 +1,24 @@
+{
+  "id": "ws_e8751334",
+  "name": "agentnative",
+  "slug": "agentnative",
+  "defaults": {
+    "permissionMode": "safe",
+    "cyclablePermissionModes": [
+      "safe",
+      "allow-all"
+    ],
+    "enabledSourceSlugs": [
+      "agentnative"
+    ],
+    "defaultLlmConnection": "claude-max",
+    "model": "claude-opus-4-6",
+    "thinkingLevel": "max",
+    "workingDirectory": "C:\\dev\\deving\\agentnative"
+  },
+  "localMcpServers": {
+    "enabled": true
+  },
+  "createdAt": 1771083588110,
+  "updatedAt": 1771169149951
+}

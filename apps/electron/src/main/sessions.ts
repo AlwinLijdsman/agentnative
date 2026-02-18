@@ -1,7 +1,7 @@
 import { app } from 'electron'
 import * as Sentry from '@sentry/electron/main'
 import { basename, join } from 'path'
-import { existsSync } from 'fs'
+import { existsSync, readFileSync, readdirSync } from 'fs'
 import { rm, readFile, mkdir, writeFile, rename, open } from 'fs/promises'
 import { CraftAgent, type AgentEvent, setPermissionMode, type PermissionMode, unregisterSessionScopedToolCallbacks, AbortReason, type AuthRequest, type AuthResult, type CredentialAuthRequest } from '@craft-agent/shared/agent'
 import {
@@ -75,7 +75,9 @@ import { getCredentialManager } from '@craft-agent/shared/credentials'
 import { CraftMcpClient } from '@craft-agent/shared/mcp'
 import { type Session, type Message, type SessionEvent, type FileAttachment, type StoredAttachment, type SendMessageOptions, IPC_CHANNELS, generateMessageId } from '../shared/types'
 import { formatPathsToRelative, formatToolInputPaths, perf, encodeIconToDataUrl, getEmojiIcon, resetSummarizationClient, resolveToolIcon } from '@craft-agent/shared/utils'
-import { loadWorkspaceSkills, type LoadedSkill } from '@craft-agent/shared/skills'
+import { loadWorkspaceSkills, loadAllSkills, type LoadedSkill } from '@craft-agent/shared/skills'
+import { loadWorkspaceAgents } from '@craft-agent/shared/agents'
+import { parseMentions } from '@craft-agent/shared/mentions'
 import type { ToolDisplayMeta } from '@craft-agent/core/types'
 import { getToolIconsDir, isCodexModel, getMiniModel, DEFAULT_MODEL, DEFAULT_CODEX_MODEL } from '@craft-agent/shared/config'
 import type { SummarizeCallback } from '@craft-agent/shared/sources'
@@ -333,7 +335,7 @@ async function setupCodexSessionConfig(
     : join(process.cwd(), 'packages', 'bridge-mcp-server', 'dist', 'index.js')
   const bridgeConfigPath = join(sessionPath, '.codex-home', 'bridge-config.json')
 
-  // Session MCP server path - provides session-scoped tools (SubmitPlan, config_validate, etc.)
+  // Session MCP server path - provides session-scoped tools (submit_plan, config_validate, etc.)
   // - Packaged: resources/session-mcp-server/index.js (copied during build)
   // - Dev: packages/session-mcp-server/dist/index.js (built by electron:build:main)
   const sessionServerPath = app.isPackaged
@@ -350,13 +352,13 @@ async function setupCodexSessionConfig(
   // Check if session server exists
   const sessionServerExists = existsSync(sessionServerPath)
   if (!sessionServerExists) {
-    sessionLog.warn(`Session MCP server not found at ${sessionServerPath}. Session-scoped tools (SubmitPlan, etc.) will not be available in Codex sessions. Run 'bun run electron:build' to build it.`)
+    sessionLog.warn(`Session MCP server not found at ${sessionServerPath}. Session-scoped tools (submit_plan, etc.) will not be available in Codex sessions. Run 'bun run electron:build' to build it.`)
   }
 
   // Extract workspaceId from first source (all sources in a session share the same workspace)
   const workspaceId = sources[0]?.workspaceId
 
-  // Plans folder path for SubmitPlan tool
+  // Plans folder path for submit_plan tool
   const plansFolderPath = sessionId && workspaceRootPath
     ? join(workspaceRootPath, 'sessions', sessionId, 'plans')
     : undefined
@@ -371,7 +373,7 @@ async function setupCodexSessionConfig(
     bridgeConfigPath: bridgeExists ? bridgeConfigPath : undefined,
     // workspaceId is required for the bridge's --workspace flag (credential lookups)
     workspaceId,
-    // Session server provides session-scoped tools (SubmitPlan, config_validate, etc.)
+    // Session server provides session-scoped tools (submit_plan, config_validate, etc.)
     // Only include if the session server exists and we have the required session info
     sessionServerPath: sessionServerExists && sessionId && workspaceRootPath ? sessionServerPath : undefined,
     sessionId,
@@ -516,7 +518,7 @@ function resolveToolDisplayMeta(
       // Internal MCP server tools (session, preferences, docs)
       const internalMcpServers: Record<string, Record<string, string>> = {
         'session': {
-          'SubmitPlan': 'Submit Plan',
+          'submit_plan': 'Submit Plan',
           'config_validate': 'Validate Config',
           'skill_validate': 'Validate Skill',
           'mermaid_validate': 'Validate Mermaid',
@@ -582,9 +584,10 @@ function resolveToolDisplayMeta(
       if (skillSlug) {
         // Load skills and find the one being invoked
         try {
-          const skills = loadWorkspaceSkills(workspaceRootPath)
+          const skills = loadAllSkills(workspaceRootPath)
           const skill = skills.find(s => s.slug === skillSlug)
           if (skill) {
+            sessionLog.debug(`[skill-resolve] hit slug=${skillSlug} displayName=${skill.metadata.name}`)
             // Try file-based icon first, fall back to emoji icon from metadata
             const iconDataUrl = skill.iconPath
               ? encodeIconToDataUrl(skill.iconPath)
@@ -595,9 +598,11 @@ function resolveToolDisplayMeta(
               description: skill.metadata.description,
               category: 'skill' as const,
             }
+          } else {
+            sessionLog.warn(`[skill-resolve] miss slug=${skillSlug} available=[${skills.map(s => s.slug).join(',')}]`)
           }
-        } catch {
-          // Skills loading failed, skip
+        } catch (skillLoadErr) {
+          sessionLog.warn(`[skill-resolve] loadAllSkills failed`, skillLoadErr instanceof Error ? skillLoadErr.message : String(skillLoadErr))
         }
       }
     }
@@ -660,6 +665,11 @@ interface ManagedSession {
   isProcessing: boolean
   /** Set when user requests stop - allows event loop to drain before clearing isProcessing */
   stopRequested?: boolean
+  /**
+   * Set when onAgentStagePause fires — blocks LLM self-resume in the same turn.
+   * Cleared in onProcessingStopped when the turn ends.
+   */
+  pauseLocked?: boolean
   lastMessageAt: number
   streamingText: string
   // Incremented each time a new message starts processing.
@@ -1033,10 +1043,19 @@ export class SessionManager {
       },
       onSkillChange: async (slug, skill) => {
         sessionLog.info(`Skill '${slug}' changed:`, skill ? 'updated' : 'deleted')
-        // Broadcast updated list to UI
-        const { loadWorkspaceSkills } = await import('@craft-agent/shared/skills')
-        const skills = loadWorkspaceSkills(workspaceRootPath)
+        // Broadcast updated list to UI (use loadAllSkills to include agent→skill bridge)
+        const skills = loadAllSkills(workspaceRootPath)
         this.broadcastSkillsChanged(skills)
+      },
+
+      onAgentsListChange: async (agents) => {
+        sessionLog.info(`Agents list changed in ${workspaceRootPath} (${agents.length} agents)`)
+        this.broadcastAgentsChanged(agents)
+      },
+      onAgentChange: async (_slug, _agent) => {
+        const { loadWorkspaceAgents } = await import('@craft-agent/shared/agents')
+        const agents = loadWorkspaceAgents(workspaceRootPath)
+        this.broadcastAgentsChanged(agents)
       },
 
       // Session metadata changes (external edits to session.jsonl headers).
@@ -1190,6 +1209,12 @@ export class SessionManager {
     this.windowManager.broadcastToAll(IPC_CHANNELS.SKILLS_CHANGED, skills)
   }
 
+  private broadcastAgentsChanged(agents: import('@craft-agent/shared/agents').LoadedAgent[]): void {
+    if (!this.windowManager) return
+    sessionLog.info(`Broadcasting agents changed (${agents.length} agents)`)
+    this.windowManager.broadcastToAll(IPC_CHANNELS.AGENTS_CHANGED, agents)
+  }
+
   /**
    * Broadcast default permissions changed event to all windows
    * Triggered when ~/.craft-agent/permissions/default.json changes
@@ -1272,6 +1297,10 @@ export class SessionManager {
       }
       const connection = slug ? getLlmConnection(slug) : null
 
+      // Debug: log which env vars were set before clearing
+      const hadOAuthBefore = !!process.env.CLAUDE_CODE_OAUTH_TOKEN
+      const hadApiKeyBefore = !!process.env.ANTHROPIC_API_KEY
+
       // Clear all auth env vars first to ensure clean state
       delete process.env.ANTHROPIC_API_KEY
       delete process.env.CLAUDE_CODE_OAUTH_TOKEN
@@ -1325,6 +1354,24 @@ export class SessionManager {
           }
         }
         // OpenAI OAuth doesn't use env vars - handled by CodexAgent via tryInjectStoredChatGptTokens
+      }
+
+      // Debug: log auth resolution summary
+      const hasOAuthAfter = !!process.env.CLAUDE_CODE_OAUTH_TOKEN
+      const hasApiKeyAfter = !!process.env.ANTHROPIC_API_KEY
+      const priorityLevel = hasOAuthAfter ? 2 : hasApiKeyAfter ? 6 : 0
+      sessionLog.info(
+        `[auth-debug] reinitializeAuth complete: ` +
+        `connection=${slug ?? 'none'}, authType=${connection?.authType ?? 'none'}, ` +
+        `priorityLevel=${priorityLevel}, ` +
+        `oauthBefore=${hadOAuthBefore}→after=${hasOAuthAfter}, ` +
+        `apiKeyBefore=${hadApiKeyBefore}→after=${hasApiKeyAfter}`
+      )
+
+      // Record refresh timestamp for diagnostics
+      if (hasOAuthAfter || hasApiKeyAfter) {
+        const { recordTokenRefresh } = await import('@craft-agent/shared/auth/state')
+        recordTokenRefresh()
       }
 
       // Reset cached summarization client so it picks up new credentials/base URL
@@ -2571,14 +2618,14 @@ export class SessionManager {
         )
         const { mcpServers, apiServers } = await buildServersFromSources(enabledSources, sessionPath, managed.tokenRefreshManager)
 
-        // Session MCP server path - provides session-scoped tools (SubmitPlan, config_validate, etc.)
+        // Session MCP server path - provides session-scoped tools (submit_plan, config_validate, etc.)
         // Same resolution logic as Codex branch (line ~324)
         const copilotSessionServerPath = app.isPackaged
           ? join(app.getAppPath(), 'resources', 'session-mcp-server', 'index.js')
           : join(process.cwd(), 'packages', 'session-mcp-server', 'dist', 'index.js')
         const copilotSessionServerExists = existsSync(copilotSessionServerPath)
         if (!copilotSessionServerExists) {
-          sessionLog.warn(`Session MCP server not found at ${copilotSessionServerPath}. Session-scoped tools (SubmitPlan, etc.) will not be available in Copilot sessions. Run 'bun run electron:build' to build it.`)
+          sessionLog.warn(`Session MCP server not found at ${copilotSessionServerPath}. Session-scoped tools (submit_plan, etc.) will not be available in Copilot sessions. Run 'bun run electron:build' to build it.`)
         }
 
         // Create per-session config directory for Copilot CLI
@@ -2780,9 +2827,9 @@ export class SessionManager {
           // Read the plan file content
           const planContent = await readFile(planPath, 'utf-8')
 
-          // Mark the SubmitPlan tool message as completed (it won't get a tool_result due to forceAbort)
+          // Mark the submit_plan tool message as completed (it won't get a tool_result due to forceAbort)
           const submitPlanMsg = managed.messages.find(
-            m => m.toolName?.includes('SubmitPlan') && m.toolStatus === 'executing'
+            m => m.toolName?.includes('submit_plan') && m.toolStatus === 'executing'
           )
           if (submitPlanMsg) {
             submitPlanMsg.toolStatus = 'completed'
@@ -2865,7 +2912,7 @@ export class SessionManager {
         managed.pendingAuthRequestId = request.requestId
         managed.pendingAuthRequest = request
 
-        // Force-abort execution (like SubmitPlan)
+        // Force-abort execution (like submit_plan)
         if (managed.isProcessing && managed.agent) {
           sessionLog.info(`Force-aborting after auth request for session ${managed.id}`)
           managed.agent.forceAbort(AbortReason.AuthRequest)
@@ -2888,6 +2935,101 @@ export class SessionManager {
 
         // OAuth flow is now user-initiated via startSessionOAuth()
         // The UI will call sessionCommand({ type: 'startOAuth' }) when user clicks "Sign in"
+      }
+
+      // Wire up isPauseLocked to let tool handlers check if pause is active in this turn
+      managed.agent.isPauseLocked = () => managed.pauseLocked === true
+
+      // Wire up onAgentStagePause to pause execution when a stage gate requires human approval
+      managed.agent.onAgentStagePause = async ({ agentSlug, stage, runId, data }: { agentSlug: string; stage: number; runId: string; data: Record<string, unknown> }) => {
+        sessionLog.info(`[stage-gate][pause] entered — agent=${agentSlug} stage=${stage} runId=${runId}`)
+
+        try {
+          // Lock pause immediately — blocks any further resume/start/complete in this turn
+          managed.pauseLocked = true
+          sessionLog.debug(`[stage-gate][pause] pauseLocked=true`)
+
+          // Mark the executing agent_stage_gate tool as completed.
+          const stageTool = managed.messages.find(
+            m => m.toolName?.includes('agent_stage_gate') && m.toolStatus === 'executing'
+          )
+          if (stageTool) {
+            stageTool.toolStatus = 'completed'
+            stageTool.content = `Stage ${stage} completed. Awaiting approval.`
+            stageTool.toolResult = JSON.stringify({ pauseRequired: true, stage, data })
+            sessionLog.debug(`[stage-gate][pause] marked tool completed toolUseId=${stageTool.toolUseId}`)
+          } else {
+            sessionLog.warn(`[stage-gate][pause] no executing agent_stage_gate tool found to mark completed`)
+          }
+
+          // Send stage_gate_pause event to renderer
+          this.sendEvent({
+            type: 'agent_stage_gate_pause',
+            sessionId: managed.id,
+            agentSlug,
+            stage,
+            runId,
+            data,
+          }, managed.workspace.id)
+          sessionLog.debug(`[stage-gate][pause] emitted agent_stage_gate_pause`)
+
+          sessionLog.info(`[stage-gate][pause] natural-completion mode active — waiting for LLM summary completion`)
+        } catch (pauseError) {
+          sessionLog.error(`[stage-gate][pause] FAILED`, pauseError instanceof Error ? { name: pauseError.name, message: pauseError.message, stack: pauseError.stack } : String(pauseError))
+          throw pauseError
+        }
+      }
+
+      // Wire up onAgentEvent for real-time agent pipeline progress streaming
+      managed.agent.onAgentEvent = (event: { type: string; agentSlug: string; runId: string; data: Record<string, unknown> }) => {
+        sessionLog.info(`Agent event: type=${event.type} agent=${event.agentSlug} run=${event.runId}`)
+
+        // Map stage gate event types to SessionEvent types and broadcast to renderer
+        switch (event.type) {
+          case 'agent_stage_started':
+            this.sendEvent({
+              type: 'agent_stage_started',
+              sessionId: managed.id,
+              agentSlug: event.agentSlug,
+              runId: event.runId,
+              stage: event.data.stage as number,
+              stageName: (event.data.stageName as string) ?? 'unknown',
+            }, managed.workspace.id)
+            break
+          case 'agent_stage_completed':
+            this.sendEvent({
+              type: 'agent_stage_completed',
+              sessionId: managed.id,
+              agentSlug: event.agentSlug,
+              runId: event.runId,
+              stage: event.data.stage as number,
+              stageName: (event.data.stageName as string) ?? 'unknown',
+              data: event.data,
+            }, managed.workspace.id)
+            break
+          case 'agent_repair_iteration':
+            this.sendEvent({
+              type: 'agent_repair_iteration',
+              sessionId: managed.id,
+              agentSlug: event.agentSlug,
+              runId: event.runId,
+              iteration: event.data.iteration as number,
+              scores: event.data.scores as Record<string, number> | undefined,
+            }, managed.workspace.id)
+            break
+          case 'agent_run_completed':
+            this.sendEvent({
+              type: 'agent_run_completed',
+              sessionId: managed.id,
+              agentSlug: event.agentSlug,
+              runId: event.runId,
+              verificationStatus: (event.data.verificationStatus as string) ?? 'pending',
+            }, managed.workspace.id)
+            break
+          default:
+            // Unknown agent event — log but don't broadcast
+            sessionLog.warn(`Unknown agent event type: ${event.type}`)
+        }
       }
 
       // Wire up onSourceActivationRequest to auto-enable sources when agent tries to use them
@@ -3797,6 +3939,73 @@ export class SessionManager {
     sessionLog.info(`Deleted session ${sessionId}`)
   }
 
+
+  // ============================================================
+  // Agent Stage Gate Resume Context
+  // ============================================================
+
+  /**
+   * Scan for paused agent pipelines and generate resume context to inject
+   * into the message. This ensures the LLM knows to call
+   * agent_stage_gate({ action: "resume" }) before proceeding to the next stage.
+   *
+    * Without this, the LLM may not have deterministic resume instructions in
+    * its context window after pause completion/compaction boundaries.
+   */
+  private getPausedAgentResumeContext(sessionPath: string): string | null {
+    const agentsDir = join(sessionPath, 'data', 'agents')
+    if (!existsSync(agentsDir)) return null
+
+    try {
+      const slugs = readdirSync(agentsDir, { withFileTypes: true })
+        .filter(d => d.isDirectory())
+        .map(d => d.name)
+
+      for (const slug of slugs) {
+        const stateFile = join(agentsDir, slug, 'current-run-state.json')
+        if (!existsSync(stateFile)) continue
+
+        try {
+          const state = JSON.parse(readFileSync(stateFile, 'utf8'))
+          if (state.pausedAtStage !== undefined && state.pausedAtStage !== null) {
+            const nextStage = state.pausedAtStage + 1
+            return (
+              `<agent_pipeline_resume agentSlug="${slug}" pausedAtStage="${state.pausedAtStage}" runId="${state.runId}" nextStage="${nextStage}">` +
+              `\nThe ${slug} agent pipeline is PAUSED after stage ${state.pausedAtStage} (completed stages: ${JSON.stringify(state.completedStages)}).` +
+              `\nIMPORTANT: Only resume the pipeline if the user's message CLEARLY indicates a decision about the paused pipeline.` +
+              `\n` +
+              `\nExplicit proceed signals (case-insensitive): "proceed", "continue", "go ahead", "looks good", "approved", "yes", "lgtm", "ok", "next"` +
+              `\nExplicit abort signals: "abort", "cancel", "stop", "nevermind", "no"` +
+              `\nExplicit modify signals: the message includes specific requested changes to the paused stage output` +
+              `\n` +
+              `\nIf the user's message matches a proceed signal:` +
+              `\n  1. Call agent_stage_gate({ agentSlug: "${slug}", action: "resume", data: { decision: "proceed" } })` +
+              `\n  2. Then call agent_stage_gate({ agentSlug: "${slug}", action: "start", stage: ${nextStage} })` +
+              `\n` +
+              `\nIf the user's message matches an abort signal:` +
+              `\n  1. Call agent_stage_gate({ agentSlug: "${slug}", action: "resume", data: { decision: "abort" } })` +
+              `\n` +
+              `\nIf the user's message matches a modify signal:` +
+              `\n  1. Call agent_stage_gate({ agentSlug: "${slug}", action: "resume", data: { decision: "modify", modifications: { ... } } })` +
+              `\n  2. Then call agent_stage_gate({ agentSlug: "${slug}", action: "start", stage: ${nextStage} })` +
+              `\n` +
+              `\nIf the user's message is unrelated to the paused pipeline:` +
+              `\n  - Do NOT call resume.` +
+              `\n  - Do NOT call start.` +
+              `\n  - Respond to the user normally, then remind them the pipeline remains paused and ask for explicit 'proceed', 'modify', or 'abort'.` +
+              `\n</agent_pipeline_resume>`
+            )
+          }
+        } catch {
+          // Corrupted state file - skip
+        }
+      }
+    } catch {
+      // Cannot read agents dir - skip
+    }
+
+    return null
+  }
   async sendMessage(sessionId: string, message: string, attachments?: FileAttachment[], storedAttachments?: StoredAttachment[], options?: SendMessageOptions, existingMessageId?: string, _isAuthRetry?: boolean): Promise<void> {
     const managed = this.sessions.get(sessionId)
     if (!managed) {
@@ -3811,11 +4020,12 @@ export class SessionManager {
     // Ensure messages are loaded before we try to add new ones
     await this.ensureMessagesLoaded(managed)
 
-    // If currently processing, queue the message and interrupt via forceAbort.
-    // The abort throws an AbortError (caught in the catch block) which calls
-    // onProcessingStopped → processNextQueuedMessage to drain the queue.
+    // If currently processing, queue the message.
     if (managed.isProcessing) {
-      sessionLog.info(`Session ${sessionId} is processing, queueing message and interrupting`)
+      const queueReason = managed.pauseLocked
+        ? 'pause-locked'
+        : 'in-flight'
+      sessionLog.info(`[stage-gate][queue] session=${sessionId} queueing message reason=${queueReason}`)
 
       // Create user message for queued state (so UI can show it)
       const queuedMessage: Message = {
@@ -3842,8 +4052,16 @@ export class SessionManager {
         optimisticMessageId: options?.optimisticMessageId
       }, managed.workspace.id)
 
-      // Force-abort via Query.close() - immediately stops processing.
-      // The for-await loop will complete, triggering onProcessingStopped → queue drain.
+      // During an active pause lock, allow natural completion so the LLM can
+      // finish its pause summary. Do not redirect-abort in this case.
+      if (managed.pauseLocked) {
+        sessionLog.info(`[stage-gate][queue] pause-locked queue hold active — no redirect abort session=${sessionId}`)
+        return
+      }
+
+      // Normal in-flight behavior: interrupt and drain queue.
+      // The abort throws an AbortError (caught in the catch block) which calls
+      // onProcessingStopped → processNextQueuedMessage.
       managed.agent?.forceAbort(AbortReason.Redirect)
 
       return
@@ -3985,6 +4203,60 @@ export class SessionManager {
     agent.setAllSources(allSources)
     sendSpan.mark('sources.loaded')
 
+    // Auto-enable required sources for mentioned agents
+    // Agents declare required sources in AGENT.md frontmatter (e.g. isa-knowledge-base for isa-deep-research).
+    // Pre-enabling them here avoids the agent wasting tool calls to discover and activate sources at runtime.
+    if (message.includes('[agent:')) {
+      try {
+        const agents = loadWorkspaceAgents(workspaceRootPath)
+        const agentSlugs = agents.map(a => a.slug)
+        const parsed = parseMentions(message, [], [], agentSlugs)
+
+        if (parsed.agents.length > 0) {
+          const slugSet = new Set(managed.enabledSourceSlugs || [])
+          let sourcesAdded = false
+
+          for (const agentSlug of parsed.agents) {
+            const agent_ = agents.find(a => a.slug === agentSlug)
+            if (!agent_?.metadata.sources) continue
+
+            for (const sourceBinding of agent_.metadata.sources) {
+              if (!sourceBinding.required) continue
+              if (slugSet.has(sourceBinding.slug)) continue
+
+              // Check if source exists and is usable
+              const sourceCandidates = getSourcesBySlugs(workspaceRootPath, [sourceBinding.slug])
+              if (sourceCandidates.length === 0) {
+                sessionLog.warn(`Required source ${sourceBinding.slug} for agent ${agentSlug} not found in workspace`)
+                continue
+              }
+              if (!isSourceUsable(sourceCandidates[0])) {
+                sessionLog.warn(`Required source ${sourceBinding.slug} for agent ${agentSlug} is not usable (disabled or requires authentication)`)
+                continue
+              }
+
+              slugSet.add(sourceBinding.slug)
+              sourcesAdded = true
+              sessionLog.info(`Auto-enabled required source ${sourceBinding.slug} for agent ${agentSlug}`)
+            }
+          }
+
+          if (sourcesAdded) {
+            managed.enabledSourceSlugs = Array.from(slugSet)
+            this.persistSession(managed)
+            this.sendEvent({
+              type: 'sources_changed',
+              sessionId: managed.id,
+              enabledSourceSlugs: managed.enabledSourceSlugs,
+            }, managed.workspace.id)
+          }
+        }
+        sendSpan.mark('agent.sources.resolved')
+      } catch (e) {
+        sessionLog.warn('Failed to auto-enable agent required sources:', e)
+      }
+    }
+
     // Apply source servers if any are enabled
     if (managed.enabledSourceSlugs?.length) {
       // Always build server configs fresh (no caching - single source of truth)
@@ -4064,6 +4336,15 @@ export class SessionManager {
       const chatSessionDir = getSessionStoragePath(workspaceRootPath, sessionId)
       toolMetadataStore.setSessionDir(chatSessionDir)
 
+      // Inject agent stage gate resume context if a pipeline is paused.
+      // This ensures the LLM has explicit instructions to call
+      // agent_stage_gate({ action: "resume" }) before continuing.
+      const resumeContext = this.getPausedAgentResumeContext(chatSessionDir)
+      if (resumeContext) {
+        sessionLog.info('Injecting agent stage gate resume context for paused pipeline')
+        message = resumeContext + '\n\n' + message
+      }
+
       sendSpan.mark('chat.starting')
       const chatIterator = agent.chat(message, attachments)
       sessionLog.info('Got chat iterator, starting iteration...')
@@ -4104,13 +4385,13 @@ export class SessionManager {
           // Skip normal completion handling if auth retry is in progress
           // The retry will handle its own completion
           if (managed.authRetryInProgress) {
-            sessionLog.info('Chat completed but auth retry is in progress, skipping normal completion handling')
+            sessionLog.info('[chat-loop] exit=auth_retry — auth retry in progress, skipping normal completion')
             sendSpan.mark('chat.complete.auth_retry_pending')
             sendSpan.end()
             return  // Exit function - retry will handle completion
           }
 
-          sessionLog.info('Chat completed via complete event')
+          sessionLog.info('[chat-loop] exit=complete')
 
           // Check if we got an assistant response in this turn
           // If not, the SDK may have hit context limits or other issues
@@ -4139,10 +4420,10 @@ export class SessionManager {
 
       // Loop exited - either via complete event (normal) or generator ended after soft interrupt
       if (managed.stopRequested) {
-        sessionLog.info('Chat loop completed after stop request - events drained successfully')
+        sessionLog.info('[chat-loop] exit=stop_drained — events drained after forceAbort')
         this.onProcessingStopped(sessionId, 'interrupted')
       } else {
-        sessionLog.info('Chat loop exited unexpectedly')
+        sessionLog.warn('[chat-loop] exit=unexpected — loop ended without complete event or stopRequested')
       }
     } catch (error) {
       // Check if this is an abort error (expected when interrupted)
@@ -4156,19 +4437,18 @@ export class SessionManager {
         // Extract abort reason if available (safety net for unexpected abort propagation)
         const reason = (error as DOMException).cause as AbortReason | undefined
 
-        sessionLog.info(`Chat aborted (reason: ${reason || 'unknown'})`)
+        sessionLog.info(`[chat-loop] exit=abort reason=${reason || 'unknown'}`)
         sendSpan.mark('chat.aborted')
         sendSpan.setMetadata('abort_reason', reason || 'unknown')
         sendSpan.end()
 
         // Plan submissions handle their own cleanup (they set isProcessing = false directly).
         // All other abort reasons route through onProcessingStopped for queue draining.
-        if (reason === AbortReason.UserStop || reason === AbortReason.Redirect || reason === undefined) {
+        if (reason === AbortReason.UserStop || reason === AbortReason.Redirect || reason === AbortReason.AgentStageGatePause || reason === undefined) {
           this.onProcessingStopped(sessionId, 'interrupted')
         }
       } else {
-        sessionLog.error('Error in chat:', error)
-        sessionLog.error('Error message:', error instanceof Error ? error.message : String(error))
+        sessionLog.error(`[chat-loop] exit=error message=${error instanceof Error ? error.message : String(error)}`)
         sessionLog.error('Error stack:', error instanceof Error ? error.stack : 'No stack')
 
         // Report chat/SDK errors to Sentry for crash tracking
@@ -4192,7 +4472,7 @@ export class SessionManager {
       // Normal completion returns early after calling onProcessingStopped
       // Errors are handled in catch block
       if (managed.isProcessing && managed.processingGeneration === myGeneration) {
-        sessionLog.info('Finally block cleanup - unexpected exit')
+        sessionLog.warn('[chat-loop] exit=finally_safety — isProcessing still true after loop')
         sendSpan.mark('chat.unexpected_exit')
         sendSpan.end()
         this.onProcessingStopped(sessionId, 'interrupted')
@@ -4268,6 +4548,7 @@ export class SessionManager {
     // 1. Cleanup state
     managed.isProcessing = false
     managed.stopRequested = false  // Reset for next turn
+    managed.pauseLocked = false    // Reset pause lock for next turn
 
     // Notify power manager that a session stopped processing
     // (may allow display sleep if no other sessions are active)
@@ -4303,10 +4584,31 @@ export class SessionManager {
     }
 
     // 4. Check queue and process or complete
-    if (managed.messageQueue.length > 0) {
-      // Has queued messages - process next
+    // If any agent pipeline is paused, do not auto-drain queued messages.
+    // This prevents auto-continuation without an explicit post-pause user decision.
+    const sessionPath = getSessionStoragePath(managed.workspace.rootPath, sessionId)
+    const hasPausedPipeline = this.getPausedAgentResumeContext(sessionPath) !== null
+
+    if (managed.messageQueue.length > 0 && !hasPausedPipeline) {
+      // Has queued messages and no paused pipeline - process next
+      sessionLog.info('[stage-gate][queue-drain] draining queued messages', {
+        sessionId,
+        queuedCount: managed.messageQueue.length,
+        reason,
+        hasPausedPipeline,
+      })
       this.processNextQueuedMessage(sessionId)
     } else {
+      if (managed.messageQueue.length > 0 && hasPausedPipeline) {
+        sessionLog.info('[stage-gate][queue-hold] holding queued messages while paused', {
+          sessionId,
+          queuedCount: managed.messageQueue.length,
+          hasPausedPipeline,
+          reason,
+          pausedContextPresent: true,
+        })
+      }
+
       // No queue - emit complete to UI (include tokenUsage and hasUnread for state updates)
       this.sendEvent({
         type: 'complete',
@@ -5355,7 +5657,7 @@ To view this task's output:
    */
   private resolveHookMentions(workspaceRootPath: string, mentions: string[]): { sourceSlugs: string[]; skillSlugs: string[] } | undefined {
     const sources = loadWorkspaceSources(workspaceRootPath)
-    const skills = loadWorkspaceSkills(workspaceRootPath)
+    const skills = loadAllSkills(workspaceRootPath)
     const sourceSlugs: string[] = []
     const skillSlugs: string[] = []
 

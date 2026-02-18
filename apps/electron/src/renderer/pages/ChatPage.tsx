@@ -51,6 +51,7 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
     onInputChange,
     enabledSources,
     skills,
+    agents,
     labels,
     onSessionLabelsChange,
     enabledModes,
@@ -520,6 +521,7 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
                 onInputChange={handleInputChange}
                 sources={enabledSources}
                 skills={skills}
+                agents={agents}
                 todoStates={todoStates}
                 onTodoStateChange={handleTodoStateChange}
                 workspaceId={activeWorkspaceId || undefined}
@@ -593,6 +595,7 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
             onInputChange={handleInputChange}
             sources={enabledSources}
             skills={skills}
+            agents={agents}
             labels={labels}
             onLabelsChange={(newLabels) => onSessionLabelsChange?.(sessionId, newLabels)}
             todoStates={todoStates}

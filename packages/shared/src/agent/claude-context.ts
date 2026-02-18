@@ -78,6 +78,9 @@ export interface ClaudeContextOptions {
   workspaceId: string;
   onPlanSubmitted: (planPath: string) => void;
   onAuthRequest: (request: unknown) => void;
+  onAgentStagePause?: (args: { agentSlug: string; stage: number; runId: string; data: Record<string, unknown> }) => void;
+  onAgentEvent?: (event: { type: string; agentSlug: string; runId: string; data: Record<string, unknown> }) => void;
+  isPauseLocked?: () => boolean;
 }
 
 /**
@@ -91,7 +94,7 @@ export interface ClaudeContextOptions {
  * - Icon management
  */
 export function createClaudeContext(options: ClaudeContextOptions): SessionToolContext {
-  const { sessionId, workspacePath, workspaceId, onPlanSubmitted, onAuthRequest } = options;
+  const { sessionId, workspacePath, workspaceId, onPlanSubmitted, onAuthRequest, onAgentStagePause, onAgentEvent, isPauseLocked } = options;
 
   // File system implementation
   const fs: FileSystemInterface = {
@@ -114,6 +117,9 @@ export function createClaudeContext(options: ClaudeContextOptions): SessionToolC
   const callbacks: SessionToolCallbacks = {
     onPlanSubmitted,
     onAuthRequest: (request) => onAuthRequest(request),
+    onAgentStagePause,
+    onAgentEvent,
+    isPauseLocked,
   };
 
   // Validators implementation
@@ -239,6 +245,7 @@ export function createClaudeContext(options: ClaudeContextOptions): SessionToolC
     workspacePath,
     get sourcesPath() { return join(workspacePath, 'sources'); },
     get skillsPath() { return join(workspacePath, 'skills'); },
+    get agentsPath() { return join(workspacePath, 'agents'); },
     plansFolderPath: getSessionPlansPath(workspacePath, sessionId),
     callbacks,
     fs,

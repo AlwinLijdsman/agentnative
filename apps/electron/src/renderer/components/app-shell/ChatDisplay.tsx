@@ -141,6 +141,8 @@ interface ChatDisplayProps {
   // Skill selection (for @mentions)
   /** Available skills for @mention autocomplete */
   skills?: LoadedSkill[]
+  /** Available agents for @mention autocomplete */
+  agents?: import('@craft-agent/shared/agents').LoadedAgent[]
   // Label selection (for #labels)
   /** Available label configs (tree) for label menu and badge display */
   labels?: import('@craft-agent/shared/labels').LabelConfig[]
@@ -402,6 +404,8 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
   onSourcesChange,
   // Skills (for @mentions)
   skills,
+  // Agents (for @mentions)
+  agents,
   // Labels (for #labels)
   labels,
   onLabelsChange,
@@ -1552,6 +1556,21 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
               onTodoStateChange={onTodoStateChange}
             />
             )}
+            {session.pausedAgent && (
+              <div className="mb-2 rounded-md border border-info/30 bg-info/10 px-3 py-2">
+                <div className="flex items-start gap-2 text-sm">
+                  <Info className="mt-0.5 h-4 w-4 shrink-0 text-info" />
+                  <div className="text-foreground/90">
+                    <div className="font-medium text-foreground">
+                      Pipeline paused after stage {session.pausedAgent.stage} ({session.pausedAgent.agentSlug})
+                    </div>
+                    <div className="mt-0.5 text-xs text-muted-foreground">
+                      Reply with <span className="font-medium text-foreground">proceed</span>, <span className="font-medium text-foreground">modify</span>, or <span className="font-medium text-foreground">abort</span> to continue.
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
             <InputContainer
               compactMode={compactMode}
               placeholder={placeholder}
@@ -1578,6 +1597,7 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
               enabledSourceSlugs={session.enabledSourceSlugs}
               onSourcesChange={onSourcesChange}
               skills={skills}
+              agents={agents}
               labels={labels}
               sessionLabels={session.labels}
               onLabelAdd={(labelId) => {

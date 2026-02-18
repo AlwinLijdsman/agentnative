@@ -26,6 +26,7 @@ import {
   HelpCircle,
   ExternalLink,
   Cake,
+  Bot,
 } from "lucide-react"
 import { PanelRightRounded } from "../icons/PanelRightRounded"
 import { PanelLeftRounded } from "../icons/PanelLeftRounded"
@@ -85,6 +86,7 @@ import type { Session, Workspace, FileAttachment, PermissionRequest, LoadedSourc
 import { sessionMetaMapAtom, type SessionMeta } from "@/atoms/sessions"
 import { sourcesAtom } from "@/atoms/sources"
 import { skillsAtom } from "@/atoms/skills"
+import { agentsAtom } from "@/atoms/agents"
 import { type TodoStateId, type TodoState, statusConfigsToTodoStates } from "@/config/todo-states"
 import { useStatuses } from "@/hooks/useStatuses"
 import { useLabels } from "@/hooks/useLabels"
@@ -104,12 +106,14 @@ import {
   isSourcesNavigation,
   isSettingsNavigation,
   isSkillsNavigation,
+  isAgentsNavigation,
   type NavigationState,
   type SessionFilter,
 } from "@/contexts/NavigationContext"
 import type { SettingsSubpage } from "../../../shared/types"
 import { SourcesListPanel } from "./SourcesListPanel"
 import { SkillsListPanel } from "./SkillsListPanel"
+import { AgentsListPanel } from "./AgentsListPanel"
 import { PanelHeader } from "./PanelHeader"
 import { EditPopover, getEditConfig, type EditContextKey } from "@/components/ui/EditPopover"
 import { getDocUrl } from "@craft-agent/shared/docs/doc-links"
@@ -754,6 +758,15 @@ function AppShellContent({
   React.useEffect(() => {
     setSkillsAtom(skills)
   }, [skills, setSkillsAtom])
+
+  // Agents state (workspace-scoped)
+  const [agents, setAgents] = React.useState<import('@craft-agent/shared/agents').LoadedAgent[]>([])
+  // Sync agents to atom for NavigationContext auto-selection
+  const setAgentsAtom = useSetAtom(agentsAtom)
+  React.useEffect(() => {
+    setAgentsAtom(agents)
+  }, [agents, setAgentsAtom])
+
   // Whether local MCP servers are enabled (affects stdio source status)
   const [localMcpEnabled, setLocalMcpEnabled] = React.useState(true)
 
@@ -838,6 +851,14 @@ function AppShellContent({
   React.useEffect(() => {
     const cleanup = window.electronAPI.onSkillsChanged?.((updatedSkills) => {
       setSkills(updatedSkills || [])
+    })
+    return cleanup
+  }, [])
+
+  // Subscribe to live agent updates (when agents are added/removed/modified)
+  React.useEffect(() => {
+    const cleanup = window.electronAPI.onAgentsChanged?.((updatedAgents) => {
+      setAgents(updatedAgents || [])
     })
     return cleanup
   }, [])
@@ -979,6 +1000,12 @@ function AppShellContent({
   const handleSkillSelect = React.useCallback((skill: LoadedSkill) => {
     if (!activeWorkspaceId) return
     navigate(routes.view.skills(skill.slug))
+  }, [activeWorkspaceId, navigate])
+
+  // Handle selecting an agent from the list
+  const handleAgentSelect = React.useCallback((agent: import('@craft-agent/shared/agents').LoadedAgent) => {
+    if (!activeWorkspaceId) return
+    navigate(routes.view.agents(agent.slug))
   }, [activeWorkspaceId, navigate])
 
   // Focus zone management
@@ -1203,6 +1230,16 @@ function AppShellContent({
       console.error('[Chat] Failed to load skills:', err)
     })
   }, [activeWorkspaceId, activeSessionWorkingDirectory])
+
+  // Load agents (workspace-scoped only — no project-level agents)
+  React.useEffect(() => {
+    if (!activeWorkspaceId) return
+    window.electronAPI.getAgents(activeWorkspaceId).then((loaded) => {
+      setAgents(loaded || [])
+    }).catch(err => {
+      console.error('[Chat] Failed to load agents:', err)
+    })
+  }, [activeWorkspaceId])
 
   // Filter session metadata by active workspace
   // Also exclude hidden sessions (mini-agent sessions) from all counts and lists
@@ -1456,6 +1493,7 @@ function AppShellContent({
     textareaRef: chatInputRef,
     enabledSources: sources,
     skills,
+    agents,
     labels: labelConfigs,
     onSessionLabelsChange: handleSessionLabelsChange,
     enabledModes,
@@ -1467,7 +1505,7 @@ function AppShellContent({
     isSearchModeActive: searchActive,
     chatDisplayRef,
     onChatMatchInfoChange: handleChatMatchInfoChange,
-  }), [contextValue, handleDeleteSession, sources, skills, labelConfigs, handleSessionLabelsChange, enabledModes, effectiveTodoStates, handleSessionSourcesChange, rightSidebarOpenButton, searchActive, searchQuery, handleChatMatchInfoChange])
+  }), [contextValue, handleDeleteSession, sources, skills, agents, labelConfigs, handleSessionLabelsChange, enabledModes, effectiveTodoStates, handleSessionSourcesChange, rightSidebarOpenButton, searchActive, searchQuery, handleChatMatchInfoChange])
 
   // Persist expanded folders to localStorage (workspace-scoped)
   React.useEffect(() => {
@@ -1573,6 +1611,11 @@ function AppShellContent({
   // Handler for skills view
   const handleSkillsClick = useCallback(() => {
     navigate(routes.view.skills())
+  }, [])
+
+  // Handler for agents view
+  const handleAgentsClick = useCallback(() => {
+    navigate(routes.view.agents())
   }, [])
 
   // Handler for settings view
@@ -1752,6 +1795,18 @@ function AppShellContent({
     }
   }, [activeWorkspace])
 
+  // Delete Agent
+  const handleDeleteAgent = useCallback(async (agentSlug: string) => {
+    if (!activeWorkspace) return
+    try {
+      await window.electronAPI.deleteAgent(activeWorkspace.id, agentSlug)
+      toast.success(`Deleted agent: ${agentSlug}`)
+    } catch (error) {
+      console.error('[Chat] Failed to delete agent:', error)
+      toast.error('Failed to delete agent')
+    }
+  }, [activeWorkspace])
+
   // Respond to menu bar "New Chat" trigger
   const menuTriggerRef = useRef(menuNewChatTrigger)
   useEffect(() => {
@@ -1795,14 +1850,17 @@ function AppShellContent({
     // 2b. Archived section
     result.push({ id: 'nav:archived', type: 'nav', action: handleArchivedClick })
 
-    // 3. Sources, Skills, Settings
+    // 3. Sources, Skills, Agents, Settings
     result.push({ id: 'nav:sources', type: 'nav', action: handleSourcesClick })
     result.push({ id: 'nav:skills', type: 'nav', action: handleSkillsClick })
+    if (agents.length > 0) {
+      result.push({ id: 'nav:agents', type: 'nav', action: handleAgentsClick })
+    }
     result.push({ id: 'nav:settings', type: 'nav', action: () => handleSettingsClick('app') })
     result.push({ id: 'nav:whats-new', type: 'nav', action: handleWhatsNewClick })
 
     return result
-  }, [handleAllSessionsClick, handleFlaggedClick, handleArchivedClick, handleTodoStateClick, effectiveTodoStates, handleLabelClick, labelConfigs, labelTree, viewConfigs, handleViewClick, handleSourcesClick, handleSkillsClick, handleSettingsClick, handleWhatsNewClick])
+  }, [handleAllSessionsClick, handleFlaggedClick, handleArchivedClick, handleTodoStateClick, effectiveTodoStates, handleLabelClick, labelConfigs, labelTree, viewConfigs, handleViewClick, handleSourcesClick, handleSkillsClick, handleAgentsClick, agents.length, handleSettingsClick, handleWhatsNewClick])
 
   // Toggle folder expanded state
   const handleToggleFolder = React.useCallback((path: string) => {
@@ -1919,6 +1977,11 @@ function AppShellContent({
     // Skills navigator
     if (isSkillsNavigation(navState)) {
       return 'All Skills'
+    }
+
+    // Agents navigator
+    if (isAgentsNavigation(navState)) {
+      return 'Agents'
     }
 
     // Settings navigator
@@ -2261,6 +2324,17 @@ function AppShellContent({
                         onAddSkill: openAddSkill,
                       },
                     },
+                    ...(agents.length > 0 ? [{
+                      id: "nav:agents",
+                      title: "Agents",
+                      label: String(agents.length),
+                      icon: Bot,
+                      variant: isAgentsNavigation(navState) ? "default" as const : "ghost" as const,
+                      onClick: handleAgentsClick,
+                      contextMenu: {
+                        type: 'agents' as const,
+                      },
+                    }] : []),
                     // --- Separator ---
                     { id: "separator:skills-settings", type: "separator" },
                     // --- Settings ---
@@ -2988,6 +3062,16 @@ function AppShellContent({
                 onSkillClick={handleSkillSelect}
                 onDeleteSkill={handleDeleteSkill}
                 selectedSkillSlug={isSkillsNavigation(navState) && navState.details?.type === 'skill' ? navState.details.skillSlug : null}
+              />
+            )}
+            {isAgentsNavigation(navState) && activeWorkspaceId && (
+              /* Agents List */
+              <AgentsListPanel
+                agents={agents}
+                workspaceId={activeWorkspaceId}
+                onAgentClick={handleAgentSelect}
+                onDeleteAgent={handleDeleteAgent}
+                selectedAgentSlug={isAgentsNavigation(navState) && navState.details?.type === 'agent' ? navState.details.agentSlug : null}
               />
             )}
             {isSettingsNavigation(navState) && (

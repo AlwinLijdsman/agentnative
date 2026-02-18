@@ -11,7 +11,16 @@ pnpm run electron:build         # Full build (main/preload/renderer)
 pnpm run typecheck:all          # TypeScript check all packages
 pnpm run lint                   # ESLint check
 pnpm run test                   # Run tests
+pnpm run test:e2e               # All E2E tests (stage-gate, session validation, stage0 pause)
+pnpm run test:e2e:live          # Live SDK tests (requires CLAUDE_CODE_OAUTH_TOKEN)
+pnpm run test:e2e:live:auto     # Live SDK tests with auto-extracted token (reads ~/.craft-agent/credentials.enc)
 ```
+
+> **For agents running E2E tests**: Use `test:e2e:live:auto` or set the token first:
+> ```powershell
+> $env:CLAUDE_CODE_OAUTH_TOKEN = (npx tsx scripts/extract-oauth-token.ts)
+> pnpm run test:e2e:live
+> ```
 
 ## Project Structure
 

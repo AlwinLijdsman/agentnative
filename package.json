@@ -19,6 +19,9 @@
   ],
   "scripts": {
     "test": "npx tsx --test",
+    "test:e2e": "npx tsx --test packages/session-tools-core/src/handlers/__tests__/e2e-*.test.ts apps/electron/src/__tests__/e2e-*.test.ts",
+    "test:e2e:live": "npx tsx --test apps/electron/src/__tests__/e2e-sdk-live.test.ts",
+    "test:e2e:live:auto": "npx tsx scripts/run-e2e-live.ts",
     "typecheck": "cd packages/shared && npx tsc --noEmit",
     "typecheck:all": "cd packages/core && npx tsc --noEmit && cd ../shared && npx tsc --noEmit",
     "lint:electron": "cd apps/electron && npx eslint .",

@@ -70,6 +70,7 @@ export function processEvent(
     }
 
     case 'text_complete': {
+      console.debug(`[event] text_complete turnId=${(event as { turnId?: string }).turnId ?? 'none'}`)
       const newState = handleTextComplete(state, event)
       return { state: newState, effects: [] }
     }
@@ -100,6 +101,7 @@ export function processEvent(
     }
 
     case 'complete':
+      console.debug('[event] complete')
       return handleComplete(state, event)
 
     case 'error':
@@ -205,6 +207,65 @@ export function processEvent(
       // Codex's turn/plan/updated notification - synthesize a TodoWrite tool message
       // This allows reusing existing turn-utils extraction logic for TurnCard todos
       return handleTodosUpdated(state, event)
+
+    // Agent pipeline events — emit effects to update agentRunStateAtom for live visualization.
+    case 'agent_stage_started':
+      return {
+        state: { ...state, session: { ...state.session, pausedAgent: undefined } },
+        effects: [{
+          type: 'agent_run_state_update',
+          agentSlug: event.agentSlug,
+          runId: event.runId,
+          currentStage: event.stage,
+          stageName: event.stageName,
+          isRunning: true,
+        }],
+      }
+    case 'agent_stage_completed':
+      return {
+        state: { ...state, session: { ...state.session } },
+        effects: [{
+          type: 'agent_run_state_update',
+          agentSlug: event.agentSlug,
+          runId: event.runId,
+          currentStage: event.stage,
+          stageName: event.stageName,
+          isRunning: true,
+        }],
+      }
+    case 'agent_run_completed':
+      return {
+        state: { ...state, session: { ...state.session } },
+        effects: [{
+          type: 'agent_run_state_update',
+          agentSlug: event.agentSlug,
+          runId: event.runId,
+          currentStage: -1,
+          stageName: '',
+          isRunning: false,
+        }],
+      }
+    case 'agent_repair_iteration':
+      return {
+        state: { ...state, session: { ...state.session } },
+        effects: [],
+      }
+    case 'agent_stage_gate_pause':
+      console.debug(`[event] agent_stage_gate_pause agent=${event.agentSlug} stage=${event.stage} runId=${event.runId}`)
+      return {
+        state: {
+          ...state,
+          session: {
+            ...state.session,
+            pausedAgent: {
+              agentSlug: event.agentSlug,
+              stage: event.stage,
+              runId: event.runId,
+            },
+          },
+        },
+        effects: [],
+      }
 
     default: {
       // Unknown event type - return state unchanged but as new reference

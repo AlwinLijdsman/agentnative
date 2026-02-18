@@ -1,0 +1,5 @@
+{
+  "allowedApiEndpoints": [
+    { "method": "GET", "path": ".*", "comment": "All GET requests (list models, get results)" }
+  ]
+}

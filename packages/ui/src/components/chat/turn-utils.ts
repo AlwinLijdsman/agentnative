@@ -227,6 +227,9 @@ export function shouldShowThinkingIndicator(phase: TurnPhase, isBuffering: boole
 function getToolStatus(message: Message): ActivityStatus {
   // response_too_large is success (data was saved, just too large for inline display)
   if (message.errorCode === 'response_too_large') return 'completed'
+  // Skill tool "Unknown skill" errors are expected — SDK falls back to Task tool.
+  // Showing a red error badge for this is misleading since the Task fallback succeeds.
+  if (message.isError && message.toolName === 'Skill') return 'completed'
   if (message.isError) return 'error'
   // Check explicit toolStatus first (set by tool_result handler)
   if (message.toolStatus === 'completed') return 'completed'
@@ -518,7 +521,7 @@ export function groupMessagesByTurn(messages: Message[]): Turn[] {
     }
 
     // Plan messages are added as activities to be time-sorted with tool calls
-    // This ensures SubmitPlan tool appears before the plan content chronologically
+    // This ensures submit_plan tool appears before the plan content chronologically
     if (message.role === 'plan') {
       if (!currentTurn) {
         // Edge case: plan without preceding activities

@@ -228,7 +228,7 @@ export interface CredentialResponse {
 }
 
 // ============================================
-// Plan Types (SubmitPlan workflow)
+// Plan Types (submit_plan workflow)
 // ============================================
 
 /**
@@ -394,6 +394,8 @@ export interface Session {
   parentSessionId?: string
   /** Explicit sibling order (lazy - only populated when user reorders). */
   siblingOrder?: number
+  /** Set when an agent pipeline is paused at a stage gate (for visual pause indicator). */
+  pausedAgent?: { agentSlug: string; stage: number; runId: string }
 }
 
 /**
@@ -500,6 +502,12 @@ export type SessionEvent =
       turnId?: string
       explanation?: string | null
     }
+  // Agent pipeline events (real-time stage progress)
+  | { type: 'agent_stage_started'; sessionId: string; agentSlug: string; runId: string; stage: number; stageName: string }
+  | { type: 'agent_stage_completed'; sessionId: string; agentSlug: string; runId: string; stage: number; stageName: string; data?: Record<string, unknown> }
+  | { type: 'agent_repair_iteration'; sessionId: string; agentSlug: string; runId: string; iteration: number; scores?: Record<string, number> }
+  | { type: 'agent_run_completed'; sessionId: string; agentSlug: string; runId: string; verificationStatus: string }
+  | { type: 'agent_stage_gate_pause'; sessionId: string; agentSlug: string; runId: string; stage: number; data?: Record<string, unknown> }
 
 // Options for sendMessage
 export interface SendMessageOptions {
@@ -681,6 +689,9 @@ export const IPC_CHANNELS = {
   // Credential health check (startup validation)
   CREDENTIAL_HEALTH_CHECK: 'credentials:healthCheck',
 
+  // Auth diagnostics (debugging toolkit)
+  AUTH_DIAGNOSTICS: 'auth:diagnostics',
+
   // Onboarding
   ONBOARDING_GET_AUTH_STATE: 'onboarding:getAuthState',
   ONBOARDING_VALIDATE_MCP: 'onboarding:validateMcp',
@@ -765,6 +776,15 @@ export const IPC_CHANNELS = {
   SKILLS_OPEN_EDITOR: 'skills:openEditor',
   SKILLS_OPEN_FINDER: 'skills:openFinder',
   SKILLS_CHANGED: 'skills:changed',
+
+  // Agents (workspace-scoped definitions, session-scoped runs)
+  AGENTS_GET: 'agents:get',
+  AGENTS_DELETE: 'agents:delete',
+  AGENTS_CHANGED: 'agents:changed',
+  AGENTS_GET_RUNS: 'agents:getRuns',
+  AGENTS_GET_RUN_DETAIL: 'agents:getRunDetail',
+  AGENTS_UPDATE_CONFIG: 'agents:updateConfig',
+  AGENTS_OPEN_FINDER: 'agents:openFinder',
 
   // Status management (workspace-scoped)
   STATUSES_LIST: 'statuses:list',
@@ -986,6 +1006,9 @@ export interface ElectronAPI {
   // Credential health check (startup validation)
   getCredentialHealth(): Promise<CredentialHealthStatus>
 
+  // Auth diagnostics (debugging toolkit)
+  getAuthDiagnostics(): Promise<import('../../../../packages/shared/src/auth/state.ts').AuthDiagnostics>
+
   // Onboarding
   getAuthState(): Promise<AuthState>
   getSetupNeeds(): Promise<SetupNeeds>
@@ -1073,6 +1096,18 @@ export interface ElectronAPI {
 
   // Skills change listener (live updates when skills are added/removed/modified)
   onSkillsChanged(callback: (skills: LoadedSkill[]) => void): () => void
+
+  // Agent definitions (workspace-scoped)
+  getAgents(workspaceId: string): Promise<import('@craft-agent/shared/agents').LoadedAgent[]>
+  deleteAgent(workspaceId: string, agentSlug: string): Promise<void>
+  onAgentsChanged(callback: (agents: import('@craft-agent/shared/agents').LoadedAgent[]) => void): () => void
+  // Agent runs (session-scoped)
+  getAgentRuns(sessionId: string, agentSlug: string): Promise<import('@craft-agent/shared/agents').AgentRunSummary[]>
+  getAgentRunDetail(sessionId: string, agentSlug: string, runId: string): Promise<import('@craft-agent/shared/agents').AgentRunDetail>
+  // Agent config update (workspace-scoped)
+  updateAgentConfig(workspaceId: string, agentSlug: string, updates: Partial<import('@craft-agent/shared/agents').AgentConfig>): Promise<{ success: boolean; error?: string }>
+  // Agent filesystem (workspace-scoped)
+  openAgentInFinder(workspaceId: string, agentSlug: string): Promise<void>
 
   // Statuses (workspace-scoped)
   listStatuses(workspaceId: string): Promise<import('@craft-agent/shared/statuses').StatusConfig[]>
@@ -1343,6 +1378,17 @@ export interface SkillsNavigationState {
 }
 
 /**
+ * Agents navigation state - shows AgentsListPanel in navigator
+ */
+export interface AgentsNavigationState {
+  navigator: 'agents'
+  /** Selected agent details or null for empty state */
+  details: { type: 'agent'; agentSlug: string; runId?: string } | null
+  /** Optional right sidebar panel state */
+  rightSidebar?: RightSidebarPanel
+}
+
+/**
  * Unified navigation state - single source of truth for all 3 panels
  *
  * From this state we can derive:
@@ -1355,6 +1401,7 @@ export type NavigationState =
   | SourcesNavigationState
   | SettingsNavigationState
   | SkillsNavigationState
+  | AgentsNavigationState
 
 /**
  * Type guard to check if state is sessions navigation
@@ -1385,6 +1432,13 @@ export const isSkillsNavigation = (
 ): state is SkillsNavigationState => state.navigator === 'skills'
 
 /**
+ * Type guard to check if state is agents navigation
+ */
+export const isAgentsNavigation = (
+  state: NavigationState
+): state is AgentsNavigationState => state.navigator === 'agents'
+
+/**
  * Default navigation state - allSessions with no selection
  */
 export const DEFAULT_NAVIGATION_STATE: NavigationState = {
@@ -1408,6 +1462,15 @@ export const getNavigationStateKey = (state: NavigationState): string => {
       return `skills/skill/${state.details.skillSlug}`
     }
     return 'skills'
+  }
+  if (state.navigator === 'agents') {
+    if (state.details?.type === 'agent') {
+      if (state.details.runId) {
+        return `agents/agent/${state.details.agentSlug}/run/${state.details.runId}`
+      }
+      return `agents/agent/${state.details.agentSlug}`
+    }
+    return 'agents'
   }
   if (state.navigator === 'settings') {
     return `settings:${state.subpage}`
@@ -1448,6 +1511,21 @@ export const parseNavigationStateKey = (key: string): NavigationState | null => 
       return { navigator: 'skills', details: { type: 'skill', skillSlug } }
     }
     return { navigator: 'skills', details: null }
+  }
+
+  // Handle agents
+  if (key === 'agents') return { navigator: 'agents', details: null }
+  if (key.startsWith('agents/agent/')) {
+    const rest = key.slice(13)
+    if (rest) {
+      // Check for run sub-route: agents/agent/{slug}/run/{runId}
+      const runMatch = rest.match(/^([^/]+)\/run\/(.+)$/)
+      if (runMatch) {
+        return { navigator: 'agents', details: { type: 'agent', agentSlug: runMatch[1], runId: runMatch[2] } }
+      }
+      return { navigator: 'agents', details: { type: 'agent', agentSlug: rest } }
+    }
+    return { navigator: 'agents', details: null }
   }
 
   // Handle settings

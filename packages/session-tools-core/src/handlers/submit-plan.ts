@@ -1,5 +1,5 @@
 /**
- * SubmitPlan Handler
+ * submit_plan Handler
  *
  * Submits a plan file for user review. This triggers the plan display UI
  * and pauses agent execution until the user responds.
@@ -14,7 +14,7 @@ export interface SubmitPlanArgs {
 }
 
 /**
- * Handle the SubmitPlan tool call.
+ * Handle the submit_plan tool call.
  *
  * 1. Verifies the plan file exists
  * 2. Reads the file to verify it's valid

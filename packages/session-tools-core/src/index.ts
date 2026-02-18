@@ -128,7 +128,7 @@ export { createNodeFileSystem } from './context.ts';
 
 // Handlers
 export {
-  // SubmitPlan
+  // submit_plan
   handleSubmitPlan,
   // Config Validate
   handleConfigValidate,
@@ -145,6 +145,12 @@ export {
   handleMicrosoftOAuthTrigger,
   // Credential Prompt
   handleCredentialPrompt,
+  // Agent Stage Gate
+  handleAgentStageGate,
+  // Agent State
+  handleAgentState,
+  // Agent Validate
+  handleAgentValidate,
 } from './handlers/index.ts';
 
 export type {
@@ -158,4 +164,7 @@ export type {
   SlackOAuthTriggerArgs,
   MicrosoftOAuthTriggerArgs,
   CredentialPromptArgs,
+  AgentStageGateArgs,
+  AgentStateArgs,
+  AgentValidateArgs,
 } from './handlers/index.ts';

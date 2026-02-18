@@ -1,0 +1,76 @@
+{
+  "controlFlow": {
+    "stages": [
+      { "id": 0, "name": "analyze_query", "description": "Decompose query and optionally calibrate with web search" },
+      { "id": 1, "name": "retrieve", "description": "Search + graph traversal + context formatting" },
+      { "id": 2, "name": "synthesize", "description": "Generate structured answer from XML context" },
+      { "id": 3, "name": "verify", "description": "{{VERIFICATION_AXIS_COUNT}}-axis verification ({{VERIFICATION_AXIS_ABBREVIATIONS}})" },
+      { "id": 4, "name": "output", "description": "Format final output with progressive disclosure" }
+    ],
+    "repairUnits": [
+      {
+        "stages": [2, 3],
+        "maxIterations": {{STANDARD_REPAIR_ITERATIONS}},
+        "feedbackField": "repair_instructions"
+      }
+    ],
+    "pauseAfterStages": [0],
+    "autoAdvance": true,
+    "webSearch": {
+      "enabled": true,
+      "provider": "brave",
+      "maxQueries": 5,
+      "preferredDomains": [
+{{WEB_SEARCH_DOMAINS}}
+      ]
+    }
+  },
+  "depthModes": {
+    "quick": {
+      "maxSubQueries": {{QUICK_SUB_QUERIES}},
+      "maxParagraphsPerQuery": {{QUICK_MAX_PARAGRAPHS}},
+      "maxRepairIterations": 0,
+      "contextTokenBudget": {{QUICK_TOKEN_BUDGET}},
+      "enableWebSearch": false
+    },
+    "standard": {
+      "maxSubQueries": {{STANDARD_SUB_QUERIES}},
+      "maxParagraphsPerQuery": {{STANDARD_MAX_PARAGRAPHS}},
+      "maxRepairIterations": {{STANDARD_REPAIR_ITERATIONS}},
+      "contextTokenBudget": {{STANDARD_TOKEN_BUDGET}},
+      "enableWebSearch": true
+    },
+    "deep": {
+      "maxSubQueries": {{DEEP_SUB_QUERIES}},
+      "maxParagraphsPerQuery": {{DEEP_MAX_PARAGRAPHS}},
+      "maxRepairIterations": {{DEEP_REPAIR_ITERATIONS}},
+      "contextTokenBudget": {{DEEP_TOKEN_BUDGET}},
+      "enableWebSearch": true
+    }
+  },
+  "verification": {
+{{VERIFICATION_CONFIG}}
+  },
+  "logging": {
+    "level": "verbose",
+    "persistIntermediates": true,
+    "costTracking": true
+  },
+  "followUp": {
+    "enabled": true,
+    "deltaRetrieval": true,
+    "maxAccumulatedSections": 30
+  },
+  "output": {
+    "progressiveDisclosure": true,
+    "citationFormat": "{{CITATION_FORMAT}}"
+  },
+  "debug": {
+    "enabled": false,
+    "maxParagraphs": 5,
+    "maxToolCalls": 10,
+    "skipVerification": false,
+    "skipWebSearch": true,
+    "useFixtures": false
+  }
+}

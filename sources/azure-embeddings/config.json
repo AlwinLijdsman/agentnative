@@ -1,0 +1,21 @@
+{
+  "id": "azure-embeddings_e1b5c2d7",
+  "name": "Azure Embeddings",
+  "slug": "azure-embeddings",
+  "enabled": true,
+  "provider": "azure-openai",
+  "type": "api",
+  "icon": "📊",
+  "tagline": "Text embedding-3-large (3072 dims) via Azure OpenAI for semantic search",
+  "api": {
+    "baseUrl": "https://datahandbook-foundry.cognitiveservices.azure.com/",
+    "authType": "header",
+    "headerName": "api-key",
+    "testEndpoint": {
+      "method": "GET",
+      "path": "openai/models?api-version=2024-10-21"
+    }
+  },
+  "createdAt": 1739548800000,
+  "updatedAt": 1739548800000
+}

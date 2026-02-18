@@ -1,0 +1,8 @@
+# Ignore generated data files but keep directory structure
+*.duckdb
+*.duckdb.wal
+*.lance
+*.pdf
+*.json
+!.gitkeep
+!.gitignore

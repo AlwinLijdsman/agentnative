@@ -29,12 +29,16 @@ import {
   isSourcesNavigation,
   isSettingsNavigation,
   isSkillsNavigation,
+  isAgentsNavigation,
 } from '@/contexts/NavigationContext'
 import { useSessionSelection, useIsMultiSelectActive, useSelectedIds, useSelectionCount } from '@/hooks/useSession'
 import { extractLabelId } from '@craft-agent/shared/labels'
 import type { TodoStateId } from '@/config/todo-states'
 import { SourceInfoPage, ChatPage } from '@/pages'
 import SkillInfoPage from '@/pages/SkillInfoPage'
+import AgentInfoPage from '@/pages/AgentInfoPage'
+import AgentRunDetailPage from '@/pages/AgentRunDetailPage'
+import { activeSessionIdAtom } from '@/atoms/sessions'
 import { getSettingsPageComponent } from '@/pages/settings/settings-pages'
 
 export interface MainContentPanelProps {
@@ -64,6 +68,7 @@ export function MainContentPanel({
   const selectionCount = useSelectionCount()
   const { clearMultiSelect } = useSessionSelection()
   const sessionMetaMap = useAtomValue(sessionMetaMapAtom)
+  const activeSessionId = useAtomValue(activeSessionIdAtom)
 
   const selectedMetas = useMemo(() => {
     const metas: SessionMeta[] = []
@@ -182,6 +187,42 @@ export function MainContentPanel({
       <Panel variant="grow" className={className}>
         <div className="flex items-center justify-center h-full text-muted-foreground">
           <p className="text-sm">No skills configured</p>
+        </div>
+      </Panel>
+    )
+  }
+
+  // Agents navigator - show run detail, agent info, or empty state
+  if (isAgentsNavigation(navState)) {
+    if (navState.details?.type === 'agent') {
+      // Run detail view: agents/agent/{slug}/run/{runId}
+      if (navState.details.runId) {
+        return wrapWithStoplight(
+          <Panel variant="grow" className={className}>
+            <AgentRunDetailPage
+              agentSlug={navState.details.agentSlug}
+              runId={navState.details.runId}
+              workspaceId={activeWorkspaceId || ''}
+              sessionId={activeSessionId ?? undefined}
+            />
+          </Panel>
+        )
+      }
+      // Agent info view: agents/agent/{slug}
+      return wrapWithStoplight(
+        <Panel variant="grow" className={className}>
+          <AgentInfoPage
+            agentSlug={navState.details.agentSlug}
+            workspaceId={activeWorkspaceId || ''}
+          />
+        </Panel>
+      )
+    }
+    // No agent selected - empty state
+    return wrapWithStoplight(
+      <Panel variant="grow" className={className}>
+        <div className="flex items-center justify-center h-full text-muted-foreground">
+          <p className="text-sm">No agents configured</p>
         </div>
       </Panel>
     )

@@ -334,6 +334,85 @@ export function getSetupNeeds(state: AuthState): SetupNeeds {
 }
 
 // ============================================
+// Auth Diagnostics (for debugging)
+// ============================================
+
+/** Diagnostic snapshot of auth environment — never exposes actual secrets */
+export interface AuthDiagnostics {
+  /** Which auth env vars are set (boolean only, never values) */
+  envState: {
+    hasAnthropicAuthToken: boolean;
+    hasClaudeCodeOAuthToken: boolean;
+    hasAnthropicApiKey: boolean;
+    hasAnthropicBaseUrl: boolean;
+  };
+  /** OAuth token expiry status */
+  tokenStatus: 'valid' | 'expired' | 'unknown' | 'none';
+  /** Active LLM connection info (slug + authType) */
+  activeConnection: {
+    slug: string | null;
+    authType: string | null;
+  };
+  /** ISO timestamp of last known token refresh, or null */
+  lastRefreshAt: string | null;
+  /** Whether a refresh is currently in progress */
+  refreshInProgress: boolean;
+}
+
+// Track last refresh timestamp for diagnostics
+let lastRefreshTimestamp: string | null = null;
+
+/**
+ * Get a diagnostic snapshot of the current auth environment.
+ * Safe for logging — never includes actual tokens or keys.
+ */
+export async function getAuthDiagnostics(): Promise<AuthDiagnostics> {
+  const defaultConnectionSlug = getDefaultLlmConnection();
+  const connection = defaultConnectionSlug ? getLlmConnection(defaultConnectionSlug) : null;
+
+  let tokenStatus: AuthDiagnostics['tokenStatus'] = 'none';
+  if (process.env.CLAUDE_CODE_OAUTH_TOKEN) {
+    // We can check token expiry via stored credentials if available
+    try {
+      const manager = getCredentialManager();
+      const creds = await manager.getClaudeOAuthCredentials();
+      if (creds?.expiresAt) {
+        tokenStatus = isTokenExpired(creds.expiresAt) ? 'expired' : 'valid';
+      } else if (creds?.accessToken) {
+        tokenStatus = 'unknown'; // Token exists but no expiry info
+      }
+    } catch {
+      tokenStatus = 'unknown';
+    }
+  } else if (process.env.ANTHROPIC_API_KEY) {
+    tokenStatus = 'valid'; // API keys don't expire in the same way
+  }
+
+  return {
+    envState: {
+      hasAnthropicAuthToken: !!process.env.ANTHROPIC_AUTH_TOKEN,
+      hasClaudeCodeOAuthToken: !!process.env.CLAUDE_CODE_OAUTH_TOKEN,
+      hasAnthropicApiKey: !!process.env.ANTHROPIC_API_KEY,
+      hasAnthropicBaseUrl: !!process.env.ANTHROPIC_BASE_URL,
+    },
+    tokenStatus,
+    activeConnection: {
+      slug: defaultConnectionSlug ?? null,
+      authType: connection?.authType ?? null,
+    },
+    lastRefreshAt: lastRefreshTimestamp,
+    refreshInProgress: refreshInProgress !== null,
+  };
+}
+
+/**
+ * Record a successful token refresh timestamp (called by reinitializeAuth).
+ */
+export function recordTokenRefresh(): void {
+  lastRefreshTimestamp = new Date().toISOString();
+}
+
+// ============================================
 // Test helpers (exported for testing only)
 // ============================================
 
@@ -343,4 +422,11 @@ export function getSetupNeeds(state: AuthState): SetupNeeds {
  */
 export function _resetRefreshMutex(): void {
   refreshInProgress = null;
+}
+
+/**
+ * Reset diagnostics state (for testing only)
+ */
+export function _resetDiagnosticsState(): void {
+  lastRefreshTimestamp = null;
 }

@@ -41,6 +41,7 @@ import {
 } from '@/atoms/sessions'
 import { sourcesAtom } from '@/atoms/sources'
 import { skillsAtom } from '@/atoms/skills'
+import { agentRunStateAtom } from '@/atoms/agents'
 import { extractBadges } from '@/lib/mentions'
 import { getDefaultStore } from 'jotai'
 import {
@@ -501,6 +502,29 @@ export default function App() {
             setTimeout(() => {
               window.electronAPI.sendMessage(effect.sessionId, messageWithSuffix)
             }, 100)
+            break
+          }
+          case 'agent_run_state_update': {
+            // Update agentRunStateAtom for live pipeline visualization
+            const prev = store.get(agentRunStateAtom)
+            const key = effect.agentSlug
+            if (effect.isRunning) {
+              store.set(agentRunStateAtom, {
+                ...prev,
+                [key]: {
+                  agentSlug: effect.agentSlug,
+                  runId: effect.runId,
+                  currentStage: effect.currentStage,
+                  stageName: effect.stageName,
+                  isRunning: true,
+                },
+              })
+            } else {
+              // Run completed — remove from live state
+              const next = { ...prev }
+              delete next[key]
+              store.set(agentRunStateAtom, next)
+            }
             break
           }
         }

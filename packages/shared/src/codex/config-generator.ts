@@ -115,7 +115,7 @@ export interface CodexConfigGeneratorOptions {
 
   /**
    * Path to the Session MCP Server executable.
-   * Provides session-scoped tools (SubmitPlan, config_validate, etc.) to Codex.
+   * Provides session-scoped tools (submit_plan, config_validate, etc.) to Codex.
    */
   sessionServerPath?: string;
 
@@ -139,7 +139,7 @@ export interface CodexConfigGeneratorOptions {
 
   /**
    * Plans folder path for the session MCP server.
-   * Where plan files are stored for SubmitPlan tool.
+   * Where plan files are stored for submit_plan tool.
    */
   plansFolderPath?: string;
 
@@ -344,7 +344,7 @@ function generateBridgeServerSection(
 
 /**
  * Generate a TOML section for the Session MCP Server.
- * Provides session-scoped tools (SubmitPlan, config_validate, etc.) to Codex.
+ * Provides session-scoped tools (submit_plan, config_validate, etc.) to Codex.
  */
 function generateSessionServerSection(
   sessionServerPath: string,
@@ -538,11 +538,11 @@ export function generateCodexConfig(options: CodexConfigGeneratorOptions): Codex
     sections.push('');
   }
 
-  // Add session server for session-scoped tools (SubmitPlan, config_validate, etc.)
+  // Add session server for session-scoped tools (submit_plan, config_validate, etc.)
   // This is always included when the session server path is provided
   if (sessionServerPath && sessionId && workspaceRootPath && plansFolderPath) {
     const nodeCommand = nodePath || 'node';
-    sections.push('# Session-scoped tools (SubmitPlan, config_validate, mermaid_validate, etc.)');
+    sections.push('# Session-scoped tools (submit_plan, config_validate, mermaid_validate, etc.)');
     sections.push(generateSessionServerSection(
       sessionServerPath,
       sessionId,

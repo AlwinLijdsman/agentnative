@@ -55,6 +55,39 @@ export interface SessionToolCallbacks {
    * Codex: sends __CALLBACK__ message to stderr
    */
   onAuthRequest(request: AuthRequest): void;
+
+  /**
+   * Called when an agent stage gate requires human approval (pause enforcement).
+   * Claude: calls onAgentStagePause callback + forceAbort
+   * Codex: sends __CALLBACK__ message to stderr
+   */
+  onAgentStagePause?(args: {
+    agentSlug: string;
+    stage: number;
+    runId: string;
+    data: Record<string, unknown>;
+  }): void;
+
+  /**
+   * Called when an agent event occurs (stage progress, tool calls, etc.).
+   * Used for real-time UI updates without pausing execution.
+   * Claude: sends event to renderer
+   * Codex: sends __CALLBACK__ message to stderr
+   */
+  onAgentEvent?(event: {
+    type: string;
+    agentSlug: string;
+    runId: string;
+    data: Record<string, unknown>;
+  }): void;
+
+  /**
+   * Returns true if the pipeline was just paused in this turn (same LLM response batch).
+   * Used by handleResume to block LLM self-resume before the user has a chance to respond.
+   * Claude: checks managed.pauseLocked flag set by onAgentStagePause
+   * Codex: always returns false (codex uses separate tool-call batching)
+   */
+  isPauseLocked?: () => boolean;
 }
 
 // ============================================================
@@ -163,6 +196,9 @@ export interface SessionToolContext {
 
   /** Path to skills folder within workspace */
   get skillsPath(): string;
+
+  /** Path to agents folder within workspace */
+  get agentsPath(): string;
 
   /** Path to session's plans folder */
   plansFolderPath: string;

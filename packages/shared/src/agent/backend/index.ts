@@ -36,6 +36,8 @@ export type {
   AuthCallback,
   SourceChangeCallback,
   SourceActivationCallback,
+  AgentStagePauseCallback,
+  AgentEventCallback,
   ChatOptions,
   RecoveryMessage,
   SdkMcpServerConfig,

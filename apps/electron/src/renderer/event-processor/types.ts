@@ -431,6 +431,66 @@ export interface TodosUpdatedEvent {
 }
 
 /**
+ * Agent stage started event — stage N is beginning execution
+ */
+export interface AgentStageStartedEvent {
+  type: 'agent_stage_started'
+  sessionId: string
+  agentSlug: string
+  runId: string
+  stage: number
+  stageName: string
+}
+
+/**
+ * Agent stage completed event — stage N finished (may include output data)
+ */
+export interface AgentStageCompletedEvent {
+  type: 'agent_stage_completed'
+  sessionId: string
+  agentSlug: string
+  runId: string
+  stage: number
+  stageName: string
+  data?: Record<string, unknown>
+}
+
+/**
+ * Agent repair iteration event — repair loop iteration within a repair unit
+ */
+export interface AgentRepairIterationEvent {
+  type: 'agent_repair_iteration'
+  sessionId: string
+  agentSlug: string
+  runId: string
+  iteration: number
+  scores?: Record<string, number>
+}
+
+/**
+ * Agent run completed event — all stages finished
+ */
+export interface AgentRunCompletedEvent {
+  type: 'agent_run_completed'
+  sessionId: string
+  agentSlug: string
+  runId: string
+  verificationStatus: string
+}
+
+/**
+ * Agent stage gate pause event — stage completed, awaiting human approval
+ */
+export interface AgentStageGatePauseEvent {
+  type: 'agent_stage_gate_pause'
+  sessionId: string
+  agentSlug: string
+  runId: string
+  stage: number
+  data?: Record<string, unknown>
+}
+
+/**
  * Union of all agent events
  */
 export type AgentEvent =
@@ -473,6 +533,11 @@ export type AgentEvent =
   | SourceActivatedEvent
   | UsageUpdateEvent
   | TodosUpdatedEvent
+  | AgentStageStartedEvent
+  | AgentStageCompletedEvent
+  | AgentRepairIterationEvent
+  | AgentRunCompletedEvent
+  | AgentStageGatePauseEvent
 
 /**
  * Side effects that need to be handled outside the pure processor
@@ -483,6 +548,7 @@ export type Effect =
   | { type: 'generate_title'; sessionId: string; userMessage: string }
   | { type: 'permission_mode_changed'; sessionId: string; permissionMode: PermissionMode }
   | { type: 'auto_retry'; sessionId: string; originalMessage: string; sourceSlug: string }
+  | { type: 'agent_run_state_update'; agentSlug: string; runId: string; currentStage: number; stageName: string; isRunning: boolean }
 
 /**
  * Result of processing an event

@@ -7,6 +7,8 @@ import { PERMISSION_MODE_CONFIG } from '../agent/mode-types.ts';
 import { APP_VERSION } from '../version/index.ts';
 import { globSync } from 'glob';
 import os from 'os';
+import { loadWorkspaceAgents } from '../agents/storage.ts';
+import type { LoadedAgent } from '../agents/types.ts';
 
 /** Maximum size of CLAUDE.md file to include (10KB) */
 const MAX_CONTEXT_FILE_SIZE = 10 * 1024;
@@ -399,6 +401,63 @@ function getCraftAgentEnvironmentMarker(): string {
 }
 
 /**
+ * Format loaded agents for inclusion in the system prompt.
+ * Lists each agent with its name, description, stages, and source connection status.
+ */
+function formatAgentsSection(agents: LoadedAgent[], workspacePath: string): string {
+  if (agents.length === 0) {
+    return '';
+  }
+
+  const agentEntries = agents.map((agent) => {
+    const meta = agent.metadata;
+    const stages = agent.config.controlFlow.stages.map((s) => s.name).join(' → ');
+
+    // Check source connection status
+    let sourcesInfo = '';
+    if (meta.sources && meta.sources.length > 0) {
+      const sourceStatuses = meta.sources.map((s) => {
+        const sourceDir = join(workspacePath, 'sources', s.slug);
+        const connected = existsSync(sourceDir);
+        const status = connected ? '✓ connected' : '✗ not configured';
+        const reqTag = s.required ? 'required' : 'optional';
+        return `    - \`${s.slug}\` (${reqTag}): ${status}`;
+      });
+      sourcesInfo = `\n  Sources:\n${sourceStatuses.join('\n')}`;
+    }
+
+    return `- **${meta.name}** (\`${agent.slug}\`): ${meta.description}
+  Stages: ${stages}${sourcesInfo}`;
+  });
+
+  return `
+
+## Agents
+
+Agents are stateful multi-stage workflows with deterministic control flow enforcement.
+
+**Available agents:**
+${agentEntries.join('\n\n')}
+
+**Agent tools:**
+- \`agent_stage_gate\` — Control flow enforcement. MUST be called before/after each stage.
+- \`agent_state\` — Read/update accumulated state across runs (replace-all semantics on top-level keys).
+- \`agent_validate\` — Validate an agent's AGENT.md and config.json.
+
+### Stage Gate Protocol (MANDATORY)
+
+When running an agent, you MUST follow this protocol:
+1. ALWAYS call \`agent_stage_gate({ action: "start", agentSlug, stage: N })\` before each stage
+2. ALWAYS call \`agent_stage_gate({ action: "complete", agentSlug, stage: N, data: {...} })\` after each stage
+3. NEVER proceed if \`allowed\` is false — report the reason to the user
+4. If \`pauseRequired\` is true, follow the pause instructions in the tool result \`reason\` and wait for user review
+5. If \`staleRun\` is returned, ask the user: resume or reset?
+6. For repair loops: \`start_repair_unit\` → iterate stages → \`repair\` or \`end_repair_unit\`
+7. Read accumulated state via \`agent_state({ action: "read", agentSlug })\` for follow-up context
+8. Update state via \`agent_state({ action: "update", agentSlug, data: {...} })\` — replaces top-level keys`;
+}
+
+/**
  * Get the Craft Assistant system prompt with workspace-specific paths.
  *
  * This prompt is intentionally concise - detailed documentation lives in
@@ -445,9 +504,11 @@ Sources are external data connections. Each source has:
 **Workspace structure:**
 - Sources: \`${workspacePath}/sources/{slug}/\`
 - Skills: \`${workspacePath}/skills/{slug}/\`
+- Agents: \`${workspacePath}/agents/{slug}/\`
 - Theme: \`${workspacePath}/theme.json\`
 
 **SDK Plugin:** This workspace is mounted as a Claude Code SDK plugin. When invoking skills via the Skill tool, use the fully-qualified format: \`${workspaceId}:skill-slug\`. For example, to invoke a skill named "commit", use \`${workspaceId}:commit\`.
+${formatAgentsSection(workspaceRootPath ? loadWorkspaceAgents(workspacePath) : [], workspacePath)}
 
 ## Project Context
 
@@ -506,11 +567,11 @@ Co-Authored-By: Craft Agent <agents-noreply@craft.do>
 
 Current mode is in \`<session_state>\`. \`plansFolderPath\` shows the **exact path** where you can write plan files. \`dataFolderPath\` shows where you can write data files (e.g. \`transform_data\` output). In Explore mode, writes are only allowed to these two folders — writes to any other location will be blocked.
 
-**${PERMISSION_MODE_CONFIG['safe'].displayName} mode:** Read, search, and explore freely. Use \`SubmitPlan\` when ready to implement - the user sees an "Accept Plan" button to transition to execution. 
+**${PERMISSION_MODE_CONFIG['safe'].displayName} mode:** Read, search, and explore freely. Use \`submit_plan\` when ready to implement - the user sees an "Accept Plan" button to transition to execution. 
 Be decisive: when you have enough context, present your approach and ask "Ready for a plan?" or write it directly. This will help the user move forward.
 
-!!Important!! - Before executing a plan you need to present it to the user via SubmitPlan tool.
-When presenting a plan via SubmitPlan the system will interrupt your current run and wait for user confirmation. Expect, and prepare for this.
+!!Important!! - Before executing a plan you need to present it to the user via submit_plan tool.
+When presenting a plan via submit_plan the system will interrupt your current run and wait for user confirmation. Expect, and prepare for this.
 Never try to execute a plan without submitting it first - it will fail, especially if user is in ${PERMISSION_MODE_CONFIG['safe'].displayName} mode.
 
 **CRITICAL:** You MUST write plan files to the **exact \`plansFolderPath\`** and data files to the **exact \`dataFolderPath\`** from \`<session_state>\`. These folders already exist (created by the system). Writes to any other path (including the parent session folder) will be blocked.
@@ -518,12 +579,12 @@ Never try to execute a plan without submitting it first - it will fail, especial
 ${backendName === 'Codex' ? `
 ### Planning tools (Codex)
 - **update_plan** — Live task tracking within a turn/session (statuses: pending/in_progress/completed). Does not pause execution or request approval.
-- **SubmitPlan** — User-facing implementation proposal (markdown plan file + approval gate). In Explore mode, required before execution and pauses for user confirmation.
+- **submit_plan** — User-facing implementation proposal (markdown plan file + approval gate). In Explore mode, required before execution and pauses for user confirmation.
 
 Recommended flow:
 1. Start multi-step work with \`update_plan\`.
 2. Keep \`update_plan\` updated as steps progress for turncard/tasklist accuracy.
-3. When ready to implement (especially in Explore mode), write the plan file and call \`SubmitPlan\`.
+3. When ready to implement (especially in Explore mode), write the plan file and call \`submit_plan\`.
 4. After acceptance and execution starts, continue using \`update_plan\` for granular progress.
 
 **Writing plan files (Codex):** Create plan files using shell commands. Do NOT use heredocs (\`<<EOF\`) as they are blocked by the sandbox.
@@ -548,7 +609,7 @@ MCP tools from connected sources follow the naming pattern \`mcp__{slug}__{tool}
 - **\`slug\`** is the source's **slug** from the \`<sources>\` block above (e.g., \`linear\`, \`github\`)
 - Do **NOT** use source IDs, provider names, or config.json \`id\` fields
 - Example: Linear source (slug: \`linear\`) → \`mcp__linear__list_issues\`, \`mcp__linear__create_issue\`
-- The \`session\` MCP server provides workspace tools: \`mcp__session__SubmitPlan\`, \`mcp__session__source_test\`, etc.
+- The \`session\` MCP server provides workspace tools: \`mcp__session__submit_plan\`, \`mcp__session__source_test\`, etc.
 
 **Tool discovery:** Call \`mcp__{slug}__list_tools\` or try calling a specific tool directly — the error response will list available tools.
 - **NEVER** use \`list_mcp_resources\` — it lists resources, not tools. It will not help you discover available tools.

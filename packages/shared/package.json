@@ -52,7 +52,8 @@
     "./search": "./src/search/index.ts",
     "./tools": "./src/tools/index.ts",
     "./codex": "./src/codex/index.ts",
-    "./mentions": "./src/mentions/index.ts"
+    "./mentions": "./src/mentions/index.ts",
+    "./agents": "./src/agents/index.ts"
   },
   "dependencies": {
     "@craft-agent/codex-types": "workspace:*",

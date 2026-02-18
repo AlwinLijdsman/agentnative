@@ -18,6 +18,7 @@ export type DocFeature =
   | 'themes'
   | 'app-settings'
   | 'preferences'
+  | 'agents'
 
 export interface DocInfo {
   /** Path relative to DOC_BASE_URL */
@@ -100,6 +101,12 @@ export const DOCS: Record<DocFeature, DocInfo> = {
     title: 'Preferences',
     summary:
       'Personal preferences like your name, timezone, and language that help the agent personalize responses. Stored in ~/.craft-agent/preferences.json.',
+  },
+  agents: {
+    path: '/features/agents',
+    title: 'Agents',
+    summary:
+      'Multi-stage research workflows with deterministic control flow, repair loops, and 4-axis verification. Stored in workspace agents/ directory.',
   },
 }
 

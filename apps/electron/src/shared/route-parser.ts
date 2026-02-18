@@ -34,7 +34,7 @@ export interface ParsedRoute {
 // Compound Route Types (new format)
 // =============================================================================
 
-export type NavigatorType = 'sessions' | 'sources' | 'skills' | 'settings'
+export type NavigatorType = 'sessions' | 'sources' | 'skills' | 'agents' | 'settings'
 
 export interface ParsedCompoundRoute {
   /** The navigator type */
@@ -47,6 +47,8 @@ export interface ParsedCompoundRoute {
   details: {
     type: string
     id: string
+    /** Sub-detail ID (e.g., runId for agent runs) */
+    subId?: string
   } | null
 }
 
@@ -58,7 +60,7 @@ export interface ParsedCompoundRoute {
  * Known prefixes that indicate a compound route
  */
 const COMPOUND_ROUTE_PREFIXES = [
-  'allSessions', 'flagged', 'archived', 'state', 'label', 'view', 'sources', 'skills', 'settings'
+  'allSessions', 'flagged', 'archived', 'state', 'label', 'view', 'sources', 'skills', 'agents', 'settings'
 ]
 
 /**
@@ -154,6 +156,30 @@ export function parseCompoundRoute(route: string): ParsedCompoundRoute | null {
     return null
   }
 
+  // Agents navigator
+  if (first === 'agents') {
+    if (segments.length === 1) {
+      return { navigator: 'agents', details: null }
+    }
+
+    // agents/agent/{agentSlug}
+    if (segments[1] === 'agent' && segments[2]) {
+      // agents/agent/{agentSlug}/run/{runId}
+      if (segments[3] === 'run' && segments[4]) {
+        return {
+          navigator: 'agents',
+          details: { type: 'agent', id: segments[2], subId: segments[4] },
+        }
+      }
+      return {
+        navigator: 'agents',
+        details: { type: 'agent', id: segments[2] },
+      }
+    }
+
+    return null
+  }
+
   // Sessions navigator (allSessions, flagged, state)
   let sessionFilter: SessionFilter
   let detailsStartIndex: number
@@ -234,6 +260,14 @@ export function buildCompoundRoute(parsed: ParsedCompoundRoute): string {
   if (parsed.navigator === 'skills') {
     if (!parsed.details) return 'skills'
     return `skills/skill/${parsed.details.id}`
+  }
+
+  if (parsed.navigator === 'agents') {
+    if (!parsed.details) return 'agents'
+    if (parsed.details.subId) {
+      return `agents/agent/${parsed.details.id}/run/${parsed.details.subId}`
+    }
+    return `agents/agent/${parsed.details.id}`
   }
 
   // Sessions navigator
@@ -351,6 +385,17 @@ function convertCompoundToViewRoute(compound: ParsedCompoundRoute): ParsedRoute 
     return { type: 'view', name: 'skill-info', id: compound.details.id, params: {} }
   }
 
+  // Agents
+  if (compound.navigator === 'agents') {
+    if (!compound.details) {
+      return { type: 'view', name: 'agents', params: {} }
+    }
+    if (compound.details.subId) {
+      return { type: 'view', name: 'agent-run', id: compound.details.id, params: { runId: compound.details.subId } }
+    }
+    return { type: 'view', name: 'agent-info', id: compound.details.id, params: {} }
+  }
+
   // Sessions
   if (compound.sessionFilter) {
     const filter = compound.sessionFilter
@@ -465,6 +510,21 @@ function convertCompoundToNavigationState(compound: ParsedCompoundRoute): Naviga
     return {
       navigator: 'skills',
       details: { type: 'skill', skillSlug: compound.details.id },
+    }
+  }
+
+  // Agents
+  if (compound.navigator === 'agents') {
+    if (!compound.details) {
+      return { navigator: 'agents', details: null }
+    }
+    return {
+      navigator: 'agents',
+      details: {
+        type: 'agent',
+        agentSlug: compound.details.id,
+        ...(compound.details.subId ? { runId: compound.details.subId } : {}),
+      },
     }
   }
 
@@ -628,6 +688,16 @@ export function buildRouteFromNavigationState(state: NavigationState): string {
       return `skills/skill/${state.details.skillSlug}`
     }
     return 'skills'
+  }
+
+  if (state.navigator === 'agents') {
+    if (state.details?.type === 'agent') {
+      if (state.details.runId) {
+        return `agents/agent/${state.details.agentSlug}/run/${state.details.runId}`
+      }
+      return `agents/agent/${state.details.agentSlug}`
+    }
+    return 'agents'
   }
 
   // Sessions

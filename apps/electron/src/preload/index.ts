@@ -166,6 +166,9 @@ const api: ElectronAPI = {
   // Credential health check (startup validation)
   getCredentialHealth: () => ipcRenderer.invoke(IPC_CHANNELS.CREDENTIAL_HEALTH_CHECK),
 
+  // Auth diagnostics (debugging toolkit)
+  getAuthDiagnostics: () => ipcRenderer.invoke(IPC_CHANNELS.AUTH_DIAGNOSTICS),
+
   // Onboarding
   getAuthState: () => ipcRenderer.invoke(IPC_CHANNELS.ONBOARDING_GET_AUTH_STATE).then(r => r.authState),
   getSetupNeeds: () => ipcRenderer.invoke(IPC_CHANNELS.ONBOARDING_GET_AUTH_STATE).then(r => r.setupNeeds),
@@ -323,6 +326,32 @@ const api: ElectronAPI = {
       ipcRenderer.removeListener(IPC_CHANNELS.SKILLS_CHANGED, handler)
     }
   },
+
+  // Agents — definitions (workspace-scoped)
+  getAgents: (workspaceId: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.AGENTS_GET, workspaceId),
+  deleteAgent: (workspaceId: string, agentSlug: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.AGENTS_DELETE, workspaceId, agentSlug),
+  onAgentsChanged: (callback: (agents: import('@craft-agent/shared/agents').LoadedAgent[]) => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, agents: import('@craft-agent/shared/agents').LoadedAgent[]) => {
+      callback(agents)
+    }
+    ipcRenderer.on(IPC_CHANNELS.AGENTS_CHANGED, handler)
+    return () => {
+      ipcRenderer.removeListener(IPC_CHANNELS.AGENTS_CHANGED, handler)
+    }
+  },
+  // Agents — runs (session-scoped)
+  getAgentRuns: (sessionId: string, agentSlug: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.AGENTS_GET_RUNS, sessionId, agentSlug),
+  getAgentRunDetail: (sessionId: string, agentSlug: string, runId: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.AGENTS_GET_RUN_DETAIL, sessionId, agentSlug, runId),
+  // Agents — config update (workspace-scoped)
+  updateAgentConfig: (workspaceId: string, agentSlug: string, updates: Partial<import('@craft-agent/shared/agents').AgentConfig>) =>
+    ipcRenderer.invoke(IPC_CHANNELS.AGENTS_UPDATE_CONFIG, workspaceId, agentSlug, updates),
+  // Agents — open in file explorer (workspace-scoped)
+  openAgentInFinder: (workspaceId: string, agentSlug: string) =>
+    ipcRenderer.invoke(IPC_CHANNELS.AGENTS_OPEN_FINDER, workspaceId, agentSlug),
 
   // Statuses change listener (live updates when statuses config or icon files change)
   onStatusesChanged: (callback: (workspaceId: string) => void) => {

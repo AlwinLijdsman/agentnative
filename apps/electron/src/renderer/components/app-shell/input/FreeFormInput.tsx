@@ -157,6 +157,8 @@ export interface FreeFormInputProps {
   // Skill selection (for @mentions)
   /** Available skills for @mention autocomplete */
   skills?: LoadedSkill[]
+  /** Available agents for @mention autocomplete */
+  agents?: import('@craft-agent/shared/agents').LoadedAgent[]
   // Label selection (for #labels)
   /** Available labels for #label autocomplete */
   labels?: LabelConfig[]
@@ -235,6 +237,7 @@ export function FreeFormInput({
   enabledSourceSlugs = [],
   onSourcesChange,
   skills = [],
+  agents = [],
   labels = [],
   sessionLabels = [],
   onLabelAdd,
@@ -789,10 +792,11 @@ export function FreeFormInput({
     // Skills also don't need special handling beyond text insertion.
   }, [optimisticSourceSlugs, onSourcesChange])
 
-  // Inline mention hook (for skills, sources, and files)
+  // Inline mention hook (for agents, skills, sources, and files)
   const inlineMention = useInlineMention({
     inputRef: richInputRef,
     skills,
+    agents,
     sources,
     basePath: workingDirectory,
     onSelect: handleMentionSelect,
