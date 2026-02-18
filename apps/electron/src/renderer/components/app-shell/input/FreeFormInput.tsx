@@ -35,6 +35,7 @@ import {
 } from '@/components/ui/label-menu'
 import type { LabelConfig } from '@craft-agent/shared/labels'
 import { parseMentions } from '@/lib/mentions'
+import { AgentSourceBadges, type ResolvedAgentSource } from '@/components/ui/mention-badge'
 import { RichTextInput, type RichTextInputHandle } from '@/components/ui/rich-text-input'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@craft-agent/ui'
 import {
@@ -804,6 +805,37 @@ export function FreeFormInput({
     workspaceId: workspaceSlug,
   })
 
+  // Compute resolved agent sources when an agent is @mentioned in the input.
+  // Parses the input text for [agent:slug] mentions, looks up the agent's
+  // metadata.sources, and resolves each binding against available workspace sources.
+  const resolvedAgentSources = React.useMemo((): ResolvedAgentSource[] => {
+    if (agents.length === 0) return []
+
+    const agentSlugs = agents.map(a => a.slug)
+    const mentions = parseMentions(input, [], [], agentSlugs)
+    if (mentions.agents.length === 0) return []
+
+    const resolved: ResolvedAgentSource[] = []
+    const seen = new Set<string>()
+
+    for (const agentSlug of mentions.agents) {
+      const agent = agents.find(a => a.slug === agentSlug)
+      if (!agent?.metadata.sources) continue
+
+      for (const binding of agent.metadata.sources) {
+        if (seen.has(binding.slug)) continue
+        seen.add(binding.slug)
+        resolved.push({
+          slug: binding.slug,
+          required: binding.required,
+          source: sources.find(s => s.config.slug === binding.slug),
+        })
+      }
+    }
+
+    return resolved
+  }, [input, agents, sources])
+
   // Inline label menu hook (for #labels)
   const handleLabelSelect = React.useCallback((labelId: string) => {
     onLabelAdd?.(labelId)
@@ -1423,6 +1455,11 @@ export function FreeFormInput({
           data-tutorial="chat-input"
           spellCheck={spellCheck}
         />
+        )}
+
+        {/* Agent source badges - shown when an agent is @mentioned */}
+        {resolvedAgentSources.length > 0 && (
+          <AgentSourceBadges resolvedSources={resolvedAgentSources} />
         )}
 
         {/* Bottom Row: Controls - wrapped in relative container for escape overlay */}

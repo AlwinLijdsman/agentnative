@@ -76,7 +76,7 @@ import { CraftMcpClient } from '@craft-agent/shared/mcp'
 import { type Session, type Message, type SessionEvent, type FileAttachment, type StoredAttachment, type SendMessageOptions, IPC_CHANNELS, generateMessageId } from '../shared/types'
 import { formatPathsToRelative, formatToolInputPaths, perf, encodeIconToDataUrl, getEmojiIcon, resetSummarizationClient, resolveToolIcon } from '@craft-agent/shared/utils'
 import { loadWorkspaceSkills, loadAllSkills, type LoadedSkill } from '@craft-agent/shared/skills'
-import { loadWorkspaceAgents } from '@craft-agent/shared/agents'
+import { loadWorkspaceAgents, resolveAgentEnvironment } from '@craft-agent/shared/agents'
 import { parseMentions } from '@craft-agent/shared/mentions'
 import type { ToolDisplayMeta } from '@craft-agent/core/types'
 import { getToolIconsDir, isCodexModel, getMiniModel, DEFAULT_MODEL, DEFAULT_CODEX_MODEL } from '@craft-agent/shared/config'
@@ -4208,52 +4208,77 @@ export class SessionManager {
     // Pre-enabling them here avoids the agent wasting tool calls to discover and activate sources at runtime.
     if (message.includes('[agent:')) {
       try {
-        const agents = loadWorkspaceAgents(workspaceRootPath)
-        const agentSlugs = agents.map(a => a.slug)
-        const parsed = parseMentions(message, [], [], agentSlugs)
+        const agentList = loadWorkspaceAgents(workspaceRootPath)
+        const resolution = resolveAgentEnvironment(
+          message,
+          agentList,
+          allSources,
+          managed.enabledSourceSlugs || [],
+        )
 
-        if (parsed.agents.length > 0) {
-          const slugSet = new Set(managed.enabledSourceSlugs || [])
-          let sourcesAdded = false
+        // Log all diagnostics
+        for (const diag of resolution.diagnostics) {
+          sessionLog.debug(`[auto-enable] ${diag.step}: ${diag.detail}`)
+        }
 
-          for (const agentSlug of parsed.agents) {
-            const agent_ = agents.find(a => a.slug === agentSlug)
-            if (!agent_?.metadata.sources) continue
+        // Log warnings and emit user-visible warning messages
+        for (const warn of resolution.warnings) {
+          sessionLog.warn(`[auto-enable] ${warn.detail}`)
+          this.sendEvent({
+            type: 'info',
+            sessionId: managed.id,
+            message: `Source "${warn.sourceSlug}" for agent could not be enabled: ${warn.reason === 'not_found' ? 'not found in workspace' : 'not usable (disabled or needs authentication)'}`,
+            level: 'warning',
+          }, managed.workspace.id)
+        }
 
-            for (const sourceBinding of agent_.metadata.sources) {
-              if (!sourceBinding.required) continue
-              if (slugSet.has(sourceBinding.slug)) continue
-
-              // Check if source exists and is usable
-              const sourceCandidates = getSourcesBySlugs(workspaceRootPath, [sourceBinding.slug])
-              if (sourceCandidates.length === 0) {
-                sessionLog.warn(`Required source ${sourceBinding.slug} for agent ${agentSlug} not found in workspace`)
-                continue
-              }
-              if (!isSourceUsable(sourceCandidates[0])) {
-                sessionLog.warn(`Required source ${sourceBinding.slug} for agent ${agentSlug} is not usable (disabled or requires authentication)`)
-                continue
-              }
-
-              slugSet.add(sourceBinding.slug)
-              sourcesAdded = true
-              sessionLog.info(`Auto-enabled required source ${sourceBinding.slug} for agent ${agentSlug}`)
+        // Check if ALL required sources failed for any agent
+        for (const agentSlug of resolution.matchedAgents) {
+          const agentDef = agentList.find(a => a.slug === agentSlug)
+          const requiredSources = agentDef?.metadata.sources?.filter(s => s.required) ?? []
+          if (requiredSources.length > 0) {
+            const allFailed = requiredSources.every(s =>
+              resolution.warnings.some(w => w.agentSlug === agentSlug && w.sourceSlug === s.slug)
+            )
+            if (allFailed) {
+              this.sendEvent({
+                type: 'info',
+                sessionId: managed.id,
+                message: `All required sources for agent "${agentSlug}" failed to enable — the agent may not function correctly.`,
+                level: 'error',
+              }, managed.workspace.id)
             }
           }
-
-          if (sourcesAdded) {
-            managed.enabledSourceSlugs = Array.from(slugSet)
-            this.persistSession(managed)
-            this.sendEvent({
-              type: 'sources_changed',
-              sessionId: managed.id,
-              enabledSourceSlugs: managed.enabledSourceSlugs,
-            }, managed.workspace.id)
-          }
         }
+
+        // Apply state changes
+        if (resolution.slugsToAdd.length > 0) {
+          const slugSet = new Set(managed.enabledSourceSlugs || [])
+          for (const slug of resolution.slugsToAdd) {
+            slugSet.add(slug)
+            sessionLog.info(`[auto-enable] Auto-enabled required source ${slug}`)
+          }
+          managed.enabledSourceSlugs = Array.from(slugSet)
+          this.persistSession(managed)
+          this.sendEvent({
+            type: 'sources_changed',
+            sessionId: managed.id,
+            enabledSourceSlugs: managed.enabledSourceSlugs,
+          }, managed.workspace.id)
+
+          // User-visible success message
+          this.sendEvent({
+            type: 'info',
+            sessionId: managed.id,
+            message: `Auto-enabled source${resolution.slugsToAdd.length > 1 ? 's' : ''}: ${resolution.slugsToAdd.join(', ')}`,
+            level: 'success',
+          }, managed.workspace.id)
+        }
+
         sendSpan.mark('agent.sources.resolved')
       } catch (e) {
-        sessionLog.warn('Failed to auto-enable agent required sources:', e)
+        const err = e instanceof Error ? e : new Error(String(e))
+        sessionLog.warn(`[auto-enable] Failed to auto-enable agent required sources: ${err.message}`, err.stack)
       }
     }
 

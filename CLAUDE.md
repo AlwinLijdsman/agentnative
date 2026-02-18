@@ -57,6 +57,7 @@ Available via `/` prefix in Claude Code CLI sessions.
 | `/an-implement-phased` | Execute plan.md one phase at a time with approval | For careful, step-by-step implementation |
 | `/an-code-researcher` | Read-only codebase analysis with architecture tracing | Explore and understand existing code |
 | `/an-adversarial-reviewer` | Adversarial review (TypeScript, Electron, security) | Final check before shipping |
+| `/an-clean-plan-commit-push` | Archive completed plan, commit, push | After implementation is tested and working |
 
 ### General Template Commands (Python/Streamlit)
 
