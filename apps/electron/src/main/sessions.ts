@@ -3973,7 +3973,7 @@ export class SessionManager {
               `<agent_pipeline_resume agentSlug="${slug}" pausedAtStage="${state.pausedAtStage}" runId="${state.runId}" nextStage="${nextStage}">` +
               `\nMANDATORY: The ${slug} agent pipeline is PAUSED after stage ${state.pausedAtStage}. Your FIRST action in this turn MUST be calling agent_stage_gate — either resume or abort. Do NOT generate any text before calling the tool.` +
               `\n` +
-              `\nCRITICAL: Do NOT regenerate or re-present previous stage output (no CALIBRATED, CONFIRMED, READY, CLARIFYING text). The stage is already complete. Your only job is to call the resume tool.` +
+              `\nCRITICAL: Do NOT re-present the output from stage ${state.pausedAtStage}. That stage is already complete. Your only job is to call the resume tool.` +
               `\n` +
               `\nProceed signals (case-insensitive): "proceed", "continue", "go ahead", "looks good", "approved", "yes", "lgtm", "ok", "next", "1", "go", "sure", "do it"` +
               `\nAbort signals: "abort", "cancel", "stop", "nevermind", "no", "2" (when only two options and second is abort/cancel)` +
@@ -4366,6 +4366,14 @@ export class SessionManager {
       if (resumeContext) {
         sessionLog.info('Injecting agent stage gate resume context for paused pipeline')
         message = resumeContext + '\n\n' + message
+
+        // Clear the pause lock so the agent can call resume in this new processing context.
+        // The lock was set during onAgentStagePause to prevent same-turn LLM self-resume.
+        // Now that the user has sent a new message (we're in sendMessage), it's safe to unlock.
+        if (managed.pauseLocked) {
+          managed.pauseLocked = false
+          sessionLog.info('[stage-gate] Cleared pauseLocked — user-initiated resume via new message')
+        }
       }
 
       sendSpan.mark('chat.starting')
