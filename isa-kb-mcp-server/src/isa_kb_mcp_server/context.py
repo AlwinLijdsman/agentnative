@@ -135,41 +135,67 @@ def format_context(
 
     for rank, role, para in included:
         content = para.get("content", "")
-        paragraph_ref = para.get("paragraph_ref", "")
-        isa_number = para.get("isa_number", "")
-        page_number = para.get("page_number", 0)
         confidence = para.get("confidence", para.get("rrf_score", para.get("hop_score", 0)))
         retrieval_path = para.get("retrieval_path", "unknown")
-        sub_paragraph = para.get("sub_paragraph", "")
-        application_ref = para.get("application_ref", "")
+        tier = para.get("tier", 2)
 
-        # Source label
-        source_label = f"ISA {isa_number}"
-        if paragraph_ref:
-            source_label = f"ISA {paragraph_ref}"
+        if tier == 1:
+            # Guide section
+            heading = para.get("heading", "")
+            source_doc = para.get("source_doc", "")
+            source_label = f"Guide: {heading}" if heading else f"Guide: {source_doc}"
 
-        xml_parts.append(
-            f'  <result rank="{rank}" source="{xml_escape(source_label)}" '
-            f'confidence="{confidence}" retrieval_path="{xml_escape(str(retrieval_path))}" '
-            f'role="{role}">'
-        )
-        xml_parts.append(f"    <content>{xml_escape(content)}</content>")
-        xml_parts.append(
-            f'    <source_text standard="ISA {xml_escape(str(isa_number))}" '
-            f'paragraph="{xml_escape(str(paragraph_ref))}" '
-            f'page="{page_number}"/>'
-        )
+            xml_parts.append(
+                f'  <result rank="{rank}" source="{xml_escape(source_label)}" '
+                f'confidence="{confidence}" retrieval_path="{xml_escape(str(retrieval_path))}" '
+                f'role="{role}" tier="1">'
+            )
+            xml_parts.append(f"    <content>{xml_escape(content)}</content>")
+            xml_parts.append(
+                f'    <source_text guide="{xml_escape(str(source_doc))}" '
+                f'section="{xml_escape(str(heading))}"/>'
+            )
 
-        # Metadata: cross-references (extracted from content)
-        cross_refs = _extract_cross_references(content, isa_number)
-        if cross_refs:
-            xml_parts.append("    <metadata>")
-            xml_parts.append(f"      <cross_references>{xml_escape(', '.join(cross_refs))}</cross_references>")
-            if sub_paragraph:
-                xml_parts.append(f"      <sub_paragraph>{xml_escape(sub_paragraph)}</sub_paragraph>")
-            if application_ref:
-                xml_parts.append(f"      <application_ref>{xml_escape(application_ref)}</application_ref>")
-            xml_parts.append("    </metadata>")
+            # Guide metadata: ISA references found in this section
+            isa_refs = para.get("isa_references", [])
+            if isa_refs:
+                xml_parts.append("    <metadata>")
+                xml_parts.append(f"      <isa_references>{xml_escape(', '.join(str(r) for r in isa_refs))}</isa_references>")
+                xml_parts.append("    </metadata>")
+        else:
+            # ISA paragraph (default, tier 2)
+            paragraph_ref = para.get("paragraph_ref", "")
+            isa_number = para.get("isa_number", "")
+            page_number = para.get("page_number", 0)
+            sub_paragraph = para.get("sub_paragraph", "")
+            application_ref = para.get("application_ref", "")
+
+            source_label = f"ISA {isa_number}"
+            if paragraph_ref:
+                source_label = f"ISA {paragraph_ref}"
+
+            xml_parts.append(
+                f'  <result rank="{rank}" source="{xml_escape(source_label)}" '
+                f'confidence="{confidence}" retrieval_path="{xml_escape(str(retrieval_path))}" '
+                f'role="{role}" tier="2">'
+            )
+            xml_parts.append(f"    <content>{xml_escape(content)}</content>")
+            xml_parts.append(
+                f'    <source_text standard="ISA {xml_escape(str(isa_number))}" '
+                f'paragraph="{xml_escape(str(paragraph_ref))}" '
+                f'page="{page_number}"/>'
+            )
+
+            # Metadata: cross-references (extracted from content)
+            cross_refs = _extract_cross_references(content, isa_number)
+            if cross_refs:
+                xml_parts.append("    <metadata>")
+                xml_parts.append(f"      <cross_references>{xml_escape(', '.join(cross_refs))}</cross_references>")
+                if sub_paragraph:
+                    xml_parts.append(f"      <sub_paragraph>{xml_escape(sub_paragraph)}</sub_paragraph>")
+                if application_ref:
+                    xml_parts.append(f"      <application_ref>{xml_escape(application_ref)}</application_ref>")
+                xml_parts.append("    </metadata>")
 
         xml_parts.append("  </result>")
 

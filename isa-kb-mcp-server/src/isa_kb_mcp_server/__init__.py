@@ -16,6 +16,12 @@ Tools registered:
         - isa_list_standards — List all ISA standards with metadata
         - isa_get_paragraph  — Get specific paragraph by ID or reference
 
+    Phase 12b (Guide Search & Multi-Tier):
+        - isa_guide_search       — Hybrid search on guide documents
+        - isa_guide_to_isa_hop   — Guide section → ISA paragraphs via graph
+        - isa_list_guides        — List available guide documents
+        - isa_multi_tier_search  — Unified cross-tier search (guides + ISA)
+
     Phase 13 (Verification, Context, Web Search):
         - isa_entity_verify      — Entity grounding verification
         - isa_citation_verify    — Citation accuracy verification
@@ -23,6 +29,10 @@ Tools registered:
         - isa_contradiction_check — Contradiction detection
         - isa_format_context     — XML context formatting with token budget
         - isa_web_search         — Brave Search for query calibration
+
+    Phase 14 (Diagnostics):
+        - isa_kb_status          — KB health status (table counts, connections)
+        - isa_debug_hop_trace    — Multi-hop path tracing for graph debugging
 """
 
 from __future__ import annotations
@@ -110,9 +120,9 @@ def create_server() -> FastMCP:
     # Phase 12: Core Search & Retrieval Tools
     # ------------------------------------------------------------------
 
-    from isa_kb_mcp_server.graph import hop_retrieve
+    from isa_kb_mcp_server.graph import guide_to_isa_hop, hop_retrieve
     from isa_kb_mcp_server.paragraphs import get_paragraph, list_standards
-    from isa_kb_mcp_server.search import hybrid_search
+    from isa_kb_mcp_server.search import guide_search, hybrid_search, list_guides, multi_tier_search
 
     @mcp.tool()
     def isa_hybrid_search(
@@ -216,6 +226,111 @@ def create_server() -> FastMCP:
         return get_paragraph(identifier)
 
     # ------------------------------------------------------------------
+    # Phase 12b: Guide Search & Multi-Tier Tools
+    # ------------------------------------------------------------------
+
+    @mcp.tool()
+    def isa_guide_search(
+        query: str,
+        max_results: int = 10,
+        guide_filter: str = "",
+        search_type: str = "hybrid",
+    ) -> dict:
+        """Search guide documents using hybrid keyword + vector retrieval with RRF fusion.
+
+        Searches guide sections (e.g., ISA for LCE chapters) rather than
+        ISA paragraphs. Use this to find guide-level context that references
+        specific ISA requirements.
+
+        Args:
+            query: The search query text.
+            max_results: Maximum number of results to return (default 10).
+            guide_filter: Optional source document name to filter by (e.g., "ISA_LCE").
+                Leave empty for no filter.
+            search_type: Search mode — "hybrid" (default), "keyword", or "vector".
+
+        Returns:
+            Dict with results, total_results, search_type_used, and warnings.
+        """
+        return guide_search(
+            query,
+            max_results=max_results,
+            guide_filter=guide_filter if guide_filter else None,
+            search_type=search_type,
+        )
+
+    @mcp.tool()
+    def isa_guide_to_isa_hop(
+        guide_section_id: str,
+        max_hops: int = 2,
+    ) -> dict:
+        """From a guide section, find connected ISA paragraphs via graph traversal.
+
+        First follows maps_to edges from the guide section to directly
+        referenced ISA paragraphs. Then continues via hop_edge for further
+        ISA-to-ISA connections.
+
+        This gives a "guide-first" retrieval path:
+        Guide Section → maps_to → ISA Paragraphs → hop_edge → Related ISA
+
+        Args:
+            guide_section_id: The guide section ID (e.g., "gs_a1b2c3d4").
+            max_hops: Maximum additional hops beyond maps_to (default 2).
+
+        Returns:
+            Dict with guide_section info, direct_references, connected paragraphs,
+            and total_found.
+        """
+        return guide_to_isa_hop(
+            guide_section_id,
+            max_hops=max_hops,
+        )
+
+    @mcp.tool()
+    def isa_list_guides() -> dict:
+        """List all guide documents in the knowledge base.
+
+        Returns each guide's source document name, section count, and
+        first heading. Use this to discover what guide content is available
+        before searching.
+
+        Returns:
+            Dict with guides list and total_guides count.
+        """
+        return list_guides()
+
+    @mcp.tool()
+    def isa_multi_tier_search(
+        query: str,
+        max_results: int = 20,
+        tiers: list[int] | None = None,
+        search_type: str = "hybrid",
+    ) -> dict:
+        """Search across both guide documents (tier 1) and ISA standards (tier 2).
+
+        Results are ranked across tiers with authority-based weighting.
+        ISA paragraphs (authoritative) are weighted 1.0, guide sections
+        (supplementary) are weighted 0.85.
+
+        Args:
+            query: The search query text.
+            max_results: Maximum total results to return (default 20).
+            tiers: Which tiers to search — [1] guides only, [2] ISA only,
+                [1, 2] both (default). Tier 1 = guides, Tier 2 = ISA standards.
+            search_type: Search mode — "hybrid" (default), "keyword", or "vector".
+
+        Returns:
+            Dict with results (each with tier field), total_results,
+            search_type_used, tier_counts, and warnings.
+        """
+        return multi_tier_search(
+            query,
+            max_results=max_results,
+            tiers=tiers if tiers else [1, 2],
+            search_type=search_type,
+        )
+
+    # ------------------------------------------------------------------
     # Phase 13: Verification, Context Formatter, Web Search
     # ------------------------------------------------------------------
 
@@ -227,6 +342,7 @@ def create_server() -> FastMCP:
         relation_verify,
     )
     from isa_kb_mcp_server.web_search import web_search
+    from isa_kb_mcp_server.diagnostics import debug_hop_trace, kb_status
 
     @mcp.tool()
     def isa_entity_verify(
@@ -360,6 +476,44 @@ def create_server() -> FastMCP:
             Dict with results, analysis_hints, queries_executed, and warnings.
         """
         return web_search(queries, max_results_per_query=max_results_per_query)
+
+    # ------------------------------------------------------------------
+    # Phase 14: Diagnostic Tools
+    # ------------------------------------------------------------------
+
+    @mcp.tool()
+    def isa_kb_status() -> dict:
+        """Return KB health status including table counts, vector collection sizes, and connection state.
+
+        Provides a comprehensive health check of the ISA Knowledge Base,
+        including DuckDB table row counts, LanceDB vector counts,
+        and API availability.
+
+        Returns:
+            Dict with duckdb, lancedb, and voyage_ai status.
+        """
+        return kb_status()
+
+    @mcp.tool()
+    def isa_debug_hop_trace(
+        start_id: str,
+        max_hops: int = 3,
+    ) -> dict:
+        """Trace the full multi-hop path from a node, showing every edge traversed.
+
+        Useful for debugging graph connectivity and understanding how
+        guide sections connect to ISA paragraphs through the knowledge graph.
+
+        Args:
+            start_id: Starting node ID (gs_ prefix for guide sections,
+                ip_ prefix for ISA paragraphs).
+            max_hops: Maximum traversal depth (default 3).
+
+        Returns:
+            Dict with start_node info, hop trace, total nodes discovered,
+            and maximum depth reached.
+        """
+        return debug_hop_trace(start_id, max_hops=max_hops)
 
     return mcp
 

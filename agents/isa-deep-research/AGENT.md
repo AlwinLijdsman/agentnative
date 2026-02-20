@@ -15,6 +15,12 @@ sources:
       - isa_contradiction_check
       - isa_format_context
       - isa_web_search
+      - isa_guide_search
+      - isa_guide_to_isa_hop
+      - isa_list_guides
+      - isa_multi_tier_search
+      - isa_kb_status
+      - isa_debug_hop_trace
 ---
 
 # ISA Deep Research Agent
@@ -40,6 +46,7 @@ Before starting any stage, verify that the ISA Knowledge Base MCP tools are avai
 - `isa_hybrid_search`, `isa_hop_retrieve`, `isa_list_standards`, `isa_get_paragraph`
 - `isa_entity_verify`, `isa_citation_verify`, `isa_relation_verify`, `isa_contradiction_check`
 - `isa_format_context`, `isa_web_search`
+- `isa_guide_search`, `isa_guide_to_isa_hop`, `isa_list_guides`, `isa_multi_tier_search`
 
 **If any ISA KB tools are missing**: STOP immediately. Inform the user:
 > "The ISA Knowledge Base source is not connected to this session. Please add the ISA Knowledge Base source to your session before running this agent."
@@ -208,14 +215,20 @@ After a `resume` with `abort`:
 
 **Goal:** Gather all relevant ISA paragraphs for synthesis.
 
-**REQUIRED**: The ISA KB tools (`isa_hybrid_search`, `isa_hop_retrieve`, `isa_format_context`) MUST be available. If they are not in your tool list, do NOT proceed — report the error to the user and wait. Do not use training knowledge as a substitute for ISA KB retrieval.
+**REQUIRED**: The ISA KB tools (`isa_hybrid_search`, `isa_hop_retrieve`, `isa_guide_search`, `isa_guide_to_isa_hop`, `isa_format_context`) MUST be available. If they are not in your tool list, do NOT proceed — report the error to the user and wait. Do not use training knowledge as a substitute for ISA KB retrieval.
 
 For each sub-query in the query plan:
 
-1. Call `isa_hybrid_search(query, max_results, isa_filter)` — use `isa_filter` when targeting a specific standard
-2. For the top 3-5 results, call `isa_hop_retrieve(paragraph_id)` to discover connected paragraphs
-3. Deduplicate results by paragraph ID across all sub-queries
-4. Respect paragraph caps from depth mode config (`maxParagraphsPerQuery`)
+1. **Guide-first retrieval** — First check if the topic maps to a guide section:
+   - Call `isa_guide_search(query, max_results=5)` to find relevant guide sections
+   - For the top 1-3 guide results, call `isa_guide_to_isa_hop(guide_section_id)` to discover ISA paragraphs referenced by the guide
+   - This provides a "guide-first" path: Guide Section → maps_to → ISA Paragraphs
+2. **Direct ISA retrieval** — Call `isa_hybrid_search(query, max_results, isa_filter)` — use `isa_filter` when targeting a specific standard
+3. **Multi-hop expansion** — For the top 3-5 results (from both guide-sourced and direct ISA), call `isa_hop_retrieve(paragraph_id)` to discover connected paragraphs
+4. **Combine and deduplicate** — Merge guide-sourced ISA paragraphs with direct search results, deduplicating by paragraph ID across all sub-queries
+5. Respect paragraph caps from depth mode config (`maxParagraphsPerQuery`)
+
+**Alternative**: For broad queries spanning both guides and ISA standards, use `isa_multi_tier_search(query, tiers=[1, 2])` to search both tiers in one call with authority-based ranking.
 
 ### Stage 2.5: Format Context
 
@@ -256,7 +269,7 @@ Complete Stage 2 with data containing:
 ### Synthesis Behaviors (ALL 12 required)
 
 1. **Structured Organization** — Use hierarchical headings that mirror the query's complexity
-2. **ISA-First Attribution** — Every claim MUST cite the specific ISA paragraph (e.g., "per ISA 315.12(a)")
+2. **ISA-First Attribution** — Every claim MUST cite the specific ISA paragraph (e.g., "per ISA 315.12(a)"). When citing ISA paragraphs found via guide sections, note the guide context (e.g., "Per ISA 315.12(a), as referenced in the ISA for LCE Section 5...")
 3. **Requirement Classification** — Clearly distinguish between requirements ("shall"), recommendations ("should"), and guidance (application material)
 4. **Cross-Standard Linking** — Explicitly connect related requirements across different ISAs
 5. **Practical Application** — Include application material (A-paragraphs) that explain how to implement requirements
@@ -297,10 +310,10 @@ Complete Stage 3 with data containing the full synthesis text and metadata:
 
 **Goal:** Run 4-axis verification and determine if repair is needed.
 
-1. **Entity Grounding** — Call `isa_entity_verify(entities, source_paragraph_ids)` with entities from Stage 3
-2. **Citation Accuracy** — Call `isa_citation_verify(citations)` with citations from Stage 3
+1. **Entity Grounding** — Call `isa_entity_verify(entities, source_paragraph_ids)` with entities from Stage 3. Include both `ip_` (ISA paragraph) and `gs_` (guide section) IDs in `source_paragraph_ids` — the verification tool checks entities against both `ISAParagraph` and `GuideSection` content.
+2. **Citation Accuracy** — Call `isa_citation_verify(citations)` with citations from Stage 3. Citations may reference guide sections (`gs_` IDs) in addition to ISA paragraphs (`ip_` IDs) — both are valid citation sources.
 3. **Relation Preservation** — Call `isa_relation_verify(relations)` with relations from Stage 3
-4. **Contradiction Detection** — Call `isa_contradiction_check(paragraph_ids)` with all cited paragraph IDs
+4. **Contradiction Detection** — Call `isa_contradiction_check(paragraph_ids)` with all cited paragraph IDs (both `ip_` and `gs_` prefixed)
 
 ### Threshold Evaluation
 
