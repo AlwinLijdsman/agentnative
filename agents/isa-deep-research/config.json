@@ -101,12 +101,14 @@
         }
       },
       "5": {
-        "required": ["answer_delivered"],
+        "required": ["answer_delivered", "output_file_path"],
         "properties": {
           "answer_delivered": { "type": "boolean" },
           "total_citations": { "type": "number" },
           "output_file_path": { "type": "string" }
-        }
+        },
+        "enforcement": "block",
+        "blockMessage": "Stage 5 BLOCKED: You MUST (1) write the full research output to ./isa-research-output.md, (2) include the COMPLETE formatted research with citations in your response to the user, and (3) re-complete Stage 5 with answer_delivered: true and output_file_path set to the file path. Do NOT skip the output file or the inline research content."
       }
     },
     "webSearch": {

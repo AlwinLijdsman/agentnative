@@ -164,6 +164,7 @@ const STAGE_4_OUTPUT = {
 const STAGE_5_OUTPUT = {
   answer_delivered: true,
   total_citations: 12,
+  output_file_path: './isa-research-output.md',
 };
 
 // ============================================================

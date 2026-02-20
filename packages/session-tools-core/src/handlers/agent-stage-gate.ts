@@ -100,7 +100,11 @@ interface StageGateConfig {
 /**
  * Lightweight JSON schema for validating stage outputs.
  * Intentionally simple — no external deps, ~80 lines.
- * Validation emits warnings, never blocks completion.
+ *
+ * Enforcement modes:
+ * - "warn" (default): validation emits warnings but never blocks completion.
+ * - "block": validation failures return allowed:false with a repair message,
+ *   forcing the agent to fix the output before the stage can complete.
  */
 interface StageOutputSchemaProperty {
   type?: 'string' | 'number' | 'boolean' | 'array' | 'object';
@@ -113,6 +117,10 @@ interface StageOutputSchemaProperty {
 interface StageOutputSchema {
   required?: string[];
   properties?: Record<string, StageOutputSchemaProperty>;
+  /** When "block", validation failures prevent stage completion. Default: "warn". */
+  enforcement?: 'warn' | 'block';
+  /** Message returned to the agent when enforcement is "block" and validation fails. */
+  blockMessage?: string;
 }
 
 interface ValidationResult {
@@ -654,7 +662,8 @@ function handleComplete(
 
   state.lastEventAt = now;
 
-  // Stage output schema validation (warnings only, never blocks)
+  // Stage output schema validation
+  // Enforcement modes: "warn" (default) logs warnings; "block" rejects completion.
   let validationWarnings: string[] | undefined;
   if (args.data && config.controlFlow.stageOutputSchemas) {
     const schema = config.controlFlow.stageOutputSchemas[String(stage)];
@@ -662,12 +671,31 @@ function handleComplete(
       const validation = validateStageOutput(args.data, schema);
       if (!validation.valid) {
         validationWarnings = validation.warnings;
+        const enforcement = schema.enforcement ?? 'warn';
+
         appendEvent(ctx, args.agentSlug, {
-          type: 'stage_output_validation_warning',
+          type: enforcement === 'block' ? 'stage_output_validation_blocked' : 'stage_output_validation_warning',
           timestamp: now,
           runId: state.runId,
-          data: { stage, warnings: validation.warnings },
+          data: { stage, warnings: validation.warnings, enforcement },
         });
+
+        // Block completion when enforcement is "block"
+        if (enforcement === 'block') {
+          // Undo the stage completion — remove from completedStages
+          state.completedStages = state.completedStages.filter((s) => s !== stage);
+          state.lastEventAt = now;
+          writeRunState(ctx, args.agentSlug, state);
+
+          const repairMessage = schema.blockMessage
+            ?? `Stage ${stage} output validation failed. Fix the following issues and re-complete the stage: ${validation.warnings.join('; ')}`;
+
+          return makeResult(state, config, {
+            allowed: false,
+            reason: repairMessage,
+            validationWarnings,
+          });
+        }
       }
     }
   }
