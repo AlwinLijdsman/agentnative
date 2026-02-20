@@ -34,6 +34,18 @@ After each stage:   agent_stage_gate({ agentSlug: "isa-deep-research", action: "
 - If `pauseRequired` is `true`, follow the pause instructions in the tool result `reason`, then stop and wait for the user to decide proceed/modify/abort.
 - If `staleRun` is returned, ask the user: resume the stale run, or reset?
 
+## Prerequisites: ISA Knowledge Base Verification
+
+Before starting any stage, verify that the ISA Knowledge Base MCP tools are available in your tool list. You need ALL of these tools:
+- `isa_hybrid_search`, `isa_hop_retrieve`, `isa_list_standards`, `isa_get_paragraph`
+- `isa_entity_verify`, `isa_citation_verify`, `isa_relation_verify`, `isa_contradiction_check`
+- `isa_format_context`, `isa_web_search`
+
+**If any ISA KB tools are missing**: STOP immediately. Inform the user:
+> "The ISA Knowledge Base source is not connected to this session. Please add the ISA Knowledge Base source to your session before running this agent."
+
+**NEVER fall back to training knowledge** for retrieval or verification. The ISA KB is the authoritative source. Reading source config files from disk does NOT mean the tools are available — check your actual tool list.
+
 ## Stage 0: Analyze Query
 
 **Goal:** Decompose the user's question into a structured query plan.
@@ -56,15 +68,6 @@ After each stage:   agent_stage_gate({ agentSlug: "isa-deep-research", action: "
    - `standard`: Only if user explicitly requests a quick answer (8 sub-queries, 2 repair iterations, web search)
    - `quick`: Only for simple single-paragraph lookups (3 sub-queries, no repair, no web search)
 
-### Second Calibration (Web Search)
-
-If depth mode is `standard` or `deep` AND web search is enabled in config:
-
-1. Call `isa_web_search` with 3-5 targeted queries derived from the question
-2. Review `analysis_hints` — which standards are most discussed, which authoritative sources appear
-3. **Refine sub-queries** based on web insights — add sub-queries for frequently mentioned standards, adjust roles
-4. Web results inform what to FOCUS on during retrieval, NOT what the answer says
-
 ### Stage 0 Output
 
 Complete Stage 0 with data containing:
@@ -80,8 +83,6 @@ Complete Stage 0 with data containing:
     ],
     "scope": "cross-standard",
     "depth_mode": "standard",
-    "web_calibration_used": true,
-    "web_hints": ["..."],
     "assumptions": ["User is asking about ISA 315 revised (2019)", "Focus is on inherent risk factors"],
     "alternative_interpretations": [],
     "recommended_action": "proceed"
@@ -103,9 +104,85 @@ Complete Stage 0 with data containing:
   - Confirm your understanding of the question
   - Mention the ISA standards you plan to focus on
   - State key assumptions and, when ambiguous, ask which interpretation the user intends
-- Do NOT present the full query plan, sub-query lists, scope/depth breakdowns, standards tables, or complexity scoring in the user-facing pause text.
+- The stage gate pause instructions will also ask the user whether they want a web search to refine the query plan (unless in quick mode). This question is defined in config.json pauseInstructions.
+- After your narrative, include a "Planned research queries:" section listing each sub-query as a bullet (• [role] query text — target standards). This gives the user visibility into what will be researched.
+- Do NOT present scope/depth breakdowns, standards tables, or complexity scoring in the user-facing pause text.
 
-**PAUSE: Stage gate enforces pause after Stage 0.** The user reviews the query plan.
+**PAUSE: Stage gate enforces pause after Stage 0.** The user reviews the query plan and decides whether to proceed (with or without web search calibration).
+
+## Stage 1: Websearch Calibration
+
+**Goal:** Optionally run web searches to refine the query plan before retrieval.
+
+### Skip Conditions
+
+Stage 1 runs as a **no-op** (immediately complete with `skipped: true`) when ANY of:
+- User declined websearch at Stage 0 pause (resume with `modify: { skip_websearch: true }`)
+- `depth_mode` is `quick` (quick mode has `enableWebSearch: false`)
+- `config.debug.skipWebSearch` is `true`
+
+When skipping, complete with:
+```json
+{
+  "websearch_calibration": {
+    "skipped": true,
+    "skip_reason": "user_declined | quick_mode | debug_skip",
+    "web_queries_executed": 0,
+    "web_sources": [],
+    "intent_changes": {
+      "sub_queries_added": [],
+      "sub_queries_modified": [],
+      "sub_queries_removed": [],
+      "scope_changed": false,
+      "standards_added": []
+    },
+    "query_plan_refined": false
+  }
+}
+```
+
+### Execution (when not skipped)
+
+1. Call `isa_web_search` with 3-5 targeted queries derived from the Stage 0 query plan
+2. Review `analysis_hints` — which standards are most discussed, which authoritative sources appear
+3. Record each web source: `{ url, title, relevance_note }`
+4. **Refine sub-queries** based on web insights:
+   - Add sub-queries for frequently mentioned standards not in the original plan
+   - Adjust roles (primary/supporting/context) based on web prominence
+   - Consider adding query expansion terms from web results
+5. Compute `intent_changes` diff between original and refined query plan
+6. Web results inform what to FOCUS on during retrieval, NOT what the answer says
+
+### Stage 1 Output
+
+```json
+{
+  "websearch_calibration": {
+    "skipped": false,
+    "web_queries_executed": 4,
+    "web_sources": [
+      { "url": "https://ifac.org/...", "title": "ISA 540 Implementation Guide", "relevance_note": "Key guidance on estimates" }
+    ],
+    "intent_changes": {
+      "sub_queries_added": [{ "query": "...", "role": "primary", "reason": "Found in IFAC guidance" }],
+      "sub_queries_modified": [{ "original": "...", "modified": "...", "reason": "..." }],
+      "sub_queries_removed": [],
+      "scope_changed": true,
+      "standards_added": ["ISA 540"]
+    },
+    "query_plan_refined": true
+  }
+}
+```
+
+### Stage 1 Output Requirements
+- `skipped` must be a boolean
+- If `skipped` is `true`, `skip_reason` must be one of: `user_declined`, `quick_mode`, `debug_skip`
+- If `skipped` is `false`, `web_queries_executed` must be >= 1
+- If `skipped` is `false`, `web_sources` must have at least 1 entry with `url` and `title`
+- `intent_changes` must always be present (empty arrays if no changes)
+
+**PAUSE: Stage gate enforces pause after Stage 1.** The user reviews what changed.
 
 ## Resume Protocol
 
@@ -115,6 +192,7 @@ When execution resumes after any stage pause, interpret the user's message and c
 |-----------|----------|------|
 | "approved", "proceed", "looks good", "continue", "go" | `proceed` | `{ decision: "proceed" }` |
 | "abort", "cancel", "stop", "nevermind" | `abort` | `{ decision: "abort", reason: "..." }` |
+| "no websearch", "skip search", "B" (option B at Stage 0 websearch question) | `modify` | `{ decision: "modify", modifications: { skip_websearch: true } }` |
 | Any modification request | `modify` | `{ decision: "modify", modifications: { adjusted_sub_queries: [...], ... } }` |
 
 After a `resume` with `modify`:
@@ -126,9 +204,11 @@ After a `resume` with `abort`:
 1. The pipeline is terminated — inform the user
 2. State is cleared — a new run can be started
 
-## Stage 1: Retrieve
+## Stage 2: Retrieve
 
 **Goal:** Gather all relevant ISA paragraphs for synthesis.
+
+**REQUIRED**: The ISA KB tools (`isa_hybrid_search`, `isa_hop_retrieve`, `isa_format_context`) MUST be available. If they are not in your tool list, do NOT proceed — report the error to the user and wait. Do not use training knowledge as a substitute for ISA KB retrieval.
 
 For each sub-query in the query plan:
 
@@ -137,7 +217,7 @@ For each sub-query in the query plan:
 3. Deduplicate results by paragraph ID across all sub-queries
 4. Respect paragraph caps from depth mode config (`maxParagraphsPerQuery`)
 
-### Stage 1.5: Format Context
+### Stage 2.5: Format Context
 
 After retrieval is complete:
 
@@ -145,9 +225,9 @@ After retrieval is complete:
 2. Call `isa_format_context(paragraphs, query, max_tokens, roles)` with the token budget from depth mode config
 3. The XML output becomes the input for synthesis
 
-### Stage 1 Output
+### Stage 2 Output
 
-Complete Stage 1 with data containing:
+Complete Stage 2 with data containing:
 ```json
 {
   "retrieval_summary": {
@@ -163,13 +243,13 @@ Complete Stage 1 with data containing:
 }
 ```
 
-### Stage 1 Output Requirements
+### Stage 2 Output Requirements
 - At least 10 unique paragraphs retrieved (`unique_after_dedup >= 10`)
 - At least 1 standard covered in `standards_covered`
 - `formatted_context_xml` must be present and non-empty
 - All sub-queries from Stage 0 must have been executed
 
-## Stage 2: Synthesize
+## Stage 3: Synthesize
 
 **Goal:** Generate a structured, authoritative answer from the formatted XML context.
 
@@ -188,9 +268,9 @@ Complete Stage 1 with data containing:
 11. **Confidence Calibration** — Self-assess confidence for each major section (high/medium/low) based on source quality
 12. **Progressive Disclosure** — Lead with the direct answer, then expand with supporting detail
 
-### Stage 2 Output
+### Stage 3 Output
 
-Complete Stage 2 with data containing the full synthesis text and metadata:
+Complete Stage 3 with data containing the full synthesis text and metadata:
 ```json
 {
   "synthesis": "...(full answer text)...",
@@ -206,20 +286,20 @@ Complete Stage 2 with data containing the full synthesis text and metadata:
 }
 ```
 
-### Stage 2 Output Requirements
+### Stage 3 Output Requirements
 - `synthesis` text must be present and substantive (not a stub)
 - At least 5 citations in `citations_used`
 - `entities_referenced` must list all ISA standards mentioned
 - All 12 synthesis behaviors must be followed (cross-check each one)
 - `confidence_per_section` must cover all sections
 
-## Stage 3: Verify
+## Stage 4: Verify
 
 **Goal:** Run 4-axis verification and determine if repair is needed.
 
-1. **Entity Grounding** — Call `isa_entity_verify(entities, source_paragraph_ids)` with entities from Stage 2
-2. **Citation Accuracy** — Call `isa_citation_verify(citations)` with citations from Stage 2
-3. **Relation Preservation** — Call `isa_relation_verify(relations)` with relations from Stage 2
+1. **Entity Grounding** — Call `isa_entity_verify(entities, source_paragraph_ids)` with entities from Stage 3
+2. **Citation Accuracy** — Call `isa_citation_verify(citations)` with citations from Stage 3
+3. **Relation Preservation** — Call `isa_relation_verify(relations)` with relations from Stage 3
 4. **Contradiction Detection** — Call `isa_contradiction_check(paragraph_ids)` with all cited paragraph IDs
 
 ### Threshold Evaluation
@@ -230,7 +310,7 @@ Check each score against config thresholds:
 - Relation Preservation: threshold from `config.verification.relationPreservation.threshold`
 - Contradictions: max unresolved from `config.verification.contradictions.maxUnresolved`
 
-### Stage 3 Output
+### Stage 4 Output
 
 ```json
 {
@@ -262,7 +342,7 @@ If any axis fails, generate `repair_instructions`:
 }
 ```
 
-### Stage 3 Output Requirements
+### Stage 4 Output Requirements
 - All 4 verification axes must be executed (EG, CA, RP, CD)
 - `verification_scores` must contain scores for all 4 axes
 - `all_passed` must be a boolean reflecting threshold evaluation
@@ -274,10 +354,10 @@ When verification fails and repair iterations remain:
 
 ```
 1. agent_stage_gate({ action: "start_repair_unit", agentSlug: "isa-deep-research" })
-2. agent_stage_gate({ action: "start", stage: 2 }) → Re-synthesize with repair_instructions as feedback
-3. agent_stage_gate({ action: "complete", stage: 2, data: { synthesis, repair_feedback: "..." } })
-4. agent_stage_gate({ action: "start", stage: 3 }) → Re-verify
-5. agent_stage_gate({ action: "complete", stage: 3, data: { verification_scores, repair_instructions } })
+2. agent_stage_gate({ action: "start", stage: 3 }) → Re-synthesize with repair_instructions as feedback
+3. agent_stage_gate({ action: "complete", stage: 3, data: { synthesis, repair_feedback: "..." } })
+4. agent_stage_gate({ action: "start", stage: 4 }) → Re-verify
+5. agent_stage_gate({ action: "complete", stage: 4, data: { verification_scores, repair_instructions } })
 6. If ALL thresholds passed → agent_stage_gate({ action: "end_repair_unit" })
 7. If still failing → agent_stage_gate({ action: "repair" })
    - If allowed: true → go to step 2
@@ -290,7 +370,7 @@ During re-synthesis (step 2), incorporate the `repair_instructions` feedback:
 - Resolve contradictions by clarifying scope or noting conflicting guidance
 - Strengthen weak relation preservation with explicit cross-references
 
-## Stage 4: Output & Visualization
+## Stage 5: Output & Visualization
 
 **Goal:** Format the final answer with progressive disclosure and citation linking.
 
@@ -319,15 +399,24 @@ During re-synthesis (step 2), incorporate the `repair_instructions` feedback:
    }})
    ```
 
-### Stage 4 Output Requirements
+5. **Save Research Output:**
+   - Write the complete formatted answer (from step 1-3 above) as a markdown file
+   - Save to the working directory as `isa-research-output.md`
+   - Include a metadata header in the file: `# ISA Research: {original_query}` followed by `> Generated by ISA Deep Research Agent | Run: {runId} | Date: {date}`
+   - After writing the file, reference it in your response to the user: "The full research output has been saved to `isa-research-output.md`."
+   - Include the file path in your Stage 5 completion data as `output_file_path`
+
+### Stage 5 Output Requirements
 - Verification summary table must be present with all 4 axis scores
 - All ISA references must use the format: `ISA {number}.{paragraph}`
 - Direct answer must lead the response (progressive disclosure)
 - Accumulated state must be updated via `agent_state`
+- Research output must be saved as `isa-research-output.md` in the working directory
+- The file path must be included in Stage 5 output data as `output_file_path`
 
-### Stage 4 Output
+### Stage 5 Output
 
-Complete Stage 4 with:
+Complete Stage 5 with:
 ```json
 {
   "answer_delivered": true,
@@ -335,7 +424,8 @@ Complete Stage 4 with:
   "total_citations": 12,
   "verification_summary": { "EG": 0.92, "CA": 0.88, "RP": 0.75, "CD": 0 },
   "repair_iterations_used": 0,
-  "state_updated": true
+  "state_updated": true,
+  "output_file_path": "isa-research-output.md"
 }
 ```
 
@@ -348,6 +438,7 @@ When the user asks a follow-up question in the same session:
 3. **Delta retrieval** — Only search for paragraphs not already covered
 4. Reference prior sections where relevant: "As discussed in the previous analysis of ISA 315..."
 5. Update state after completion with the combined query history
+6. `webSearchQueryCount` in metadata should include Stage 1 web queries (0 if skipped)
 
 ## Error Recovery
 
@@ -371,5 +462,5 @@ When `config.debug.enabled` is `true`:
 - Cap paragraphs to `config.debug.maxParagraphs` per query
 - Cap total tool calls to `config.debug.maxToolCalls`
 - Skip Relation Preservation and Contradiction verification if `config.debug.skipVerification`
-- Skip web search if `config.debug.skipWebSearch`
+- Skip websearch calibration (Stage 1) if `config.debug.skipWebSearch` — Stage 1 completes as no-op with `skip_reason: "debug_skip"`
 - Use fixture data if `config.debug.useFixtures`

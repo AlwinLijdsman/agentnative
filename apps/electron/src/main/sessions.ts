@@ -3971,28 +3971,26 @@ export class SessionManager {
             const nextStage = state.pausedAtStage + 1
             return (
               `<agent_pipeline_resume agentSlug="${slug}" pausedAtStage="${state.pausedAtStage}" runId="${state.runId}" nextStage="${nextStage}">` +
-              `\nThe ${slug} agent pipeline is PAUSED after stage ${state.pausedAtStage} (completed stages: ${JSON.stringify(state.completedStages)}).` +
-              `\nIMPORTANT: Only resume the pipeline if the user's message CLEARLY indicates a decision about the paused pipeline.` +
+              `\nMANDATORY: The ${slug} agent pipeline is PAUSED after stage ${state.pausedAtStage}. Your FIRST action in this turn MUST be calling agent_stage_gate — either resume or abort. Do NOT generate any text before calling the tool.` +
               `\n` +
-              `\nExplicit proceed signals (case-insensitive): "proceed", "continue", "go ahead", "looks good", "approved", "yes", "lgtm", "ok", "next"` +
-              `\nExplicit abort signals: "abort", "cancel", "stop", "nevermind", "no"` +
-              `\nExplicit modify signals: the message includes specific requested changes to the paused stage output` +
+              `\nCRITICAL: Do NOT regenerate or re-present previous stage output (no CALIBRATED, CONFIRMED, READY, CLARIFYING text). The stage is already complete. Your only job is to call the resume tool.` +
               `\n` +
-              `\nIf the user's message matches a proceed signal:` +
-              `\n  1. Call agent_stage_gate({ agentSlug: "${slug}", action: "resume", data: { decision: "proceed" } })` +
-              `\n  2. Then call agent_stage_gate({ agentSlug: "${slug}", action: "start", stage: ${nextStage} })` +
+              `\nProceed signals (case-insensitive): "proceed", "continue", "go ahead", "looks good", "approved", "yes", "lgtm", "ok", "next", "1", "go", "sure", "do it"` +
+              `\nAbort signals: "abort", "cancel", "stop", "nevermind", "no", "2" (when only two options and second is abort/cancel)` +
+              `\nModify signals: the message includes specific requested changes, or "modify", "change", "adjust", "2" (when second option is modify)` +
               `\n` +
-              `\nIf the user's message matches an abort signal:` +
-              `\n  1. Call agent_stage_gate({ agentSlug: "${slug}", action: "resume", data: { decision: "abort" } })` +
+              `\nIf proceed → call these two tools IN ORDER:` +
+              `\n  agent_stage_gate({ agentSlug: "${slug}", action: "resume", data: { decision: "proceed" } })` +
+              `\n  agent_stage_gate({ agentSlug: "${slug}", action: "start", stage: ${nextStage} })` +
               `\n` +
-              `\nIf the user's message matches a modify signal:` +
-              `\n  1. Call agent_stage_gate({ agentSlug: "${slug}", action: "resume", data: { decision: "modify", modifications: { ... } } })` +
-              `\n  2. Then call agent_stage_gate({ agentSlug: "${slug}", action: "start", stage: ${nextStage} })` +
+              `\nIf abort → call:` +
+              `\n  agent_stage_gate({ agentSlug: "${slug}", action: "resume", data: { decision: "abort" } })` +
               `\n` +
-              `\nIf the user's message is unrelated to the paused pipeline:` +
-              `\n  - Do NOT call resume.` +
-              `\n  - Do NOT call start.` +
-              `\n  - Respond to the user normally, then remind them the pipeline remains paused and ask for explicit 'proceed', 'modify', or 'abort'.` +
+              `\nIf modify → call these two tools IN ORDER:` +
+              `\n  agent_stage_gate({ agentSlug: "${slug}", action: "resume", data: { decision: "modify", modifications: { ... } } })` +
+              `\n  agent_stage_gate({ agentSlug: "${slug}", action: "start", stage: ${nextStage} })` +
+              `\n` +
+              `\nIf the message is clearly unrelated to the pipeline, respond normally and remind the user the pipeline is paused.` +
               `\n</agent_pipeline_resume>`
             )
           }
