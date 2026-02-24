@@ -46,7 +46,7 @@
       {
         "stages": [3, 4],
         "maxIterations": 2,
-        "feedbackField": "repair_instructions"
+        "feedbackField": "feedback"
       }
     ],
     "pauseAfterStages": [0, 1],
@@ -58,14 +58,26 @@
         "properties": {
           "query_plan": {
             "type": "object",
-            "required": ["original_query", "sub_queries", "depth_mode"],
+            "required": ["original_query", "clarity_score", "sub_queries", "depth_mode", "primary_standards", "recommended_action"],
             "properties": {
               "original_query": { "type": "string" },
-              "sub_queries": { "type": "array", "minItems": 1 },
-              "depth_mode": { "type": "string", "enum": ["quick", "standard", "deep"] },
+              "clarity_score": { "type": "number", "minimum": 0, "maximum": 1 },
+              "recommended_action": { "type": "string", "enum": ["proceed", "clarify"] },
               "assumptions": { "type": "array" },
               "alternative_interpretations": { "type": "array" },
-              "recommended_action": { "type": "string", "enum": ["proceed", "clarify"] }
+              "clarification_questions": { "type": "array" },
+              "primary_standards": { "type": "array", "minItems": 1 },
+              "sub_queries": { "type": "array", "minItems": 1 },
+              "scope": { "type": "string" },
+              "depth_mode": { "type": "string", "enum": ["quick", "standard", "deep"] },
+              "authority_sources": {
+                "type": "object",
+                "properties": {
+                  "search_queries": { "type": "array", "minItems": 3 },
+                  "domain_hints": { "type": "array", "minItems": 3 },
+                  "source_types": { "type": "array" }
+                }
+              }
             }
           }
         }
@@ -87,10 +99,12 @@
                   "sub_queries_added": { "type": "array" },
                   "sub_queries_modified": { "type": "array" },
                   "sub_queries_removed": { "type": "array" },
+                  "sub_queries_demoted": { "type": "array" },
                   "scope_changed": { "type": "boolean" },
                   "standards_added": { "type": "array" }
                 }
               },
+              "web_research_context": { "type": "string" },
               "query_plan_refined": { "type": "boolean" }
             }
           }
@@ -101,11 +115,20 @@
         "properties": {
           "retrieval_summary": {
             "type": "object",
-            "required": ["total_paragraphs_found", "unique_after_dedup", "standards_covered"],
+            "required": ["total_paragraphs_found", "unique_after_dedup", "standards_covered", "role_counts"],
             "properties": {
               "total_paragraphs_found": { "type": "number" },
               "unique_after_dedup": { "type": "number" },
-              "standards_covered": { "type": "array", "minItems": 1 }
+              "standards_covered": { "type": "array", "minItems": 1 },
+              "role_counts": {
+                "type": "object",
+                "properties": {
+                  "primary": { "type": "number" },
+                  "supporting": { "type": "number" },
+                  "context": { "type": "number" }
+                }
+              },
+              "skipped_sub_queries": { "type": "array" }
             }
           }
         }
@@ -115,24 +138,32 @@
         "properties": {
           "synthesis": { "type": "string" },
           "citations_used": { "type": "array", "minItems": 1 }
-        }
+        },
+        "enforcement": "block",
+        "blockMessage": "Stage 3 BLOCKED: synthesis (full text) and citations_used (array of citation refs) are required. Pass the complete synthesis text and the list of all citations used."
       },
       "4": {
-        "required": ["verification_scores", "all_passed"],
+        "required": ["verification_scores", "all_passed", "source_texts"],
         "properties": {
           "verification_scores": { "type": "object" },
-          "all_passed": { "type": "boolean" }
-        }
+          "all_passed": { "type": "boolean" },
+          "source_texts": { "type": "object" },
+          "missing_source_texts": { "type": "array" }
+        },
+        "enforcement": "block",
+        "blockMessage": "Stage 4 BLOCKED: verification_scores, all_passed, and source_texts are required. source_texts must be a map of citation refs to verbatim paragraph text from isa_citation_verify results. Pass all verification data to complete Stage 4."
       },
       "5": {
         "required": ["answer_delivered", "output_file_path"],
         "properties": {
           "answer_delivered": { "type": "boolean" },
           "total_citations": { "type": "number" },
-          "output_file_path": { "type": "string" }
+          "output_file_path": { "type": "string" },
+          "source_texts_used": { "type": "number" },
+          "renderer_tool_called": { "type": "boolean" }
         },
         "enforcement": "block",
-        "blockMessage": "Stage 5 BLOCKED: You MUST (1) write the full research output to ./isa-research-output.md, (2) include the COMPLETE formatted research with citations in your response to the user, and (3) re-complete Stage 5 with answer_delivered: true and output_file_path set to the file path. Do NOT skip the output file or the inline research content."
+        "blockMessage": "Stage 5 BLOCKED: answer_delivered and output_file_path are required. The output file must exist on disk. Preferred: call agent_render_research_output with sourceTexts. Alternative: write the file with the Write tool — the stage gate will inject > **Sources** blockquotes automatically from Stage 4 source_texts. Re-complete with answer_delivered: true and output_file_path set."
       }
     },
     "webSearch": {
@@ -154,20 +185,23 @@
       "maxParagraphsPerQuery": 10,
       "maxRepairIterations": 0,
       "contextTokenBudget": 4000,
+      "maxSynthesisTokens": 2048,
       "enableWebSearch": false
     },
     "standard": {
       "maxSubQueries": 8,
       "maxParagraphsPerQuery": 20,
       "maxRepairIterations": 2,
-      "contextTokenBudget": 8000,
+      "contextTokenBudget": 12000,
+      "maxSynthesisTokens": 4096,
       "enableWebSearch": true
     },
     "deep": {
       "maxSubQueries": 15,
       "maxParagraphsPerQuery": 30,
       "maxRepairIterations": 3,
-      "contextTokenBudget": 16000,
+      "contextTokenBudget": 24000,
+      "maxSynthesisTokens": 8192,
       "enableWebSearch": true
     }
   },
@@ -188,8 +222,35 @@
     "maxAccumulatedSections": 30
   },
   "output": {
-    "progressiveDisclosure": true,
-    "citationFormat": "ISA {number}.{paragraph}"
+    "renderer": { "type": "research", "version": "1.0" },
+    "titleTemplate": "ISA Research",
+    "followupTitleTemplate": "ISA Research Follow-Up #{n}",
+    "citationFormat": "ISA {number}.{paragraph}",
+    "citationRegex": "(?:\\()?ISA \\d{3}(?:\\.\\d+)?(?:\\([a-z]\\))?(?:\\.A\\d+)?(?:\\))?",
+    "sourceDiscovery": {
+      "enabled": true,
+      "linkerType": "isa-pdf",
+      "linkBase": "../staging/pdf/"
+    },
+    "sections": {
+      "externalReferencesTitle": "External Good Practice References",
+      "priorResearchTitle": "Prior Research References",
+      "verificationSummaryTitle": "Verification Summary",
+      "citationsUsedTitle": "Citations Used",
+      "researchDecompositionTitle": "Appendix: Research Decomposition"
+    },
+    "priorResearch": {
+      "refFormat": "[P{num}]",
+      "excerptLength": 200
+    },
+    "confidence": {
+      "qualifierThresholds": { "high": 0.85, "medium": 0.70 }
+    },
+    "files": {
+      "answerFile": "isa-research-output.md",
+      "followupTemplate": "isa-research-output-followup-{n}.md"
+    },
+    "progressiveDisclosure": true
   },
   "debug": {
     "enabled": false,
@@ -198,5 +259,27 @@
     "skipVerification": false,
     "skipWebSearch": true,
     "useFixtures": false
+  },
+  "orchestrator": {
+    "enabled": true,
+    "model": "claude-opus-4-6",
+    "thinking": { "type": "adaptive" },
+    "effort": "max",
+    "depthModeEffort": {
+      "quick": "high",
+      "standard": "high",
+      "deep": "max"
+    },
+    "contextWindow": 200000,
+    "minOutputBudget": 4096,
+    "budgetUsd": 10.0,
+    "perStageDesiredTokens": {
+      "0": 16384,
+      "1": 8192,
+      "3": 128000,
+      "5": 0
+    },
+    "useBAML": true,
+    "bamlFallbackToZod": true
   }
 }

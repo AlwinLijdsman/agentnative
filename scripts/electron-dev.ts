@@ -353,6 +353,96 @@ async function main(): Promise<void> {
   const childProcesses: ChildProcess[] = [];
   const esbuildContexts: esbuild.BuildContext[] = [];
 
+  // ── Electron process management ──────────────────────────
+  // Mutable reference so the restart plugin can kill + re-spawn.
+  let electronProc: ChildProcess | null = null;
+  let isCleaningUp = false;
+  let restartCount = 0;
+
+  /**
+   * Spawn (or re-spawn) the Electron process.
+   * Registers an exit handler that triggers full cleanup when the user
+   * closes the app window manually (but NOT when we kill it for restart).
+   */
+  let electronKilledForRestart = false;
+
+  function spawnElectron(): ChildProcess {
+    const proc = spawn(ELECTRON_BIN, ["apps/electron"], {
+      cwd: ROOT_DIR,
+      stdio: ["ignore", "inherit", "inherit"],
+      env: getElectronEnv(),
+      shell: IS_WINDOWS,
+    });
+
+    proc.on("exit", (code) => {
+      // If we killed Electron ourselves for a restart, don't trigger cleanup.
+      if (electronKilledForRestart) return;
+      // User closed the app window — shut everything down.
+      cleanup();
+    });
+
+    return proc;
+  }
+
+  // ── Electron restart plugin for esbuild ──────────────────
+  // Restarts Electron when main.cjs is rebuilt successfully.
+  // Skips the first build (initial startup) and debounces rapid rebuilds.
+  let mainBuildCount = 0;
+  let restartTimer: ReturnType<typeof setTimeout> | null = null;
+  const RESTART_DEBOUNCE_MS = 150;
+
+  const electronRestartPlugin: esbuild.Plugin = {
+    name: "electron-restart",
+    setup(build) {
+      build.onEnd(async (result) => {
+        mainBuildCount++;
+
+        // Skip the very first build — Electron is spawned separately after all watchers start.
+        if (mainBuildCount === 1) return;
+
+        // Don't restart on build errors
+        if (result.errors.length > 0) {
+          console.log(`\n❌ Main process build failed (${result.errors.length} error(s)) — Electron NOT restarted`);
+          return;
+        }
+
+        // Debounce: if a restart is already scheduled, cancel it and reschedule.
+        // This prevents rapid-fire restarts when esbuild detects cascading file changes.
+        if (restartTimer) {
+          clearTimeout(restartTimer);
+        }
+
+        restartTimer = setTimeout(async () => {
+          restartTimer = null;
+          restartCount++;
+          const timestamp = new Date().toISOString();
+          console.log(`\n🔄 Restart #${restartCount} — main.cjs rebuilt [${timestamp}]`);
+          console.log(`⚠️  Active sessions will resume automatically after restart`);
+
+          // Wait for main.cjs to stabilize on disk before restarting
+          const stable = await waitForFileStable(mainCjsPath, 5000);
+          if (!stable) {
+            console.log("⏳ main.cjs did not stabilize — skipping restart");
+            return;
+          }
+
+          // Kill the current Electron process
+          if (electronProc && !electronProc.killed) {
+            electronKilledForRestart = true;
+            electronProc.kill();
+            // Brief wait for graceful shutdown
+            await sleep(500);
+            electronKilledForRestart = false;
+          }
+
+          // Spawn a fresh Electron process with the new main.cjs
+          console.log("🚀 Restarting Electron...\n");
+          electronProc = spawnElectron();
+        }, RESTART_DEBOUNCE_MS);
+      });
+    },
+  };
+
   // 1. Vite dev server
   const viteProc = spawn(VITE_BIN, ["dev", "--config", "apps/electron/vite.config.ts", "--port", vitePort, "--strictPort"], {
     cwd: ROOT_DIR,
@@ -362,7 +452,7 @@ async function main(): Promise<void> {
   });
   childProcesses.push(viteProc);
 
-  // 2. Main process watcher
+  // 2. Main process watcher (with restart plugin)
   const mainContext = await esbuild.context({
     entryPoints: [join(ROOT_DIR, "apps/electron/src/main/index.ts")],
     bundle: true,
@@ -372,10 +462,11 @@ async function main(): Promise<void> {
     external: ["electron"],
     define: oauthDefines,
     logLevel: "info",
+    plugins: [electronRestartPlugin],
   });
   await mainContext.watch();
   esbuildContexts.push(mainContext);
-  console.log("👀 Watching main process...");
+  console.log("👀 Watching main process (auto-restart enabled)...");
 
   // 3. Preload watcher
   const preloadContext = await esbuild.context({
@@ -393,18 +484,21 @@ async function main(): Promise<void> {
 
   // 4. Start Electron
   console.log("🚀 Starting Electron...\n");
-
-  const electronProc = spawn(ELECTRON_BIN, ["apps/electron"], {
-    cwd: ROOT_DIR,
-    stdio: ["ignore", "inherit", "inherit"],
-    env: getElectronEnv(),
-    shell: IS_WINDOWS,
-  });
-  childProcesses.push(electronProc);
+  electronProc = spawnElectron();
 
   // Handle cleanup on exit
   const cleanup = async () => {
+    if (isCleaningUp) return;
+    isCleaningUp = true;
+
     console.log("\n🛑 Shutting down...");
+
+    // Cancel any pending restart
+    if (restartTimer) {
+      clearTimeout(restartTimer);
+      restartTimer = null;
+    }
+
     for (const ctx of esbuildContexts) {
       try {
         await ctx.dispose();
@@ -412,9 +506,18 @@ async function main(): Promise<void> {
         // Context may already be disposed
       }
     }
+    // Kill Vite and any other child processes
     for (const proc of childProcesses) {
       try {
         proc.kill();
+      } catch {
+        // Process may already be dead
+      }
+    }
+    // Kill current Electron process
+    if (electronProc && !electronProc.killed) {
+      try {
+        electronProc.kill();
       } catch {
         // Process may already be dead
       }
@@ -428,9 +531,6 @@ async function main(): Promise<void> {
   if (process.platform === "win32") {
     process.on("SIGHUP", () => cleanup());
   }
-
-  // Wait for electron to exit
-  electronProc.on("exit", () => cleanup());
 }
 
 main().catch((err) => {

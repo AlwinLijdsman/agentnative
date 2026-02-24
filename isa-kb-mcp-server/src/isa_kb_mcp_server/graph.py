@@ -13,11 +13,71 @@ compatibility on all platforms including Windows ARM64.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from isa_kb_mcp_server.db import execute_query
 
 logger = logging.getLogger("isa_kb_mcp_server.graph")
+
+
+def _resolve_paragraph_id(identifier: str) -> str | None:
+    """Resolve a paragraph identifier to an internal ID.
+
+    Accepts either an internal ID (``ip_...``) which is returned as-is,
+    or a human-readable reference (e.g. ``"315.12"``, ``"ISA 240.A1"``)
+    which is looked up in the database.
+
+    Returns:
+        The internal ID (``ip_...``), or None if not found.
+    """
+    identifier = identifier.strip()
+
+    # Already an internal ID
+    if identifier.startswith("ip_") or identifier.startswith("gs_"):
+        return identifier
+
+    # Strip "ISA " prefix
+    ref = re.sub(r"^ISA\s*", "", identifier, flags=re.IGNORECASE)
+
+    # Try exact match on paragraph_ref
+    rows = execute_query(
+        "SELECT id FROM ISAParagraph WHERE paragraph_ref = ? LIMIT 1",
+        [ref],
+    )
+    if rows:
+        return rows[0]["id"]
+
+    # Try parsing: {isa_number}.{para_num}({sub_paragraph}).A{app_ref}
+    match = re.match(r"(\d{3})\.(\d+)(?:\(([a-z])\))?(?:\.A(\d+))?", ref)
+    if match:
+        conditions: list[str] = ["isa_number = ?", "para_num = ?"]
+        params: list[Any] = [match.group(1), match.group(2)]
+        if match.group(3):
+            conditions.append("sub_paragraph = ?")
+            params.append(match.group(3))
+        if match.group(4):
+            conditions.append("application_ref = ?")
+            params.append(f"A{match.group(4)}")
+        where = " AND ".join(conditions)
+        rows = execute_query(
+            f"SELECT id FROM ISAParagraph WHERE {where} ORDER BY paragraph_ref LIMIT 1",
+            params,
+        )
+        if rows:
+            return rows[0]["id"]
+
+    # Try application material: {isa_number}.A{ref}
+    app_match = re.match(r"(\d{3})\.A(\d+)", ref)
+    if app_match:
+        rows = execute_query(
+            "SELECT id FROM ISAParagraph WHERE isa_number = ? AND application_ref = ? LIMIT 1",
+            [app_match.group(1), f"A{app_match.group(2)}"],
+        )
+        if rows:
+            return rows[0]["id"]
+
+    return None
 
 
 def hop_retrieve(
@@ -36,7 +96,9 @@ def hop_retrieve(
     ``min_score``.
 
     Args:
-        paragraph_id: The starting paragraph ID (e.g., ``"ip_a1b2c3d4"``).
+        paragraph_id: The starting paragraph — accepts either an internal
+            ID (e.g. ``"ip_a1b2c3d4"``) or a human-readable reference
+            (e.g. ``"315.12"``, ``"ISA 240.A1"``).
         max_hops: Maximum traversal depth (default 3).
         decay: Score decay factor per hop (default 0.7). Lower values
             favor closer paragraphs.
@@ -46,16 +108,29 @@ def hop_retrieve(
 
     Returns:
         Dict with keys:
-        - ``seed_id``: The starting paragraph ID.
+        - ``seed_id``: The resolved internal paragraph ID.
         - ``connected``: List of connected paragraph dicts with
           ``hop_score``, ``hop_depth``, and ``hop_path``.
         - ``total_found``: Number of connected paragraphs found.
         - ``max_hops_used``: The configured max hops.
     """
-    # Validate the seed paragraph exists
+    # Resolve human-readable references to internal IDs
+    resolved_id = _resolve_paragraph_id(paragraph_id)
+    if resolved_id is None:
+        return {
+            "seed_id": paragraph_id,
+            "connected": [],
+            "total_found": 0,
+            "max_hops_used": max_hops,
+            "error": f"Paragraph '{paragraph_id}' not found. "
+                     "Try formats: '315.12', '315.12(a)', '315.A2', "
+                     "or an internal ID like 'ip_a1b2c3d4'.",
+        }
+
+    # Validate the seed paragraph exists (should always pass after resolve)
     seed_rows = execute_query(
         "SELECT id, paragraph_ref, isa_number FROM ISAParagraph WHERE id = ?",
-        [paragraph_id],
+        [resolved_id],
     )
     if not seed_rows:
         return {
@@ -119,20 +194,20 @@ def hop_retrieve(
     """
 
     params: list[Any] = [
-        paragraph_id,   # Base case: src_id = ?
+        resolved_id,    # Base case: src_id = ?
         decay,          # Recursive: score * ? * weight
         max_hops,       # Recursive: depth < ?
         decay,          # Recursive: score * ? * weight >= min
         min_score,      # Recursive: >= ?
-        paragraph_id,   # Exclude seed from results
+        resolved_id,    # Exclude seed from results
     ]
 
     try:
         rows = execute_query(sql, params)
     except Exception as exc:
-        logger.error("Hop retrieve failed for %s: %s", paragraph_id, exc)
+        logger.error("Hop retrieve failed for %s: %s", resolved_id, exc)
         return {
-            "seed_id": paragraph_id,
+            "seed_id": resolved_id,
             "connected": [],
             "total_found": 0,
             "max_hops_used": max_hops,
@@ -162,12 +237,17 @@ def hop_retrieve(
         })
 
     logger.info(
-        "Hop retrieve: seed=%s hops=%d found=%d",
-        paragraph_id, max_hops, len(connected),
+        "Hop retrieve: seed=%s (resolved from %s) hops=%d found=%d",
+        resolved_id, paragraph_id, max_hops, len(connected),
     )
 
     return {
-        "seed_id": paragraph_id,
+        "seed_id": resolved_id,
+        "seed_paragraph": {
+            "id": seed_rows[0]["id"],
+            "paragraph_ref": seed_rows[0].get("paragraph_ref", ""),
+            "isa_number": seed_rows[0].get("isa_number", ""),
+        },
         "connected": connected,
         "total_found": len(connected),
         "max_hops_used": max_hops,

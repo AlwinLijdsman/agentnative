@@ -42,7 +42,8 @@ import {
 } from './mode-manager.ts';
 import { type PermissionsContext, permissionsConfigCache } from './permissions-config.ts';
 import { getSessionPlansPath, getSessionPath } from '../sessions/storage.ts';
-import { readFileSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'fs';
+import { join } from 'path';
 import { expandPath } from '../utils/paths.ts';
 import { extractWorkspaceSlug } from '../utils/workspace.ts';
 import {
@@ -100,6 +101,17 @@ export type { LoadedSource } from '../sources/types.ts';
 // Re-exported for backwards compatibility with existing imports from claude-agent.ts
 import { AbortReason, type RecoveryMessage } from './core/index.ts';
 export { AbortReason, type RecoveryMessage };
+
+// Orchestrator — deterministic stage pipeline (Phase 6 integration)
+import { AgentOrchestrator, CostTracker, McpLifecycleManager, OrchestratorMcpBridge, PipelineState, extractTransportConfig } from './orchestrator/index.ts';
+import type {
+  AgentConfig as OrchestratorAgentConfig,
+  McpBridge as OrchestratorMcpBridge_T,
+} from './orchestrator/types.ts';
+import { loadSourceConfig } from '../sources/storage.ts';
+import { loadAgent, loadWorkspaceAgents } from '../agents/storage.ts';
+import type { LoadedAgent } from '../agents/types.ts';
+import { parseMentions } from '../mentions/index.ts';
 
 export interface ClaudeAgentConfig {
   workspace: Workspace;
@@ -647,6 +659,32 @@ export class ClaudeAgent extends BaseAgent {
         yield { type: 'error', message: 'Cannot send empty message' };
         yield { type: 'complete' };
         return;
+      }
+
+      // ── ORCHESTRATOR RESUME DETECTION ─────────────────────────────
+      // Check if a paused orchestrator pipeline exists for this session.
+      // If so, route to resume() instead of run() — no [agent:] mention needed.
+      if (!_isRetry) {
+        const pausedOrch = this.detectPausedOrchestrator(sessionId);
+        if (pausedOrch) {
+          debug(`[chat] Detected paused orchestrator for agent=${pausedOrch.slug} — resuming`);
+          yield* this.resumeOrchestrator(userMessage, pausedOrch.agent);
+          return;
+        }
+      }
+
+      // ── ORCHESTRATOR DETECTION ──────────────────────────────────────
+      // Check if the message mentions an agent with orchestratable stages.
+      // If so, delegate to the deterministic orchestrator pipeline instead
+      // of the SDK's tool-calling loop. This ensures TypeScript controls
+      // stage execution, not the LLM.
+      if (!_isRetry) {
+        const orchestratableAgent = this.detectOrchestratableAgent(userMessage);
+        if (orchestratableAgent) {
+          debug(`[chat] Detected orchestratable agent: ${orchestratableAgent.slug} — delegating to orchestrator`);
+          yield* this.runOrchestrator(userMessage, orchestratableAgent);
+          return;
+        }
       }
 
       // Get centralized mini agent configuration (from BaseAgent)
@@ -2914,6 +2952,536 @@ export class ClaudeAgent extends BaseAgent {
     } catch (error) {
       this.debug(`[runMiniCompletion] Failed: ${error}`);
       return null;
+    }
+  }
+
+  // ============================================================
+  // Orchestrator — Deterministic Pipeline (Phase 6)
+  // ============================================================
+
+  /**
+   * Detect if the user message mentions an agent with orchestratable stages.
+   *
+   * Returns the first matched LoadedAgent that has controlFlow.stages defined,
+   * or null if the message doesn't mention an orchestrable agent.
+   *
+   * Detection logic:
+   * 1. Parse [agent:slug] mentions from the message
+   * 2. Load each mentioned agent's config.json
+   * 3. Return first agent with controlFlow.stages.length > 0
+   */
+  private detectOrchestratableAgent(userMessage: string): LoadedAgent | null {
+    if (!userMessage.includes('[agent:')) return null;
+
+    // Parse agent mentions — we only need agent slugs
+    const allAgentSlugs = this.getAllAgentSlugs();
+    const parsed = parseMentions(userMessage, [], [], allAgentSlugs);
+
+    if (parsed.agents.length === 0) return null;
+
+    // Find the first agent that has orchestratable stages
+    for (const slug of parsed.agents) {
+      const agent = loadAgent(this.workspaceRootPath, slug);
+      if (agent && agent.config?.controlFlow?.stages?.length > 0) {
+        return agent;
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Get all available agent slugs in the workspace.
+   * Uses loadWorkspaceAgents to extract slugs for mention parsing.
+   */
+  private getAllAgentSlugs(): string[] {
+    try {
+      return loadWorkspaceAgents(this.workspaceRootPath).map(a => a.slug);
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Detect if an orchestrator pipeline is paused for this session.
+   *
+   * Reads pipeline-state.json from the session's data directory.
+   * If the pipeline is paused, loads the agent and returns it.
+   * Used by chat() to route resume messages to orchestrator.resume()
+   * instead of SDK query().
+   *
+   * @param sessionId - Current session ID
+   * @returns Agent info if a paused orchestrator pipeline exists, null otherwise
+   */
+  private detectPausedOrchestrator(sessionId: string): { slug: string; agent: LoadedAgent } | null {
+    try {
+      const sessionPath = getSessionPath(this.workspaceRootPath, sessionId);
+      const state = PipelineState.loadFrom(sessionPath);
+      if (!state || !state.isPaused) return null;
+
+      // Find the agent slug by scanning bridge state files
+      const agentsDir = join(sessionPath, 'data', 'agents');
+      if (!existsSync(agentsDir)) return null;
+
+      const { readdirSync } = require('fs') as typeof import('fs');
+      const slugs = readdirSync(agentsDir, { withFileTypes: true })
+        .filter((d: { isDirectory: () => boolean }) => d.isDirectory())
+        .map((d: { name: string }) => d.name);
+
+      for (const slug of slugs) {
+        const bridgePath = join(agentsDir, slug, 'current-run-state.json');
+        if (!existsSync(bridgePath)) continue;
+
+        try {
+          const bridgeState = JSON.parse(readFileSync(bridgePath, 'utf-8'));
+          if (bridgeState.orchestratorMode && bridgeState.pausedAtStage !== undefined) {
+            const agent = loadAgent(this.workspaceRootPath, slug);
+            if (agent) return { slug, agent };
+          }
+        } catch {
+          // Corrupted bridge state — skip
+        }
+      }
+    } catch {
+      // Cannot read session state — not paused
+    }
+    return null;
+  }
+
+  /**
+   * Write a bridge state file so the session layer (sessions.ts) can detect
+   * that an orchestrator pipeline is paused.
+   *
+   * The session layer reads `{sessionPath}/data/agents/{slug}/current-run-state.json`
+   * to detect paused pipelines (for queue drain hold and UI state).
+   * The `orchestratorMode: true` flag distinguishes orchestrator from SDK pipelines.
+   */
+  private writeOrchestratorBridgeState(
+    sessionPath: string, agentSlug: string, stage: number, runId: string,
+  ): void {
+    const agentDataDir = join(sessionPath, 'data', 'agents', agentSlug);
+    mkdirSync(agentDataDir, { recursive: true });
+    const statePath = join(agentDataDir, 'current-run-state.json');
+    writeFileSync(statePath, JSON.stringify({
+      runId,
+      pausedAtStage: stage,
+      orchestratorMode: true,
+      currentStage: stage,
+      completedStages: Array.from({ length: stage + 1 }, (_, i) => i),
+      startedAt: new Date().toISOString(),
+      lastEventAt: new Date().toISOString(),
+    }, null, 2), 'utf-8');
+  }
+
+  /**
+   * Clear the bridge state file after orchestrator completes, errors, or resumes.
+   * Prevents stale paused-pipeline detection on subsequent messages.
+   */
+  private clearOrchestratorBridgeState(sessionPath: string, agentSlug: string): void {
+    try {
+      const statePath = join(sessionPath, 'data', 'agents', agentSlug, 'current-run-state.json');
+      if (existsSync(statePath)) unlinkSync(statePath);
+    } catch {
+      // Best-effort cleanup — non-fatal
+    }
+  }
+
+  /**
+   * Convert a LoadedAgent's config to the orchestrator's AgentConfig type.
+   * Maps from the richer agents/types.ts AgentConfig to the simpler orchestrator/types.ts AgentConfig.
+   */
+  private toOrchestratorAgentConfig(agent: LoadedAgent): OrchestratorAgentConfig {
+    const cfg = agent.config;
+    return {
+      slug: agent.slug,
+      name: agent.metadata.name,
+      controlFlow: {
+        stages: cfg.controlFlow.stages.map(s => ({
+          id: s.id,
+          name: s.name,
+          description: s.description,
+        })),
+        pauseAfterStages: cfg.controlFlow.pauseAfterStages,
+        repairUnits: cfg.controlFlow.repairUnits?.map(ru => ({
+          stages: Array.isArray(ru.stages) ? [...ru.stages] : [],
+          maxIterations: ru.maxIterations,
+          feedbackField: ru.feedbackField,
+        })),
+      },
+      output: {
+        titleTemplate: (cfg.output as unknown as Record<string, unknown>)?.['titleTemplate'] as string | undefined,
+        citationFormat: cfg.output?.citationFormat,
+      },
+      // Pass through orchestrator config from config.json (F1 fix)
+      // Maps from agents/types.ts inline type to orchestrator/types.ts OrchestratorConfig
+      orchestrator: cfg.orchestrator?.enabled
+        ? {
+            enabled: true,
+            model: cfg.orchestrator.model,
+            thinking: cfg.orchestrator.thinking as { type: 'adaptive' | 'enabled' | 'disabled' } | undefined,
+            effort: cfg.orchestrator.effort as 'max' | 'high' | 'medium' | 'low' | undefined,
+            depthModeEffort: cfg.orchestrator.depthModeEffort,
+            contextWindow: cfg.orchestrator.contextWindow,
+            minOutputBudget: cfg.orchestrator.minOutputBudget,
+            budgetUsd: cfg.orchestrator.budgetUsd,
+            perStageDesiredTokens: cfg.orchestrator.perStageDesiredTokens
+              ? Object.fromEntries(
+                  Object.entries(cfg.orchestrator.perStageDesiredTokens)
+                    .map(([k, v]) => [Number(k), v]),
+                ) as Record<number, number>
+              : undefined,
+            useBAML: cfg.orchestrator.useBAML,
+            bamlFallbackToZod: cfg.orchestrator.bamlFallbackToZod,
+          }
+        : undefined,
+      // Resolve per-stage prompt files from agent directory (Phase 7)
+      promptsDir: agent.path ? join(agent.path, 'prompts') : undefined,
+    };
+  }
+
+  /**
+   * Get an auth token for the orchestrator's LLM client.
+   * Reads from the same env vars that sessions.ts sets before creating the agent.
+   * OAuth token is preferred; falls back to API key.
+   */
+  private async getOrchestratorAuthToken(): Promise<string> {
+    const oauthToken = process.env['CLAUDE_CODE_OAUTH_TOKEN'];
+    if (oauthToken) return oauthToken;
+
+    const apiKey = process.env['ANTHROPIC_API_KEY'];
+    if (apiKey) return apiKey;
+
+    throw new Error('No auth token available for orchestrator. Set CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY.');
+  }
+
+  /**
+   * Run the deterministic orchestrator pipeline instead of SDK query().
+   *
+   * Maps OrchestratorEvent → onAgentEvent callback (for stage/pipeline events)
+   * and yields AgentEvent (for text/complete events that flow through chat()).
+   *
+   * Event architecture:
+   * - Stage events (started, completed, repair, pause, run_completed) →
+   *   emitted via this.onAgentEvent callback → sessions.ts → renderer
+   * - Text content → yielded as AgentEvent { type: 'text_delta' / 'text_complete' }
+   * - Completion → yielded as AgentEvent { type: 'complete' }
+   *
+   * This matches the existing event flow pattern used by session-scoped tools
+   * (agent_stage_gate), ensuring the renderer's event processor and agentRunStateAtom
+   * work identically for both SDK-driven and orchestrator-driven pipelines.
+   */
+  private async *runOrchestrator(
+    userMessage: string,
+    loadedAgent: LoadedAgent,
+  ): AsyncGenerator<AgentEvent> {
+    const sessionId = this.config.session?.id ?? `orch-${Date.now()}`;
+    const sessionPath = getSessionPath(this.workspaceRootPath, sessionId);
+    const agentConfig = this.toOrchestratorAgentConfig(loadedAgent);
+    const runId = `orch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const agentSlug = loadedAgent.slug;
+
+    this.onDebug?.(`[orchestrator] Starting pipeline for agent=${agentSlug} runId=${runId}`);
+
+    // Create cost tracker with budget from agent config or default
+    const budgetUsd = agentConfig.orchestrator?.budgetUsd ?? 50;
+    const costTracker = new CostTracker({ budgetUsd });
+
+    // ── MCP Bridge wiring ──────────────────────────────────────────────
+    // Connect to the agent's required MCP source for programmatic tool calls.
+    // The lifecycle manager ensures cleanup on completion or error.
+    let mcpBridge: OrchestratorMcpBridge_T | null = null;
+    const mcpLifecycle = new McpLifecycleManager();
+
+    try {
+      // Find first required MCP source from agent metadata
+      const mcpSourceSlug = loadedAgent.metadata.sources
+        ?.find(s => s.required)?.slug;
+
+      if (mcpSourceSlug) {
+        try {
+          const sourceConfig = loadSourceConfig(this.workspaceRootPath, mcpSourceSlug);
+          if (sourceConfig?.mcp) {
+            const transportConfig = extractTransportConfig(
+              sourceConfig.mcp as unknown as Record<string, unknown>,
+            );
+            const mcpClient = await mcpLifecycle.connect(transportConfig);
+            mcpBridge = new OrchestratorMcpBridge(mcpClient);
+            this.onDebug?.(`[orchestrator] MCP bridge connected: ${mcpSourceSlug}`);
+          } else {
+            this.onDebug?.(`[orchestrator] Source '${mcpSourceSlug}' has no MCP config — bridge skipped`);
+          }
+        } catch (mcpError) {
+          // MCP connection failure is non-fatal — stages 2/4 have null-bridge guards
+          this.onDebug?.(
+            `[orchestrator] MCP bridge connection failed (non-fatal): ` +
+            `${mcpError instanceof Error ? mcpError.message : String(mcpError)}`,
+          );
+        }
+      }
+
+      // ── Create orchestrator instance ───────────────────────────────
+      // Inside try block so create() failures are caught and yield 'complete' (F7 fix)
+      const orchestrator = AgentOrchestrator.create(
+        {
+          sessionId,
+          sessionPath,
+          getAuthToken: () => this.getOrchestratorAuthToken(),
+          onStreamEvent: (event) => {
+            // Forward text deltas for debug logging.
+            // Real-time streaming to UI is limited by the generator pattern —
+            // callbacks can't yield. Stage text is accumulated and yielded
+            // as intermediate text events between stages (F5 mitigation).
+            if (event.type === 'text_delta' && event.text) {
+              this.onDebug?.(`[orchestrator] stream: ${event.text.slice(0, 50)}...`);
+            }
+          },
+        },
+        mcpBridge,
+        costTracker,
+        agentConfig.orchestrator ?? undefined,
+      );
+
+      // ── Pipeline event loop ────────────────────────────────────────
+      yield* this.processOrchestratorEvents(
+        orchestrator.run(userMessage, agentConfig),
+        agentSlug, runId, sessionPath,
+      );
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      this.onDebug?.(`[orchestrator] Pipeline error: ${errorMessage}`);
+      yield { type: 'error', message: `Orchestrator error: ${errorMessage}` };
+      this.onAgentEvent?.({
+        type: 'agent_run_completed',
+        agentSlug,
+        runId,
+        data: { verificationStatus: 'error', error: errorMessage },
+      });
+    }
+
+    // Always yield complete at the end (F7 fix — now reachable even if create() throws)
+    yield { type: 'complete' };
+
+    // Clean up bridge state on run completion
+    this.clearOrchestratorBridgeState(sessionPath, agentSlug);
+
+    // Ensure MCP client is closed — separate try to guarantee cleanup
+    try {
+      await mcpLifecycle.close();
+    } catch {
+      // Best-effort MCP cleanup
+    }
+  }
+
+  /**
+   * Resume a paused orchestrator pipeline.
+   *
+   * Called when the user sends a follow-up message and a paused orchestrator
+   * pipeline is detected for the session. Routes to orchestrator.resume()
+   * instead of orchestrator.run().
+   */
+  private async *resumeOrchestrator(
+    userMessage: string,
+    loadedAgent: LoadedAgent,
+  ): AsyncGenerator<AgentEvent> {
+    const sessionId = this.config.session?.id ?? `orch-${Date.now()}`;
+    const sessionPath = getSessionPath(this.workspaceRootPath, sessionId);
+    const agentConfig = this.toOrchestratorAgentConfig(loadedAgent);
+    const runId = `orch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const agentSlug = loadedAgent.slug;
+
+    this.onDebug?.(`[orchestrator] Resuming pipeline for agent=${agentSlug} runId=${runId}`);
+
+    // Clear bridge state immediately — we're handling the resume now
+    this.clearOrchestratorBridgeState(sessionPath, agentSlug);
+
+    // Re-create cost tracker (costs from earlier stages are in pipeline-state.json, not tracked here)
+    const budgetUsd = agentConfig.orchestrator?.budgetUsd ?? 50;
+    const costTracker = new CostTracker({ budgetUsd });
+
+    // ── MCP Bridge wiring (same as runOrchestrator) ────────────────
+    let mcpBridge: OrchestratorMcpBridge_T | null = null;
+    const mcpLifecycle = new McpLifecycleManager();
+
+    try {
+      const mcpSourceSlug = loadedAgent.metadata.sources
+        ?.find(s => s.required)?.slug;
+
+      if (mcpSourceSlug) {
+        try {
+          const sourceConfig = loadSourceConfig(this.workspaceRootPath, mcpSourceSlug);
+          if (sourceConfig?.mcp) {
+            const transportConfig = extractTransportConfig(
+              sourceConfig.mcp as unknown as Record<string, unknown>,
+            );
+            const mcpClient = await mcpLifecycle.connect(transportConfig);
+            mcpBridge = new OrchestratorMcpBridge(mcpClient);
+            this.onDebug?.(`[orchestrator] MCP bridge connected for resume: ${mcpSourceSlug}`);
+          }
+        } catch (mcpError) {
+          this.onDebug?.(
+            `[orchestrator] MCP bridge connection failed on resume (non-fatal): ` +
+            `${mcpError instanceof Error ? mcpError.message : String(mcpError)}`,
+          );
+        }
+      }
+
+      // Create orchestrator instance for resume
+      const orchestrator = AgentOrchestrator.create(
+        {
+          sessionId,
+          sessionPath,
+          getAuthToken: () => this.getOrchestratorAuthToken(),
+          onStreamEvent: (event) => {
+            if (event.type === 'text_delta' && event.text) {
+              this.onDebug?.(`[orchestrator] resume stream: ${event.text.slice(0, 50)}...`);
+            }
+          },
+        },
+        mcpBridge,
+        costTracker,
+        agentConfig.orchestrator ?? undefined,
+      );
+
+      // ── Resume pipeline from paused state ──────────────────────────
+      yield* this.processOrchestratorEvents(
+        orchestrator.resume(userMessage, agentConfig),
+        agentSlug, runId, sessionPath,
+      );
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      this.onDebug?.(`[orchestrator] Resume error: ${errorMessage}`);
+      yield { type: 'error', message: `Orchestrator resume error: ${errorMessage}` };
+      this.onAgentEvent?.({
+        type: 'agent_run_completed',
+        agentSlug,
+        runId,
+        data: { verificationStatus: 'error', error: errorMessage },
+      });
+    }
+
+    yield { type: 'complete' };
+
+    // Clean up bridge state on resume completion
+    this.clearOrchestratorBridgeState(sessionPath, agentSlug);
+
+    try {
+      await mcpLifecycle.close();
+    } catch {
+      // Best-effort MCP cleanup
+    }
+  }
+
+  /**
+   * Process orchestrator events — shared between run() and resume().
+   *
+   * Maps OrchestratorEvent → AgentEvent yields + onAgentEvent callbacks.
+   * Extracts the common event loop to avoid code duplication between
+   * runOrchestrator() and resumeOrchestrator().
+   */
+  private async *processOrchestratorEvents(
+    events: AsyncGenerator<import('./orchestrator/types.ts').OrchestratorEvent>,
+    agentSlug: string,
+    runId: string,
+    sessionPath: string,
+  ): AsyncGenerator<AgentEvent> {
+    for await (const event of events) {
+      switch (event.type) {
+        case 'orchestrator_stage_start':
+          this.onAgentEvent?.({
+            type: 'agent_stage_started',
+            agentSlug,
+            runId,
+            data: {
+              stage: event.stage,
+              stageName: event.name,
+            },
+          });
+          break;
+
+        case 'orchestrator_stage_complete':
+          this.onAgentEvent?.({
+            type: 'agent_stage_completed',
+            agentSlug,
+            runId,
+            data: {
+              stage: event.stage,
+              stageName: event.name,
+              ...(event.stageOutput ?? {}),
+            },
+          });
+          // F5: Yield intermediate text so UI shows stage progress between LLM calls
+          yield {
+            type: 'text_complete',
+            text: `**Stage ${event.stage} (${event.name})** completed.`,
+            isIntermediate: true,
+          };
+          break;
+
+        case 'orchestrator_repair_start':
+          this.onAgentEvent?.({
+            type: 'agent_repair_iteration',
+            agentSlug,
+            runId,
+            data: {
+              iteration: event.iteration,
+              scores: event.scores,
+            },
+          });
+          break;
+
+        case 'orchestrator_pause':
+          // Yield pause message as assistant text so user sees the analysis
+          yield { type: 'text_complete', text: event.message, isIntermediate: false };
+
+          // F2: Write bridge state so session layer detects the paused pipeline
+          this.writeOrchestratorBridgeState(sessionPath, agentSlug, event.stage, runId);
+
+          // Emit stage gate pause for renderer's agentRunStateAtom
+          this.onAgentStagePause?.({
+            agentSlug,
+            stage: event.stage,
+            runId,
+            data: { message: event.message, orchestratorMode: true },
+          });
+          break;
+
+        case 'orchestrator_complete':
+          this.onAgentEvent?.({
+            type: 'agent_run_completed',
+            agentSlug,
+            runId,
+            data: {
+              verificationStatus: 'completed',
+              totalCostUsd: event.totalCostUsd,
+              stageCount: event.stageCount,
+            },
+          });
+          break;
+
+        case 'orchestrator_budget_exceeded':
+          yield { type: 'error', message: `Budget exceeded: $${event.totalCost.toFixed(2)}` };
+          this.onAgentEvent?.({
+            type: 'agent_run_completed',
+            agentSlug,
+            runId,
+            data: { verificationStatus: 'budget_exceeded' },
+          });
+          break;
+
+        case 'text':
+          yield { type: 'text_complete', text: event.text, isIntermediate: false };
+          break;
+
+        case 'orchestrator_error':
+          yield { type: 'error', message: `Stage ${event.stage} error: ${event.error}` };
+          this.onAgentEvent?.({
+            type: 'agent_run_completed',
+            agentSlug,
+            runId,
+            data: { verificationStatus: 'error', error: event.error },
+          });
+          break;
+      }
     }
   }
 

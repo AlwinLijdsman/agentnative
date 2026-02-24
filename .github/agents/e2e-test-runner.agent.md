@@ -61,7 +61,8 @@ apps/electron/src/__tests__/
   e2e-stage0-pause.test.ts      # Stage 0 pause outcome tests
 
 scripts/
-  test-stage0-e2e.ts            # Live dev script for Stage 0
+  test-stage0-e2e.ts            # Live dev script for Stage 0 (SDK query() flow — NOT orchestrator)
+  test-orchestrator-live-e2e.ts # Live orchestrator E2E (real API — proves orchestrator path)
   run-e2e-suite.ts              # Full live E2E orchestration (5 scenarios)
   extract-oauth-token.ts        # Reads token from ~/.craft-agent/credentials.enc
   run-e2e-live.ts               # Auto-extracts token + runs live tests
@@ -75,6 +76,7 @@ scripts/
 | `pnpm run test:e2e:live` | Live SDK tests (requires `CLAUDE_CODE_OAUTH_TOKEN`) |
 | `pnpm run test:e2e:live:auto` | Auto-extracts token + runs live tests |
 | `pnpm run test:e2e:suite` | Full 5-scenario live orchestration |
+| `npx tsx scripts/test-orchestrator-live-e2e.ts` | Live orchestrator pipeline E2E (real API, ~$0.05) |
 
 ## Conversation Flow
 
@@ -86,10 +88,20 @@ scripts/
    - Check `scripts/extract-oauth-token.ts` exists
    - Check `apps/electron/src/__tests__/e2e-sdk-live.test.ts` exists
 3. List `agents/` to identify available target agents
-4. Check OAuth availability:
+4. Check OAuth availability (two credential stores exist):
    ```powershell
+   # PRIMARY: Claude Code CLI (plain JSON, auto-refreshed on CLI launch)
+   $creds = Get-Content "$env:USERPROFILE\.claude\.credentials.json" | ConvertFrom-Json
+   $env:CLAUDE_CODE_OAUTH_TOKEN = $creds.claudeAiOauth.accessToken
+   # Check expiry:
+   $expires = [DateTimeOffset]::FromUnixTimeMilliseconds($creds.claudeAiOauth.expiresAt).DateTime
+   Write-Host "Expires: $expires"
+
+   # FALLBACK: Craft Agent encrypted store (may be expired independently)
    $env:CLAUDE_CODE_OAUTH_TOKEN = (npx tsx scripts/extract-oauth-token.ts)
    ```
+   **Token resolution order**: env var → `~/.claude/.credentials.json` → `~/.craft-agent/credentials.enc`
+   **To refresh**: Open Claude Code CLI (`claude` command) — it auto-refreshes on launch.
 5. Report environment status:
 
 ```markdown

@@ -210,6 +210,27 @@ export interface AgentConfig {
   output: AgentOutputConfig;
   /** Debug overrides (optional) */
   debug?: DebugOverrides;
+  /**
+   * Orchestrator-specific configuration (optional).
+   * When present and `enabled: true`, the orchestrator pipeline replaces
+   * SDK-driven tool calling with a deterministic TypeScript for-loop.
+   *
+   * Uses an inline type to avoid circular dependency with orchestrator/types.ts.
+   * Shape mirrors OrchestratorConfig — structurally typed, no import needed.
+   */
+  orchestrator?: {
+    enabled: boolean;
+    model?: string;
+    thinking?: { type: string };
+    effort?: string;
+    depthModeEffort?: Record<string, string>;
+    contextWindow?: number;
+    minOutputBudget?: number;
+    budgetUsd?: number;
+    perStageDesiredTokens?: Record<string, number>;
+    useBAML?: boolean;
+    bamlFallbackToZod?: boolean;
+  };
 }
 
 // ============================================================

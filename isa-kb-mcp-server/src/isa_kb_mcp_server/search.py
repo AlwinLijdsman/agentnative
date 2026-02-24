@@ -120,7 +120,7 @@ def _keyword_search(
             p.content,
             p.page_number,
             p.source_doc,
-            fts.score
+            p.score
         FROM (
             SELECT *, fts_main_ISAParagraph.match_bm25(id, ?) AS score
             FROM ISAParagraph
@@ -136,7 +136,7 @@ def _keyword_search(
         return rows
     except Exception as exc:
         logger.error("Keyword search failed: %s", exc)
-        return []
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -212,9 +212,27 @@ def hybrid_search(
     results: list[dict[str, Any]] = []
     search_type_used = search_type
 
+    # Guard: empty/blank queries cannot be embedded or BM25-searched
+    if not query or not query.strip():
+        logger.warning("Empty query received, returning no results")
+        return {
+            "results": [],
+            "total_results": 0,
+            "search_type_used": search_type,
+            "warnings": ["Empty query — provide search terms."],
+        }
+
+    # Helper: safe keyword search that surfaces failures as warnings
+    def _safe_keyword(q: str, **kw: Any) -> list[dict[str, Any]]:
+        try:
+            return _keyword_search(q, **kw)
+        except Exception as exc:
+            warnings.append(f"Keyword search failed: {exc}")
+            return []
+
     if search_type == "keyword":
         # Pure keyword search
-        keyword_rows = _keyword_search(query, max_results=max_results, isa_filter=isa_filter)
+        keyword_rows = _safe_keyword(query, max_results=max_results, isa_filter=isa_filter)
         results = _format_keyword_results(keyword_rows)
 
     elif search_type == "vector":
@@ -226,14 +244,14 @@ def hybrid_search(
                 "Falling back to keyword search."
             )
             search_type_used = "keyword"
-            keyword_rows = _keyword_search(query, max_results=max_results, isa_filter=isa_filter)
+            keyword_rows = _safe_keyword(query, max_results=max_results, isa_filter=isa_filter)
             results = _format_keyword_results(keyword_rows)
         else:
             results = _format_vector_results(vector_rows)
 
     else:
         # Hybrid (default)
-        keyword_rows = _keyword_search(query, max_results=max_results, isa_filter=isa_filter)
+        keyword_rows = _safe_keyword(query, max_results=max_results, isa_filter=isa_filter)
         vector_rows, vector_used = _vector_search(query, max_results=max_results, isa_filter=isa_filter)
 
         if not vector_used:
@@ -345,7 +363,7 @@ def _guide_keyword_search(
             g.heading,
             g.content,
             g.source_doc,
-            fts.score
+            g.score
         FROM (
             SELECT *, fts_main_GuideSection.match_bm25(id, ?) AS score
             FROM GuideSection
@@ -361,7 +379,7 @@ def _guide_keyword_search(
         return rows
     except Exception as exc:
         logger.error("Guide keyword search failed: %s", exc)
-        return []
+        raise
 
 
 def _guide_vector_search(
@@ -478,8 +496,25 @@ def guide_search(
     results: list[dict[str, Any]] = []
     search_type_used = search_type
 
+    # Guard: empty/blank queries
+    if not query or not query.strip():
+        return {
+            "results": [],
+            "total_results": 0,
+            "search_type_used": search_type,
+            "warnings": ["Empty query — provide search terms."],
+        }
+
+    # Helper: safe keyword search that surfaces failures as warnings
+    def _safe_guide_keyword(q: str, **kw: Any) -> list[dict[str, Any]]:
+        try:
+            return _guide_keyword_search(q, **kw)
+        except Exception as exc:
+            warnings.append(f"Guide keyword search failed: {exc}")
+            return []
+
     if search_type == "keyword":
-        keyword_rows = _guide_keyword_search(query, max_results=max_results, guide_filter=guide_filter)
+        keyword_rows = _safe_guide_keyword(query, max_results=max_results, guide_filter=guide_filter)
         results = _format_guide_keyword_results(keyword_rows)
 
     elif search_type == "vector":
@@ -487,14 +522,14 @@ def guide_search(
         if not vector_used:
             warnings.append("Vector search unavailable. Falling back to keyword search.")
             search_type_used = "keyword"
-            keyword_rows = _guide_keyword_search(query, max_results=max_results, guide_filter=guide_filter)
+            keyword_rows = _safe_guide_keyword(query, max_results=max_results, guide_filter=guide_filter)
             results = _format_guide_keyword_results(keyword_rows)
         else:
             results = _format_guide_vector_results(vector_rows)
 
     else:
         # Hybrid (default)
-        keyword_rows = _guide_keyword_search(query, max_results=max_results, guide_filter=guide_filter)
+        keyword_rows = _safe_guide_keyword(query, max_results=max_results, guide_filter=guide_filter)
         vector_rows, vector_used = _guide_vector_search(query, max_results=max_results, guide_filter=guide_filter)
 
         if not vector_used:

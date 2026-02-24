@@ -1,0 +1,2 @@
+# BAML-generated TypeScript clients — regenerate with: pnpm run baml:generate
+src/agent/orchestrator/baml_client/

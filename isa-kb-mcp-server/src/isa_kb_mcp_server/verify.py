@@ -128,6 +128,10 @@ def citation_verify(
     Each citation is a dict with ``paragraph_id`` (or ``paragraph_ref``)
     and ``claim`` — the text the synthesis attributes to that source.
 
+    Returns ``source_text`` for each verified citation (the actual paragraph
+    content from the knowledge base), along with ``match_level`` and
+    ``error_category`` for failed citations.
+
     Args:
         citations: List of citation dicts, each with:
             - ``paragraph_id`` or ``paragraph_ref``: The cited source.
@@ -135,7 +139,7 @@ def citation_verify(
 
     Returns:
         Dict with ``score`` (0-1), ``passed`` (bool), and ``details``
-        (per-citation verification results).
+        (per-citation verification results including ``source_text``).
     """
     if not citations:
         return {"score": 1.0, "passed": True, "details": [], "total_citations": 0}
@@ -152,7 +156,7 @@ def citation_verify(
         row = None
         if pid:
             rows = execute_query(
-                "SELECT id, content, paragraph_ref FROM ISAParagraph WHERE id = ?",
+                "SELECT id, content, paragraph_ref, isa_number FROM ISAParagraph WHERE id = ?",
                 [pid],
             )
             if rows:
@@ -161,24 +165,45 @@ def citation_verify(
             # Try by paragraph_ref
             clean_ref = re.sub(r"^ISA\s*", "", pref, flags=re.IGNORECASE).strip()
             rows = execute_query(
-                "SELECT id, content, paragraph_ref FROM ISAParagraph WHERE paragraph_ref = ?",
+                "SELECT id, content, paragraph_ref, isa_number FROM ISAParagraph WHERE paragraph_ref = ?",
                 [clean_ref],
             )
             if rows:
                 row = rows[0]
 
         if row is None:
+            # Determine error category for not-found citations
+            error_category = "NOT_FOUND"
+            if pref and re.search(r"\(\w+\)$", pref):
+                # Has a sub-paragraph qualifier like (a), (b) — might be SUB_PARA_NOT_FOUND
+                parent_ref = re.sub(r"\(\w+\)$", "", pref).strip()
+                parent_clean = re.sub(r"^ISA\s*", "", parent_ref, flags=re.IGNORECASE).strip()
+                parent_rows = execute_query(
+                    "SELECT id FROM ISAParagraph WHERE paragraph_ref = ?",
+                    [parent_clean],
+                )
+                if parent_rows:
+                    error_category = "SUB_PARA_NOT_FOUND"
+
             details.append({
                 "paragraph_id": pid or pref,
                 "claim": claim[:200],
                 "exists": False,
                 "supports_claim": False,
+                "source_text": None,
+                "match_level": "not_found",
+                "error_category": error_category,
                 "reason": "paragraph not found in knowledge base",
             })
             continue
 
+        # Extract source text
+        source_text = row.get("content", "")
+        source_ref = row.get("paragraph_ref", "")
+        isa_number = row.get("isa_number", "")
+
         # Check if the paragraph content supports the claim
-        content = row.get("content", "").lower()
+        content_lower = source_text.lower()
         claim_lower = claim.lower().strip()
 
         # Extract key terms from claim (words > 3 chars, skip stop words)
@@ -192,10 +217,13 @@ def citation_verify(
             # Very short claim — just check existence
             details.append({
                 "paragraph_id": row["id"],
-                "paragraph_ref": row.get("paragraph_ref", ""),
+                "paragraph_ref": source_ref,
+                "source_ref": f"ISA {isa_number}.{source_ref}" if isa_number else source_ref,
                 "claim": claim[:200],
                 "exists": True,
                 "supports_claim": True,
+                "source_text": source_text,
+                "match_level": "exact",
                 "term_overlap": 1.0,
                 "reason": "paragraph exists; claim too short for content analysis",
             })
@@ -203,19 +231,35 @@ def citation_verify(
             continue
 
         # Term overlap scoring
-        matching_terms = sum(1 for t in claim_terms if t in content)
+        matching_terms = sum(1 for t in claim_terms if t in content_lower)
         term_overlap = matching_terms / len(claim_terms) if claim_terms else 0
 
         supports = term_overlap >= 0.3  # At least 30% term overlap
+
+        # Determine match_level and error_category
+        if term_overlap >= 0.6:
+            match_level = "exact"
+            error_category = None
+        elif term_overlap >= 0.3:
+            match_level = "partial"
+            error_category = None
+        else:
+            match_level = "content_mismatch"
+            error_category = "CONTENT_MISMATCH"
+
         if supports:
             verified_count += 1
 
         details.append({
             "paragraph_id": row["id"],
-            "paragraph_ref": row.get("paragraph_ref", ""),
+            "paragraph_ref": source_ref,
+            "source_ref": f"ISA {isa_number}.{source_ref}" if isa_number else source_ref,
             "claim": claim[:200],
             "exists": True,
             "supports_claim": supports,
+            "source_text": source_text,
+            "match_level": match_level,
+            "error_category": error_category,
             "term_overlap": round(term_overlap, 4),
             "matching_terms": matching_terms,
             "total_claim_terms": len(claim_terms),

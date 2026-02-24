@@ -10,6 +10,7 @@ import logging
 from typing import Any
 
 from isa_kb_mcp_server.db import execute_query, get_connection
+from isa_kb_mcp_server.query_expand import expand_query
 
 logger = logging.getLogger("isa_kb_mcp_server.diagnostics")
 
@@ -186,3 +187,156 @@ def debug_hop_trace(
         "total_nodes_discovered": len(discovered),
         "max_depth_reached": max_depth,
     }
+
+
+def debug_search(
+    query: str,
+    *,
+    max_results: int = 10,
+) -> dict[str, Any]:
+    """Run hybrid search with full intermediate scoring visible for debugging.
+
+    Shows every pipeline stage: query expansion, raw keyword scores,
+    raw vector distances, RRF fusion, and reranked ordering.
+
+    Args:
+        query: The search query.
+        max_results: Maximum results per stage.
+
+    Returns:
+        Dict with query, expanded_query, keyword_results, vector_results,
+        rrf_fused, reranked, and final result lists.
+    """
+    from isa_kb_mcp_server.search import (
+        _format_keyword_results,
+        _format_vector_results,
+        _keyword_search,
+        _rrf_fuse,
+        _vector_search,
+    )
+    from isa_kb_mcp_server.rerank import rerank_results
+
+    result: dict[str, Any] = {
+        "query": query,
+        "expanded_query": None,
+        "keyword_results": [],
+        "vector_results": [],
+        "rrf_fused": [],
+        "reranked": [],
+        "final": [],
+        "warnings": [],
+    }
+
+    if not query or not query.strip():
+        result["warnings"].append("Empty query — nothing to debug.")
+        return result
+
+    # Stage 1: Query expansion
+    expanded = expand_query(query)
+    result["expanded_query"] = expanded
+
+    # Stage 2: Raw keyword search (BM25)
+    try:
+        kw_raw = _keyword_search(expanded, max_results=max_results)
+        kw_formatted = _format_keyword_results(kw_raw)
+        result["keyword_results"] = [
+            {
+                "id": r.get("id"),
+                "paragraph_ref": r.get("paragraph_ref"),
+                "isa_number": r.get("isa_number"),
+                "score": r.get("score"),
+                "content_preview": (r.get("content", ""))[:150],
+            }
+            for r in kw_formatted
+        ]
+    except Exception as exc:
+        result["warnings"].append(f"Keyword search failed: {exc}")
+
+    # Stage 3: Raw vector search
+    try:
+        vec_raw, vec_used = _vector_search(query, max_results=max_results)
+        if vec_used:
+            vec_formatted = _format_vector_results(vec_raw)
+            result["vector_results"] = [
+                {
+                    "id": r.get("id"),
+                    "paragraph_ref": r.get("paragraph_ref"),
+                    "isa_number": r.get("isa_number"),
+                    "distance": r.get("distance"),
+                    "content_preview": (r.get("content", ""))[:150],
+                }
+                for r in vec_formatted
+            ]
+        else:
+            result["warnings"].append("Vector search unavailable.")
+    except Exception as exc:
+        result["warnings"].append(f"Vector search failed: {exc}")
+
+    # Stage 4: RRF fusion
+    try:
+        kw_for_rrf = _format_keyword_results(
+            _keyword_search(expanded, max_results=max_results)
+        ) if not result["warnings"] else []
+        vec_for_rrf = _format_vector_results(
+            _vector_search(query, max_results=max_results)[0]
+        ) if result["vector_results"] else []
+
+        if kw_for_rrf or vec_for_rrf:
+            fused = _rrf_fuse(kw_for_rrf, vec_for_rrf)[:max_results]
+            result["rrf_fused"] = [
+                {
+                    "id": r.get("id"),
+                    "paragraph_ref": r.get("paragraph_ref"),
+                    "isa_number": r.get("isa_number"),
+                    "rrf_score": r.get("rrf_score"),
+                    "retrieval_path": r.get("retrieval_path"),
+                    "content_preview": (r.get("content", ""))[:150],
+                }
+                for r in fused
+            ]
+    except Exception as exc:
+        result["warnings"].append(f"RRF fusion failed: {exc}")
+
+    # Stage 5: Reranker
+    try:
+        if result["rrf_fused"]:
+            # Need full content for reranking — re-use the fused list with content
+            kw2 = _format_keyword_results(
+                _keyword_search(expanded, max_results=max_results)
+            )
+            vec2 = _format_vector_results(
+                _vector_search(query, max_results=max_results)[0]
+            )
+            full_fused = _rrf_fuse(kw2, vec2)[:max_results]
+            reranked = rerank_results(query, full_fused, top_k=max_results)
+            result["reranked"] = [
+                {
+                    "id": r.get("id"),
+                    "paragraph_ref": r.get("paragraph_ref"),
+                    "isa_number": r.get("isa_number"),
+                    "rrf_score": r.get("rrf_score"),
+                    "rerank_score": r.get("rerank_score"),
+                    "content_preview": (r.get("content", ""))[:150],
+                }
+                for r in reranked
+            ]
+    except Exception as exc:
+        result["warnings"].append(f"Reranker failed: {exc}")
+
+    # Final output = reranked if available, else rrf_fused, else keyword
+    if result["reranked"]:
+        result["final"] = result["reranked"]
+    elif result["rrf_fused"]:
+        result["final"] = result["rrf_fused"]
+    elif result["keyword_results"]:
+        result["final"] = result["keyword_results"]
+
+    logger.info(
+        "Debug search completed: query=%r stages=%d warnings=%d",
+        query[:80],
+        sum(1 for k in ["keyword_results", "vector_results", "rrf_fused", "reranked"]
+            if result[k]),
+        len(result["warnings"]),
+    )
+
+    return result

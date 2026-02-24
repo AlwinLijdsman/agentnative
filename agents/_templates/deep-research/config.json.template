@@ -62,8 +62,35 @@
     "maxAccumulatedSections": 30
   },
   "output": {
-    "progressiveDisclosure": true,
-    "citationFormat": "{{CITATION_FORMAT}}"
+    "renderer": { "type": "research", "version": "1.0" },
+    "titleTemplate": "{{TITLE_TEMPLATE}}",
+    "followupTitleTemplate": "{{FOLLOWUP_TITLE_TEMPLATE}}",
+    "citationFormat": "{{CITATION_FORMAT}}",
+    "citationRegex": "{{CITATION_REGEX}}",
+    "sourceDiscovery": {
+      "enabled": {{SOURCE_DISCOVERY_ENABLED}},
+      "linkerType": "{{LINKER_TYPE}}",
+      "linkBase": "{{LINK_BASE}}"
+    },
+    "sections": {
+      "externalReferencesTitle": "External References",
+      "priorResearchTitle": "Prior Research References",
+      "verificationSummaryTitle": "Verification Summary",
+      "citationsUsedTitle": "Citations Used",
+      "researchDecompositionTitle": "Appendix: Research Decomposition"
+    },
+    "priorResearch": {
+      "refFormat": "[P{num}]",
+      "excerptLength": 200
+    },
+    "confidence": {
+      "qualifierThresholds": { "high": 0.85, "medium": 0.70 }
+    },
+    "files": {
+      "answerFile": "{{ANSWER_FILE}}",
+      "followupTemplate": "{{FOLLOWUP_FILE_TEMPLATE}}"
+    },
+    "progressiveDisclosure": true
   },
   "debug": {
     "enabled": false,

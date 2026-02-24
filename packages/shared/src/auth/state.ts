@@ -181,6 +181,12 @@ export async function performTokenRefresh(
  * MIGRATION (v0.3.0+):
  * - We NO LONGER import tokens from Claude CLI keychain
  * - Legacy tokens are detected and cleared, prompting re-authentication
+ *
+ * NOTE (G20): The `connectionSlug` parameter is currently ignored.
+ * Internally calls `manager.getClaudeOAuthCredentials()` which is global
+ * (not slug-aware). This works for single Claude Max connection but would
+ * silently use wrong credentials with multiple connections.
+ * Low risk — single Claude Max connection is the target use case.
  */
 export async function getValidClaudeOAuthToken(connectionSlug: string): Promise<TokenResult> {
   const manager = getCredentialManager();

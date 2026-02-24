@@ -2950,16 +2950,23 @@ export class SessionManager {
           sessionLog.debug(`[stage-gate][pause] pauseLocked=true`)
 
           // Mark the executing agent_stage_gate tool as completed.
-          const stageTool = managed.messages.find(
-            m => m.toolName?.includes('agent_stage_gate') && m.toolStatus === 'executing'
-          )
-          if (stageTool) {
-            stageTool.toolStatus = 'completed'
-            stageTool.content = `Stage ${stage} completed. Awaiting approval.`
-            stageTool.toolResult = JSON.stringify({ pauseRequired: true, stage, data })
-            sessionLog.debug(`[stage-gate][pause] marked tool completed toolUseId=${stageTool.toolUseId}`)
+          // In orchestrator flow (data.orchestratorMode === true), no such tool exists —
+          // the pause is emitted directly from the pipeline generator. Skip the lookup.
+          const isOrchestratorMode = data?.['orchestratorMode'] === true
+          if (!isOrchestratorMode) {
+            const stageTool = managed.messages.find(
+              m => m.toolName?.includes('agent_stage_gate') && m.toolStatus === 'executing'
+            )
+            if (stageTool) {
+              stageTool.toolStatus = 'completed'
+              stageTool.content = `Stage ${stage} completed. Awaiting approval.`
+              stageTool.toolResult = JSON.stringify({ pauseRequired: true, stage, data })
+              sessionLog.debug(`[stage-gate][pause] marked tool completed toolUseId=${stageTool.toolUseId}`)
+            } else {
+              sessionLog.warn(`[stage-gate][pause] no executing agent_stage_gate tool found to mark completed`)
+            }
           } else {
-            sessionLog.warn(`[stage-gate][pause] no executing agent_stage_gate tool found to mark completed`)
+            sessionLog.debug(`[stage-gate][pause] orchestrator mode — skipping tool lookup`)
           }
 
           // Send stage_gate_pause event to renderer
@@ -2996,17 +3003,46 @@ export class SessionManager {
               stageName: (event.data.stageName as string) ?? 'unknown',
             }, managed.workspace.id)
             break
-          case 'agent_stage_completed':
+          case 'agent_stage_completed': {
+            const completedStage = event.data.stage as number
             this.sendEvent({
               type: 'agent_stage_completed',
               sessionId: managed.id,
               agentSlug: event.agentSlug,
               runId: event.runId,
-              stage: event.data.stage as number,
+              stage: completedStage,
               stageName: (event.data.stageName as string) ?? 'unknown',
               data: event.data,
             }, managed.workspace.id)
+
+            // Auto-inject output file content into chat when Stage 5 completes.
+            // This ensures the full research report is shown in the chat regardless
+            // of whether the LLM includes it inline (which it often doesn't).
+            if (completedStage === 5 && typeof event.data.output_file_content === 'string') {
+              const fileContent = event.data.output_file_content as string
+              if (fileContent.length > 0) {
+                sessionLog.info(`Auto-injecting Stage 5 output file content (${fileContent.length} chars) into chat`)
+                const outputMessage: Message = {
+                  id: generateMessageId(),
+                  role: 'assistant',
+                  content: fileContent,
+                  timestamp: this.monotonic(),
+                  isIntermediate: false,
+                }
+                managed.messages.push(outputMessage)
+                managed.lastMessageRole = 'assistant'
+                managed.lastFinalMessageId = outputMessage.id
+                this.sendEvent({
+                  type: 'text_complete',
+                  sessionId: managed.id,
+                  text: fileContent,
+                  isIntermediate: false,
+                }, managed.workspace.id)
+                this.persistSession(managed)
+              }
+            }
             break
+          }
           case 'agent_repair_iteration':
             this.sendEvent({
               type: 'agent_repair_iteration',
@@ -3968,6 +4004,13 @@ export class SessionManager {
         try {
           const state = JSON.parse(readFileSync(stateFile, 'utf8'))
           if (state.pausedAtStage !== undefined && state.pausedAtStage !== null) {
+            // Orchestrator pipelines handle their own resume via
+            // ClaudeAgent.detectPausedOrchestrator() → resumeOrchestrator().
+            // Return a minimal marker so hasPausedPipeline checks still work
+            // (queue drain hold), but don't inject SDK tool instructions.
+            if (state.orchestratorMode) {
+              return `<orchestrator_pipeline_paused agentSlug="${slug}" pausedAtStage="${state.pausedAtStage}" />`
+            }
             const nextStage = state.pausedAtStage + 1
             return (
               `<agent_pipeline_resume agentSlug="${slug}" pausedAtStage="${state.pausedAtStage}" runId="${state.runId}" nextStage="${nextStage}">` +
@@ -4364,8 +4407,15 @@ export class SessionManager {
       // agent_stage_gate({ action: "resume" }) before continuing.
       const resumeContext = this.getPausedAgentResumeContext(chatSessionDir)
       if (resumeContext) {
-        sessionLog.info('Injecting agent stage gate resume context for paused pipeline')
-        message = resumeContext + '\n\n' + message
+        if (resumeContext.includes('<orchestrator_pipeline_paused')) {
+          // Orchestrator pipelines handle resume via ClaudeAgent.detectPausedOrchestrator().
+          // Don't inject SDK tool instructions — just clear the pause lock.
+          sessionLog.info('Orchestrator pipeline paused — resume handled by orchestrator detection')
+        } else {
+          // SDK flow: inject agent_stage_gate resume instructions into the message
+          sessionLog.info('Injecting agent stage gate resume context for paused pipeline')
+          message = resumeContext + '\n\n' + message
+        }
 
         // Clear the pause lock so the agent can call resume in this new processing context.
         // The lock was set during onAgentStagePause to prevent same-turn LLM self-resume.
@@ -4614,6 +4664,17 @@ export class SessionManager {
       await this.setTodoState(sessionId, 'done')
     }
 
+    // 3b. Fallback: Auto-inject agent output file content into chat.
+    //     When a multi-stage agent (ISA Deep Research) completes Stage 5 with an
+    //     output file, the LLM often produces only a brief summary. This fallback
+    //     reads the agent event log after the turn ends and injects the full file
+    //     content as the primary response if it wasn't already shown.
+    //     Works regardless of backend (ClaudeAgent/CopilotAgent) since it reads
+    //     directly from the agent events log on disk.
+    if (reason === 'complete') {
+      this.tryInjectAgentOutputFile(managed)
+    }
+
     // 4. Check queue and process or complete
     // If any agent pipeline is paused, do not auto-drain queued messages.
     // This prevents auto-continuation without an explicit post-pause user decision.
@@ -4651,6 +4712,132 @@ export class SessionManager {
 
     // 5. Always persist
     this.persistSession(managed)
+  }
+
+  /**
+   * Fallback: inject agent output file content into the chat after the turn ends.
+   *
+   * Reads the agent-events.jsonl for Stage 5 completion with output_file_path,
+   * then reads the file from disk and injects it as a non-intermediate assistant
+   * message. Skips injection if the file content is already present in messages.
+   *
+   * This mechanism works independently of the onAgentEvent callback pipeline,
+   * making it reliable across all backends (ClaudeAgent, CopilotAgent, CodexAgent).
+   */
+  private tryInjectAgentOutputFile(managed: ManagedSession): void {
+    try {
+      const sessionPath = getSessionStoragePath(managed.workspace.rootPath, managed.id)
+      const agentsDir = join(sessionPath, 'data', 'agents')
+
+      // Find agent data directories
+      let agentSlugs: string[]
+      try {
+        agentSlugs = readdirSync(agentsDir)
+      } catch {
+        return // No agent data directory — not an agent session
+      }
+
+      for (const agentSlug of agentSlugs) {
+        const eventsFile = join(agentsDir, agentSlug, 'agent-events.jsonl')
+        if (!existsSync(eventsFile)) continue
+
+        // Read agent events and find Stage 5 completion with output_file_path
+        let eventsContent: string
+        try {
+          eventsContent = readFileSync(eventsFile, 'utf-8')
+        } catch {
+          continue
+        }
+
+        const lines = eventsContent.trim().split('\n')
+        for (const line of lines) {
+          try {
+            const event = JSON.parse(line) as { type: string; data: Record<string, unknown> }
+            if (event.type !== 'stage_completed' || event.data.stage !== 5) continue
+            if (typeof event.data.output_file_path !== 'string') continue
+
+            const outputFilePath = event.data.output_file_path as string
+
+            // Resolve the file path — handle both absolute and relative paths
+            let resolvedPath: string | undefined
+            const isAbsolutePath = /^[a-zA-Z]:[\\/]/.test(outputFilePath) || outputFilePath.startsWith('/')
+            if (isAbsolutePath && existsSync(outputFilePath)) {
+              resolvedPath = outputFilePath
+            }
+            if (!resolvedPath) {
+              // Try plans folder and session root with basename
+              const baseName = outputFilePath.replace(/^.*[\\/]/, '').replace(/^\.\//, '')
+              const plansPath = join(sessionPath, 'plans', baseName)
+              const sessionRootPath = join(sessionPath, baseName)
+              const cwdPath = managed.workingDirectory ? join(managed.workingDirectory, baseName) : undefined
+
+              if (existsSync(plansPath)) resolvedPath = plansPath
+              else if (existsSync(sessionRootPath)) resolvedPath = sessionRootPath
+              else if (cwdPath && existsSync(cwdPath)) resolvedPath = cwdPath
+            }
+
+            if (!resolvedPath) {
+              sessionLog.debug(`[output-inject] Stage 5 output file not found: ${outputFilePath}`)
+              continue
+            }
+
+            // Read the file content
+            let fileContent: string
+            try {
+              fileContent = readFileSync(resolvedPath, 'utf-8')
+            } catch {
+              continue
+            }
+
+            if (fileContent.length < 100) {
+              sessionLog.debug(`[output-inject] Stage 5 output file too short (${fileContent.length} chars), skipping`)
+              continue
+            }
+
+            // Check if the content is already in the chat messages
+            // Compare first 200 chars to avoid false negatives from minor formatting differences
+            const contentPrefix = fileContent.substring(0, 200)
+            const alreadyInjected = managed.messages.some(m =>
+              m.role === 'assistant' && !m.isIntermediate && m.content.includes(contentPrefix)
+            )
+
+            if (alreadyInjected) {
+              sessionLog.debug(`[output-inject] Stage 5 output already present in chat, skipping`)
+              continue
+            }
+
+            // Inject the file content as a non-intermediate assistant message
+            sessionLog.info(`[output-inject] Injecting Stage 5 output file (${fileContent.length} chars) from ${resolvedPath}`)
+            const outputMessage: Message = {
+              id: generateMessageId(),
+              role: 'assistant',
+              content: fileContent,
+              timestamp: this.monotonic(),
+              isIntermediate: false,
+            }
+            managed.messages.push(outputMessage)
+            managed.lastMessageRole = 'assistant'
+            managed.lastFinalMessageId = outputMessage.id
+
+            // Send to renderer as a text_complete event
+            this.sendEvent({
+              type: 'text_complete',
+              sessionId: managed.id,
+              text: fileContent,
+              isIntermediate: false,
+            }, managed.workspace.id)
+
+            this.persistSession(managed)
+            sessionLog.info(`[output-inject] Stage 5 output successfully injected into chat`)
+            return // Only inject once per session
+          } catch {
+            // Skip malformed lines
+          }
+        }
+      }
+    } catch (error) {
+      sessionLog.debug(`[output-inject] Error in fallback output injection:`, error instanceof Error ? error.message : String(error))
+    }
   }
 
   /**

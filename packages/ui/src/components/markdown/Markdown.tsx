@@ -70,8 +70,8 @@ interface CollapsibleContext {
   toggleSection: (id: string) => void
 }
 
-// File path detection regex - matches paths starting with /, ~/, or ./
-const FILE_PATH_REGEX = /^(?:\/|~\/|\.\/)[\w\-./@]+\.(?:ts|tsx|js|jsx|mjs|cjs|md|json|yaml|yml|py|go|rs|css|scss|less|html|htm|txt|log|sh|bash|zsh|swift|kt|java|c|cpp|h|hpp|rb|php|xml|toml|ini|cfg|conf|env|sql|graphql|vue|svelte|astro|prisma)$/i
+// File path detection regex - matches paths starting with /, ~/, or ./ and bare filenames
+const FILE_PATH_REGEX = /^(?:(?:\/|~\/|\.\/)[\w\-./@]+|[\w\-.]+)\.(?:ts|tsx|js|jsx|mjs|cjs|md|json|yaml|yml|py|go|rs|css|scss|less|html|htm|txt|log|sh|bash|zsh|swift|kt|java|c|cpp|h|hpp|rb|php|xml|toml|ini|cfg|conf|env|sql|graphql|vue|svelte|astro|prisma|pdf|csv|docx|xlsx)$/i
 
 /**
  * Create custom components based on render mode.

@@ -112,7 +112,12 @@ def _get_by_id(paragraph_id: str) -> dict[str, Any]:
     )
 
     if not rows:
-        return {"paragraph": None, "related": [], "found": False}
+        return {
+            "paragraph": None,
+            "related": [],
+            "found": False,
+            "error": f"Paragraph '{paragraph_id}' not found",
+        }
 
     paragraph = _format_paragraph(rows[0])
     related = _get_related(paragraph_id)
@@ -225,6 +230,7 @@ def _get_by_reference(reference: str) -> dict[str, Any]:
         "paragraph": None,
         "related": [],
         "found": False,
+        "error": f"Paragraph '{reference}' not found",
         "hint": (
             "Try formats: '315.12', '315.12(a)', '315.12(a).A2', '315.A2', "
             "or a direct ID like 'ip_a1b2c3d4'."

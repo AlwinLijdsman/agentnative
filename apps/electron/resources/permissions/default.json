@@ -1,5 +1,5 @@
 {
-  "version": "2026-02-07",
+  "version": "2026-02-23",
 
   "allowedBashPatterns": [
     { "pattern": "^ls\\b", "comment": "List directory contents" },
@@ -206,7 +206,12 @@
     { "pattern": "search", "comment": "Search operations across MCP sources" },
     { "pattern": "list", "comment": "Generic list operations" },
     { "pattern": "get", "comment": "Generic get/read operations" },
-    { "pattern": "read", "comment": "Generic read operations" }
+    { "pattern": "read", "comment": "Generic read operations" },
+    { "pattern": "verify", "comment": "Verification operations (read-only checks against source data)" },
+    { "pattern": "contradiction", "comment": "Contradiction detection (read-only analysis)" },
+    { "pattern": "format", "comment": "Context formatting operations (read-only text assembly)" },
+    { "pattern": "status", "comment": "Status check operations" },
+    { "pattern": "hop", "comment": "Graph traversal/hop operations (read-only retrieval)" }
   ],
 
   "allowedApiEndpoints": [],

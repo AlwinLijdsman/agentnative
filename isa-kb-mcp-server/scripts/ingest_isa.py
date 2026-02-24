@@ -159,15 +159,35 @@ def _standard_id(isa_number: str) -> str:
     return f"is_{hashlib.sha256(f'ISA_{isa_number}'.encode()).hexdigest()[:8]}"
 
 
-# ISA paragraph reference regex
+# ISA paragraph reference regex (used for cross-ref detection AND cache parsing)
 # Matches: 315.12, 315.12(a), 315.12.A2, 315.12(a).A2
 _PARA_REF_PATTERN = re.compile(
     r"(\d{3})\.\s*(\d+)(?:\(([a-z])\))?(?:\.A(\d+))?"
 )
 
+# Actual PDF text patterns: paragraphs start as "13. The auditor..." (no ISA prefix)
+# Application material starts as "A14. Designing..." (no ISA prefix)
+# Sub-paragraphs: "(a) ...", "(b) ...", "(i) ...", "(ii) ..."
+_MAIN_PARA_PATTERN = re.compile(r"^(\d+)\.\s+(.+)", re.DOTALL)
+_APP_PARA_PATTERN = re.compile(r"^A(\d+)\.\s+(.+)", re.DOTALL)
+_SUB_PARA_PATTERN = re.compile(r"^\(([a-z])\)\s+(.+)", re.DOTALL)
+_ROMAN_SUB_PATTERN = re.compile(r"^\((i{1,3}|iv|v|vi{0,3})\)\s+(.+)", re.DOTALL)
+
 # ISA cross-reference detection (e.g., "ISA 315.12(a)", "ISA 500")
 _CROSS_REF_PATTERN = re.compile(
     r"ISA\s+(\d{3})(?:\.(\d+)(?:\(([a-z])\))?(?:\.A(\d+))?)?"
+)
+
+# Comma-notation cross-reference (e.g., "ISA 315 (Revised), paragraph 19(b)")
+# Also handles: "ISA 200, paragraph 18", "ISA 700 (Revised), paragraphs 34(b)"
+_CROSS_REF_COMMA_PATTERN = re.compile(
+    r"ISA\s+(\d{3})\s*(?:\([^)]*\))?\s*,\s*paragraph[s]?\s+(\d+)(?:\(([a-z])\))?"
+)
+
+# Application material cross-reference (e.g., "Ref: Para. A5-A8", "Para. A14")
+# Matches: "ISA 700 (Revised), paragraph A49" or "Para. A5"
+_CROSS_REF_APP_PATTERN = re.compile(
+    r"ISA\s+(\d{3})\s*(?:\([^)]*\))?\s*,\s*paragraph[s]?\s+A(\d+)"
 )
 
 
@@ -262,19 +282,32 @@ def _generate_debug_fixture(pdf_path: Path, isa_number: str) -> ProcessedStandar
 def _parse_cached_extraction(
     cached: dict[str, Any], pdf_path: Path, isa_number: str
 ) -> ProcessedStandard:
-    """Parse a cached extraction JSON into a ProcessedStandard."""
-    paragraphs = []
-    for p in cached.get("paragraphs", []):
-        para = ISAParagraph(
-            isa_number=p.get("isa_number", isa_number),
-            para_num=p.get("para_num", ""),
-            sub_paragraph=p.get("sub_paragraph", ""),
-            application_ref=p.get("application_ref", ""),
-            content=p.get("content", ""),
-            page_number=p.get("page_number", 0),
-            source_doc=pdf_path.name,
-        )
-        paragraphs.append(para)
+    """Parse a cached extraction JSON into a ProcessedStandard.
+
+    Supports two cache formats:
+    - New format: has 'raw_text' key -> re-parse from raw text
+    - Old format: has 'paragraphs' list -> use pre-parsed paragraphs
+    """
+    raw_text = cached.get("raw_text", "")
+    total_pages = cached.get("total_pages", 0)
+
+    if raw_text:
+        # New cache format: re-parse from raw text (allows parser improvements)
+        paragraphs = _parse_paragraphs_from_text(raw_text, isa_number, pdf_path.name)
+    else:
+        # Old cache format: use pre-parsed paragraphs
+        paragraphs = []
+        for p in cached.get("paragraphs", []):
+            para = ISAParagraph(
+                isa_number=p.get("isa_number", isa_number),
+                para_num=p.get("para_num", ""),
+                sub_paragraph=p.get("sub_paragraph", ""),
+                application_ref=p.get("application_ref", ""),
+                content=p.get("content", ""),
+                page_number=p.get("page_number", 0),
+                source_doc=pdf_path.name,
+            )
+            paragraphs.append(para)
 
     cross_refs = _detect_cross_references(paragraphs)
 
@@ -329,7 +362,8 @@ async def _extract_with_azure(
     paragraphs = _parse_paragraphs_from_text(full_text, isa_number, pdf_path.name)
     cross_refs = _detect_cross_references(paragraphs)
 
-    # Cache the extraction
+    # Cache the raw text (not parsed paragraphs) so parser changes
+    # can be re-applied without re-calling Azure Document Intelligence
     if cache_dir:
         cache_dir.mkdir(parents=True, exist_ok=True)
         cache_file = cache_dir / f"{pdf_path.stem}_extraction.json"
@@ -337,20 +371,10 @@ async def _extract_with_azure(
             "isa_number": isa_number,
             "title": f"ISA {isa_number}",
             "total_pages": total_pages,
-            "paragraphs": [
-                {
-                    "isa_number": p.isa_number,
-                    "para_num": p.para_num,
-                    "sub_paragraph": p.sub_paragraph,
-                    "application_ref": p.application_ref,
-                    "content": p.content,
-                    "page_number": p.page_number,
-                }
-                for p in paragraphs
-            ],
+            "raw_text": full_text,
         }
         cache_file.write_text(json.dumps(cache_data, indent=2), encoding="utf-8")
-        logger.info("  [CACHE] Saved extraction to %s", cache_file.name)
+        logger.info("  [CACHE] Saved raw text extraction to %s", cache_file.name)
 
     return ProcessedStandard(
         source_path=pdf_path,
@@ -373,48 +397,182 @@ def _parse_paragraphs_from_text(
 ) -> list[ISAParagraph]:
     """Parse ISA paragraph references from extracted text.
 
-    Splits text into paragraphs using the ISA numbering regex and
-    handles long paragraphs by splitting at double-newline boundaries.
+    ISA PDFs (as extracted by Azure Document Intelligence) use this format:
+        Main paragraphs:     "13. The auditor shall..."  (just the number)
+        Application material: "A14. Designing and..."    (A-prefixed number)
+        Sub-paragraphs:      "(a) The identification..."
+        Roman sub-sub:       "(i) For which the assessment..."
+
+    The ISA number is NOT prefixed to each line; it comes from the filename.
+    Long paragraphs (>3000 chars) are split at sentence boundaries.
+
+    Monotonicity guard: paragraph numbers must increase monotonically.
+    If a lower number is encountered after a higher one, we've entered
+    an appendix/illustration/table section — stop parsing main paragraphs.
     """
     paragraphs: list[ISAParagraph] = []
     lines = text.split("\n")
     current_para: ISAParagraph | None = None
     current_lines: list[str] = []
+    current_para_num: str = ""
+    current_sub: str = ""
+    current_app_ref: str = ""
     page_num = 1
+    in_body = False  # Skip table of contents / header section
+    max_main_para_num = 0  # Track highest main paragraph number seen
+    max_app_para_num = 0  # Track highest application paragraph number seen
+    in_appendix = False  # Flag: stop parsing main paragraphs once in appendix
+
+    # Heuristic: body starts at first line matching "1. <Capital letter>"
+    # (before that is TOC, title, etc.)
+    body_start_pattern = re.compile(r"^1\.\s+[A-Z]")
+
+    # Detect appendix boundary
+    appendix_pattern = re.compile(r"^Appendix", re.IGNORECASE)
+
+    def _flush() -> None:
+        """Save the current paragraph if it has content."""
+        nonlocal current_para, current_lines
+        if current_para and current_lines:
+            current_para.content = "\n".join(current_lines).strip()
+            if current_para.content and len(current_para.content) > 20:
+                _split_and_add(paragraphs, current_para, source_doc)
+        current_para = None
+        current_lines = []
 
     for line in lines:
-        # Try to match a paragraph reference at start of line
-        m = _PARA_REF_PATTERN.match(line.strip())
-        if m and m.group(1) == isa_number:
-            # Save previous paragraph
-            if current_para and current_lines:
-                current_para.content = "\n".join(current_lines).strip()
-                if current_para.content:
-                    _split_and_add(paragraphs, current_para, source_doc)
+        stripped = line.strip()
 
-            # Start new paragraph
-            current_para = ISAParagraph(
-                isa_number=isa_number,
-                para_num=m.group(2),
-                sub_paragraph=m.group(3) or "",
-                application_ref=f"A{m.group(4)}" if m.group(4) else "",
-                page_number=page_num,
-                source_doc=source_doc,
-            )
-            current_lines = [line]
-        else:
-            current_lines.append(line)
-
-        # Simple page break detection
+        # Page break detection
         if "\f" in line:
             page_num += 1
 
-    # Save final paragraph
-    if current_para and current_lines:
-        current_para.content = "\n".join(current_lines).strip()
-        if current_para.content:
-            _split_and_add(paragraphs, current_para, source_doc)
+        # Skip until body starts
+        if not in_body:
+            if body_start_pattern.match(stripped):
+                in_body = True
+            else:
+                continue
 
+        # Detect appendix boundary — stop matching main paragraphs
+        if appendix_pattern.match(stripped):
+            _flush()
+            in_appendix = True
+            continue
+
+        # Skip ISA header/footer lines (page numbers, repeated titles)
+        if re.match(r"^ISA\s+\d{3}\s*\(", stripped):  # e.g. "ISA 315 (REVISED 2019)"
+            continue
+        if re.match(r"^ISA$", stripped):  # standalone "ISA" line
+            continue
+        if re.match(r"^\d{3}$", stripped):  # standalone page number
+            continue
+        if stripped.startswith("INTERNATIONAL STANDARD ON"):
+            continue
+        # Skip all-caps repeated title lines (page headers/footers)
+        # Only skip if they look like repeated headers (>30 chars to avoid
+        # filtering short section headings that are legitimate content)
+        if stripped.isupper() and len(stripped) > 30:
+            continue
+
+        # Try to match application material: "A14. text..."
+        # (App material can appear in appendices too, but numbering must increase)
+        m_app = _APP_PARA_PATTERN.match(stripped)
+        if m_app:
+            app_num = int(m_app.group(1))
+            # Monotonicity guard: reject backwards A-paragraph numbers
+            if app_num <= max_app_para_num - 2:
+                # Backwards jump — this is table/illustration content, not a real paragraph
+                if current_para:
+                    current_lines.append(stripped)
+                continue
+            _flush()
+            max_app_para_num = max(max_app_para_num, app_num)
+            current_app_ref = f"A{m_app.group(1)}"
+            current_para_num = ""  # App material doesn't have a main para number
+            current_sub = ""
+            current_para = ISAParagraph(
+                isa_number=isa_number,
+                para_num="",
+                application_ref=current_app_ref,
+                page_number=page_num,
+                source_doc=source_doc,
+            )
+            current_lines = [stripped]
+            continue
+
+        # Try to match main paragraph: "13. text..."
+        m_main = _MAIN_PARA_PATTERN.match(stripped)
+        if m_main and not in_appendix:
+            para_num_candidate = int(m_main.group(1))
+            # Sanity: ISA paragraph numbers are typically 1-999
+            # Skip things like "2019" (year) or "2024" (dates)
+            if para_num_candidate <= 500:
+                # Monotonicity guard: reject backwards main paragraph numbers
+                if para_num_candidate <= max_main_para_num - 2:
+                    # Backwards jump — appendix table/illustration content
+                    if current_para:
+                        current_lines.append(stripped)
+                    continue
+                _flush()
+                max_main_para_num = max(max_main_para_num, para_num_candidate)
+                current_para_num = str(para_num_candidate)
+                current_sub = ""
+                current_app_ref = ""
+                current_para = ISAParagraph(
+                    isa_number=isa_number,
+                    para_num=current_para_num,
+                    page_number=page_num,
+                    source_doc=source_doc,
+                )
+                current_lines = [stripped]
+                continue
+
+        # Try to match sub-paragraph: "(a) text..."
+        m_sub = _SUB_PARA_PATTERN.match(stripped)
+        if m_sub and current_para_num:
+            _flush()
+            current_sub = m_sub.group(1)
+            current_para = ISAParagraph(
+                isa_number=isa_number,
+                para_num=current_para_num,
+                sub_paragraph=current_sub,
+                application_ref=current_app_ref,
+                page_number=page_num,
+                source_doc=source_doc,
+            )
+            current_lines = [stripped]
+            continue
+
+        # Roman numeral sub-sub: "(i) text..." under a sub-paragraph
+        m_roman = _ROMAN_SUB_PATTERN.match(stripped)
+        if m_roman and current_para_num:
+            _flush()
+            roman_val = m_roman.group(1)
+            current_para = ISAParagraph(
+                isa_number=isa_number,
+                para_num=current_para_num,
+                sub_paragraph=f"{current_sub}({roman_val})" if current_sub else roman_val,
+                application_ref=current_app_ref,
+                page_number=page_num,
+                source_doc=source_doc,
+            )
+            current_lines = [stripped]
+            continue
+
+        # Continuation line: append to current paragraph
+        if current_para:
+            current_lines.append(stripped)
+
+    # Save final paragraph
+    _flush()
+
+    logger.info(
+        "  [PARSE] ISA %s: extracted %d paragraphs from text (%d lines)"
+        " [max_para=%d, max_app=A%d, appendix=%s]",
+        isa_number, len(paragraphs), len(lines),
+        max_main_para_num, max_app_para_num, in_appendix,
+    )
     return paragraphs
 
 
@@ -424,13 +582,64 @@ def _split_and_add(
     source_doc: str,
     max_chars: int = 3000,
 ) -> None:
-    """Split long paragraphs at double-newline boundaries."""
+    """Split long paragraphs into chunks of ~max_chars.
+
+    Strategy (in order of preference):
+    1. If content <= max_chars, keep as-is.
+    2. Split on double-newlines (\\n\\n) if present.
+    3. Split on single newlines (\\n) if double-newlines absent.
+    4. Fall back to sentence-boundary splitting (~max_chars each).
+
+    After the initial split, any still-oversized chunk is recursively
+    re-split at sentence boundaries.
+    """
     if len(para.content) <= max_chars:
         paragraphs.append(para)
         return
 
-    chunks = para.content.split("\n\n")
-    for i, chunk in enumerate(chunks):
+    # Try double-newline split first, then single-newline
+    chunks: list[str] = []
+    raw_chunks = para.content.split("\n\n")
+    if len(raw_chunks) > 1:
+        chunks = [c.strip() for c in raw_chunks if c.strip()]
+    else:
+        # No double-newlines — Azure text typically has only single newlines
+        raw_chunks = para.content.split("\n")
+        if len(raw_chunks) > 1:
+            # Merge consecutive lines into chunks of ~max_chars
+            merged: list[str] = []
+            buf: list[str] = []
+            buf_len = 0
+            for line in raw_chunks:
+                line = line.strip()
+                if not line:
+                    continue
+                if buf_len + len(line) + 1 > max_chars and buf:
+                    merged.append("\n".join(buf))
+                    buf = [line]
+                    buf_len = len(line)
+                else:
+                    buf.append(line)
+                    buf_len += len(line) + 1
+            if buf:
+                merged.append("\n".join(buf))
+            chunks = merged
+        else:
+            # Single huge line — split at sentence boundaries
+            chunks = _split_at_sentences(para.content, max_chars)
+
+    # If we still have oversized chunks, re-split at sentence boundaries
+    final_chunks: list[str] = []
+    for chunk in chunks:
+        if len(chunk) > max_chars * 1.5:
+            final_chunks.extend(_split_at_sentences(chunk, max_chars))
+        else:
+            final_chunks.append(chunk)
+
+    if not final_chunks:
+        final_chunks = [para.content]
+
+    for i, chunk in enumerate(final_chunks):
         chunk = chunk.strip()
         if not chunk:
             continue
@@ -439,17 +648,37 @@ def _split_and_add(
             para_num=para.para_num,
             sub_paragraph=para.sub_paragraph,
             application_ref=para.application_ref,
-            paragraph_ref=para.paragraph_ref + (f"_part{i+1}" if i > 0 else ""),
+            paragraph_ref=para.paragraph_ref + (f"_part{i+1}" if len(final_chunks) > 1 and i > 0 else ""),
             content=chunk,
             page_number=para.page_number,
             source_doc=source_doc,
         )
         # Re-generate ID for split paragraphs
-        if i > 0:
+        if len(final_chunks) > 1 and i > 0:
             split_para.id = _paragraph_id(
                 split_para.isa_number, split_para.paragraph_ref
             )
         paragraphs.append(split_para)
+
+
+def _split_at_sentences(text: str, max_chars: int) -> list[str]:
+    """Split text into chunks at sentence boundaries, each ~max_chars."""
+    # Split on sentence-ending punctuation followed by space
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    chunks: list[str] = []
+    buf: list[str] = []
+    buf_len = 0
+    for sent in sentences:
+        if buf_len + len(sent) + 1 > max_chars and buf:
+            chunks.append(" ".join(buf))
+            buf = [sent]
+            buf_len = len(sent)
+        else:
+            buf.append(sent)
+            buf_len += len(sent) + 1
+    if buf:
+        chunks.append(" ".join(buf))
+    return chunks if chunks else [text]
 
 
 def _detect_cross_references(paragraphs: list[ISAParagraph]) -> list[CrossReference]:
@@ -813,9 +1042,13 @@ async def store_in_lancedb(
 ) -> int:
     """Store paragraph embeddings in LanceDB.
 
-    Creates or appends to the 'isa_chunks' table with schema:
+    Creates or replaces rows in the 'isa_chunks' table with schema:
         { id, vector[1024], content, isa_number, paragraph_ref,
           sub_paragraph, application_ref, page_number }
+
+    Uses delete-then-add per ISA standard to avoid duplicates when
+    re-ingesting individual standards. For full batch re-ingestion,
+    drops and recreates the table.
 
     Returns:
         Number of rows inserted.
@@ -854,9 +1087,17 @@ async def store_in_lancedb(
 
     df = pd.DataFrame(records)
 
-    # Create or append to table
+    # Determine which ISA standards we're inserting
+    isa_numbers = df["isa_number"].unique().tolist()
+
+    # Delete existing rows for these standards before adding (upsert behavior)
     try:
         table = db.open_table("isa_chunks")
+        for isa_num in isa_numbers:
+            try:
+                table.delete(f"isa_number = '{isa_num}'")
+            except Exception:
+                pass  # Table might be empty or column missing
         table.add(df)
     except Exception:
         db.create_table("isa_chunks", df)
@@ -868,7 +1109,8 @@ async def store_in_lancedb(
     except Exception as e:
         logger.warning("[STORE-LANCE] FTS index warning: %s", e)
 
-    logger.info("[STORE-LANCE] Stored %d rows in isa_chunks", len(records))
+    logger.info("[STORE-LANCE] Stored %d rows in isa_chunks (upsert for ISA %s)",
+                len(records), ", ".join(isa_numbers))
     return len(records)
 
 
@@ -912,6 +1154,150 @@ def _classify_hop_type(dst_ref: str) -> str:
     if "." in dst_ref:
         return "cross_ref"
     return "standard_ref"
+
+
+async def resolve_cross_standard_edges(
+    *,
+    skip: bool = False,
+) -> dict[str, int]:
+    """Post-processing pass: resolve cross-standard references using DuckDB.
+
+    After all standards are ingested, this function:
+    1. Loads all paragraphs from DuckDB
+    2. Re-scans each paragraph for cross-references
+    3. Resolves dst_id against the global paragraph set
+    4. Inserts cites and hop_edge rows for cross-standard references
+
+    Returns:
+        Dict with counts: { cites, hop_edges }.
+    """
+    if skip:
+        logger.info("[CROSS-STD] Skipping cross-standard resolution")
+        return {"cites": 0, "hop_edges": 0}
+
+    import duckdb
+
+    db_path = DATA_DIR / "duckdb" / "isa_kb.duckdb"
+    conn = duckdb.connect(str(db_path))
+
+    # Load all paragraphs: id, isa_number, paragraph_ref, content
+    rows = conn.execute(
+        "SELECT id, isa_number, paragraph_ref, content FROM ISAParagraph"
+    ).fetchall()
+
+    if not rows:
+        logger.info("[CROSS-STD] No paragraphs in DuckDB — nothing to resolve")
+        conn.close()
+        return {"cites": 0, "hop_edges": 0}
+
+    # Build global lookup: paragraph_ref → id
+    global_ref_to_id: dict[str, str] = {}
+    for row_id, _isa_num, para_ref, _content in rows:
+        if para_ref:
+            global_ref_to_id[para_ref] = row_id
+
+    logger.info(
+        "[CROSS-STD] Loaded %d paragraphs, %d unique refs",
+        len(rows), len(global_ref_to_id),
+    )
+
+    cites_count = 0
+    hop_count = 0
+    seen_edges: set[str] = set()  # Deduplicate edges from multiple pattern matches
+
+    def _insert_edge(src_id: str, dst_ref: str, dst_id: str, citation: str) -> None:
+        """Insert a cites + hop_edge pair if not already seen."""
+        nonlocal cites_count, hop_count
+        edge_key = f"{src_id}|{dst_id}"
+        if edge_key in seen_edges:
+            return
+        seen_edges.add(edge_key)
+
+        # Insert cites edge
+        edge_id = f"ct_{hashlib.sha256(edge_key.encode()).hexdigest()[:8]}"
+        conn.execute(
+            "INSERT OR REPLACE INTO cites (id, src_id, dst_id, citation_text) "
+            "VALUES (?, ?, ?, ?)",
+            [edge_id, src_id, dst_id, citation],
+        )
+        cites_count += 1
+
+        # Insert hop_edge
+        weight = _compute_hop_weight(dst_ref)
+        hop_type = _classify_hop_type(dst_ref)
+        he_id = f"he_{hashlib.sha256(f'{src_id}{dst_id}{hop_type}'.encode()).hexdigest()[:8]}"
+        conn.execute(
+            "INSERT OR REPLACE INTO hop_edge "
+            "(id, src_id, dst_id, weight, query, hop_type) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            [he_id, src_id, dst_id, weight, citation, hop_type],
+        )
+        hop_count += 1
+
+    for row_id, isa_number, para_ref, content in rows:
+        if not content:
+            continue
+
+        # Pattern 1: Dot-notation (ISA 315.12(a))
+        for m in _CROSS_REF_PATTERN.finditer(content):
+            dst_isa = m.group(1)
+            dst_para_num = m.group(2) or ""
+            dst_sub = m.group(3) or ""
+            dst_app = m.group(4) or ""
+
+            if not dst_para_num:
+                continue  # Standard-level refs — skip
+            if dst_isa == isa_number:
+                continue  # Intra-standard — already handled
+
+            dst_ref = _build_paragraph_ref(dst_isa, dst_para_num, dst_sub, dst_app)
+            if dst_ref == para_ref:
+                continue
+
+            dst_id = global_ref_to_id.get(dst_ref)
+            if dst_id:
+                _insert_edge(row_id, dst_ref, dst_id, m.group(0))
+
+        # Pattern 2: Comma-notation (ISA 315 (Revised), paragraph 19(b))
+        for m in _CROSS_REF_COMMA_PATTERN.finditer(content):
+            dst_isa = m.group(1)
+            dst_para_num = m.group(2)
+            dst_sub = m.group(3) or ""
+
+            if dst_isa == isa_number:
+                continue
+
+            dst_ref = _build_paragraph_ref(dst_isa, dst_para_num, dst_sub)
+            if dst_ref == para_ref:
+                continue
+
+            dst_id = global_ref_to_id.get(dst_ref)
+            if dst_id:
+                _insert_edge(row_id, dst_ref, dst_id, m.group(0))
+
+        # Pattern 3: Application material comma-notation (ISA 700, paragraph A49)
+        for m in _CROSS_REF_APP_PATTERN.finditer(content):
+            dst_isa = m.group(1)
+            dst_app_num = m.group(2)
+
+            if dst_isa == isa_number:
+                continue
+
+            # App material paragraph_ref format: "200..A5" (empty para_num)
+            dst_ref = _build_paragraph_ref(dst_isa, "", "", f"A{dst_app_num}")
+            if dst_ref == para_ref:
+                continue
+
+            dst_id = global_ref_to_id.get(dst_ref)
+            if dst_id:
+                _insert_edge(row_id, dst_ref, dst_id, m.group(0))
+
+    conn.close()
+    logger.info(
+        "[CROSS-STD] Resolved %d cites edges, %d hop edges across standards",
+        cites_count, hop_count,
+    )
+    return {"cites": cites_count, "hop_edges": hop_count}
 
 
 async def build_hoprag_edges(
@@ -986,7 +1372,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         prog="python -m scripts.ingest_isa",
     )
     parser.add_argument(
-        "--input", type=Path, required=True,
+        "--input", type=Path, required=False, default=None,
         help="Path to an ISA PDF or a directory of ISA PDFs.",
     )
     parser.add_argument(
@@ -1014,6 +1400,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Max web search queries per ISA standard (default: 5).",
     )
     parser.add_argument(
+        "--resolve-edges-only", action="store_true", default=False,
+        help="Only run cross-standard edge resolution (no extraction).",
+    )
+    parser.add_argument(
         "--verbose", "-v", action="store_true", default=False,
         help="Enable verbose logging.",
     )
@@ -1038,6 +1428,21 @@ def collect_pdf_files(input_path: Path) -> list[Path]:
 async def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     """Run the full ISA ingestion pipeline."""
     t_start = time.monotonic()
+
+    # Resolve-edges-only mode: just run cross-standard resolution
+    if args.resolve_edges_only:
+        logger.info("[START] Cross-standard edge resolution only")
+        counts = await resolve_cross_standard_edges()
+        elapsed = time.monotonic() - t_start
+        return {
+            "mode": "resolve-edges-only",
+            "cross_standard_cites": counts["cites"],
+            "cross_standard_hop_edges": counts["hop_edges"],
+            "elapsed_s": round(elapsed, 2),
+        }
+
+    if not args.input:
+        return {"error": "--input is required unless using --resolve-edges-only", "elapsed_s": 0}
 
     pdfs = collect_pdf_files(args.input)
     if not pdfs:
@@ -1116,6 +1521,16 @@ async def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             standard.isa_number, len(paragraphs),
             len(standard.cross_references), hop_count,
         )
+
+    # Stage 7: Cross-standard reference resolution (post-processing)
+    # Only run when processing multiple files (batch mode)
+    skip_cross_std = args.skip_store or args.skip_graph or args.skip_hoprag
+    if len(pdfs) > 1 and not skip_cross_std:
+        cross_std_counts = await resolve_cross_standard_edges()
+        total_duck["cites"] += cross_std_counts["cites"]
+        total_hop_edges += cross_std_counts["hop_edges"]
+    elif not skip_cross_std:
+        logger.info("[CROSS-STD] Single-file mode — run full batch to resolve cross-standard edges")
 
     elapsed = time.monotonic() - t_start
     summary = {

@@ -33,6 +33,7 @@ Tools registered:
     Phase 14 (Diagnostics):
         - isa_kb_status          — KB health status (table counts, connections)
         - isa_debug_hop_trace    — Multi-hop path tracing for graph debugging
+        - isa_debug_search       — Search pipeline debugging (all intermediate scores)
 """
 
 from __future__ import annotations
@@ -429,6 +430,7 @@ def create_server() -> FastMCP:
         query: str,
         max_tokens: int = 8000,
         roles: dict | None = None,
+        group_by_role: bool = True,
     ) -> dict:
         """Format retrieved paragraphs into structured XML for synthesis.
 
@@ -437,6 +439,10 @@ def create_server() -> FastMCP:
         and cross-reference metadata. This is the input format for the
         synthesis stage.
 
+        When group_by_role is True (default), the output XML is structured
+        into <primary_isa>, <supporting_isa>, and <context_isa> sections
+        with the token budget split 60/30/10 across roles.
+
         Args:
             paragraphs: List of paragraph dicts (from isa_hybrid_search or
                 isa_hop_retrieve).
@@ -444,15 +450,20 @@ def create_server() -> FastMCP:
             max_tokens: Token budget for output (default 8000).
             roles: Optional mapping of paragraph ID to role
                 ("primary", "supporting", "context").
+            group_by_role: When True, produce role-grouped XML with
+                <primary_isa>, <supporting_isa>, <context_isa> wrapper
+                elements and 60/30/10 budget split. When False, flat XML.
 
         Returns:
-            Dict with xml string, included/excluded counts, and token estimate.
+            Dict with xml string, included/excluded counts, token estimate,
+            and role_counts.
         """
         return format_context(
             paragraphs,
             query,
             max_tokens=max_tokens,
             roles=roles,
+            group_by_role=group_by_role,
         )
 
     @mcp.tool()
@@ -514,6 +525,29 @@ def create_server() -> FastMCP:
             and maximum depth reached.
         """
         return debug_hop_trace(start_id, max_hops=max_hops)
+
+    @mcp.tool()
+    def isa_debug_search(
+        query: str,
+        max_results: int = 10,
+    ) -> dict:
+        """Run hybrid search with full intermediate scoring visible for debugging.
+
+        Shows every pipeline stage: query expansion, raw BM25 keyword scores,
+        raw vector distances, RRF fusion scores, and reranker scores.
+        Useful for diagnosing why a query returns unexpected results.
+
+        Args:
+            query: The search query to debug.
+            max_results: Maximum results per stage (default 10).
+
+        Returns:
+            Dict with query, expanded_query, keyword_results, vector_results,
+            rrf_fused, reranked, final, and warnings.
+        """
+        from isa_kb_mcp_server.diagnostics import debug_search
+
+        return debug_search(query, max_results=max_results)
 
     return mcp
 

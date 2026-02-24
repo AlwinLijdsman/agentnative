@@ -9,7 +9,8 @@
   "types": "src/index.ts",
   "scripts": {
     "test": "bun test",
-    "test:watch": "bun test --watch"
+    "test:watch": "bun test --watch",
+    "baml:generate": "cd baml_src && npx @boundaryml/baml generate"
   },
   "exports": {
     ".": "./src/index.ts",
@@ -74,6 +75,7 @@
     "zod": ">=3.0.0"
   },
   "devDependencies": {
+    "@boundaryml/baml": "^0.85.0",
     "@types/shell-quote": "^1.7.5",
     "@types/uuid": "^11.0.0"
   }
