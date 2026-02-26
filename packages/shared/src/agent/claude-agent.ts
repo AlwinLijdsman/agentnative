@@ -42,7 +42,8 @@ import {
 } from './mode-manager.ts';
 import { type PermissionsContext, permissionsConfigCache } from './permissions-config.ts';
 import { getSessionPlansPath, getSessionPath } from '../sessions/storage.ts';
-import { readFileSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'fs';
+import { join } from 'path';
 import { expandPath } from '../utils/paths.ts';
 import { extractWorkspaceSlug } from '../utils/workspace.ts';
 import {
@@ -100,6 +101,18 @@ export type { LoadedSource } from '../sources/types.ts';
 // Re-exported for backwards compatibility with existing imports from claude-agent.ts
 import { AbortReason, type RecoveryMessage } from './core/index.ts';
 export { AbortReason, type RecoveryMessage };
+
+// Orchestrator — deterministic stage pipeline (Phase 6 integration)
+import { AgentOrchestrator, CostTracker, McpLifecycleManager, OrchestratorMcpBridge, PipelineState, extractTransportConfig } from './orchestrator/index.ts';
+import type {
+  AgentConfig as OrchestratorAgentConfig,
+  McpBridge as OrchestratorMcpBridge_T,
+  OrchestratorExitReason,
+} from './orchestrator/types.ts';
+import { loadSourceConfig } from '../sources/storage.ts';
+import { loadAgent, loadWorkspaceAgents } from '../agents/storage.ts';
+import type { LoadedAgent } from '../agents/types.ts';
+import { parseMentions } from '../mentions/index.ts';
 
 export interface ClaudeAgentConfig {
   workspace: Workspace;
@@ -348,6 +361,23 @@ function buildWindowsSkillsDirError(errorText: string): { type: 'typed_error'; e
     },
   };
 }
+
+/**
+ * Detect whether an error message indicates a server-side session expiry.
+ * Used by both the event-loop recovery path (result errors) and the catch-block
+ * recovery path (thrown errors / stderr) to apply a single retry with fresh session.
+ *
+ * Case-insensitive match covers:
+ *   - "No conversation found with session ID: <uuid>" (API / stderr)
+ *   - "no conversation found with session id" (lowercased catch-path)
+ */
+function isSessionExpiredError(text: string | undefined | null): boolean {
+  if (!text) return false;
+  return text.toLowerCase().includes('no conversation found with session id');
+}
+
+// Re-export for unit testing — the function is also used internally by chat() recovery paths
+export { isSessionExpiredError };
 
 export class ClaudeAgent extends BaseAgent {
   // Note: ClaudeAgentConfig is compatible with BackendConfig, so we use the inherited this.config
@@ -647,6 +677,32 @@ export class ClaudeAgent extends BaseAgent {
         yield { type: 'error', message: 'Cannot send empty message' };
         yield { type: 'complete' };
         return;
+      }
+
+      // ── ORCHESTRATOR RESUME DETECTION ─────────────────────────────
+      // Check if a paused orchestrator pipeline exists for this session.
+      // If so, route to resume() instead of run() — no [agent:] mention needed.
+      if (!_isRetry) {
+        const pausedOrch = this.detectPausedOrchestrator(sessionId);
+        if (pausedOrch) {
+          debug(`[chat] Detected paused orchestrator for agent=${pausedOrch.slug} — resuming`);
+          yield* this.resumeOrchestrator(userMessage, pausedOrch.agent);
+          return;
+        }
+      }
+
+      // ── ORCHESTRATOR DETECTION ──────────────────────────────────────
+      // Check if the message mentions an agent with orchestratable stages.
+      // If so, delegate to the deterministic orchestrator pipeline instead
+      // of the SDK's tool-calling loop. This ensures TypeScript controls
+      // stage execution, not the LLM.
+      if (!_isRetry) {
+        const orchestratableAgent = this.detectOrchestratableAgent(userMessage);
+        if (orchestratableAgent) {
+          debug(`[chat] Detected orchestratable agent: ${orchestratableAgent.slug} — delegating to orchestrator`);
+          yield* this.runOrchestrator(userMessage, orchestratableAgent);
+          return;
+        }
       }
 
       // Get centralized mini agent configuration (from BaseAgent)
@@ -1418,8 +1474,19 @@ export class ClaudeAgent extends BaseAgent {
             }
           }
 
-          // Capture session ID for conversation continuity (only when it changes)
-          if ('session_id' in message && message.session_id && message.session_id !== this.sessionId) {
+          // Capture session ID for conversation continuity.
+          // IMPORTANT: Only trust the canonical system:init message.
+          // Other SDK messages may carry session_id fields that are not safe to
+          // persist for resume, which can cause next-turn resume failures.
+          if (
+            'type' in message &&
+            message.type === 'system' &&
+            'subtype' in message &&
+            message.subtype === 'init' &&
+            'session_id' in message &&
+            message.session_id &&
+            message.session_id !== this.sessionId
+          ) {
             this.sessionId = message.session_id;
             // Notify caller of new SDK session ID (for immediate persistence)
             this.config.onSdkSessionIdUpdate?.(message.session_id);
@@ -1482,6 +1549,29 @@ export class ClaudeAgent extends BaseAgent {
                 this.onDebug?.(`Source "${sourceSlug}" activation error: ${error}`);
                 // Let original error through
               }
+            }
+
+            // ── Session-expiry recovery (result-error channel) ──────────────
+            // The SDK can deliver "No conversation found with session ID" as a
+            // result-error event rather than throwing.  Intercept BEFORE yielding
+            // so the user never sees the raw error.  One retry with a fresh
+            // session is attempted; if the retry also fails the catch block
+            // surfaces the error normally.
+            if (
+              event.type === 'error' &&
+              wasResuming &&
+              !_isRetry &&
+              isSessionExpiredError(event.message)
+            ) {
+              console.error('[ClaudeAgent] Session expired (result-error channel), clearing and retrying fresh');
+              debug('[SESSION_RECOVERY] result-error channel: detected session expiry, retrying fresh');
+              this.sessionId = null;
+              this.config.onSdkSessionIdCleared?.();
+              this.pinnedPreferencesPrompt = null;
+              this.preferencesDriftNotified = false;
+              yield { type: 'info', message: 'Session expired, restoring context...' };
+              yield* this.chat(userMessage, attachments, { isRetry: true });
+              return;
             }
 
             if (event.type === 'complete') {
@@ -1661,33 +1751,34 @@ export class ClaudeAgent extends BaseAgent {
         debug('[SESSION_DEBUG] lastStderrOutput length:', this.lastStderrOutput.length);
         debug('[SESSION_DEBUG] lastStderrOutput:', this.lastStderrOutput.join('\n'));
 
+        // ── Session-expiry recovery (catch-path) ─────────────────────────────
+        // Check both stderr and the main error message for session-expiry
+        // indicators.  This is hoisted ABOVE the isProcessError gate so that
+        // errors surfaced directly (not wrapped in "process exited with code")
+        // are also caught.  Only one retry is allowed (guarded by _isRetry).
+        const stderrContext = this.lastStderrOutput.length > 0
+          ? this.lastStderrOutput.join('\n')
+          : undefined;
+
+        const sessionExpiredInCatch =
+          isSessionExpiredError(stderrContext) ||
+          isSessionExpiredError(rawErrorMsg);
+
+        if (sessionExpiredInCatch && wasResuming && !_isRetry) {
+          debug('[SESSION_RECOVERY] catch-path: detected session expiry, retrying fresh');
+          console.error('[ClaudeAgent] SDK session expired (catch-path), clearing and retrying fresh');
+          this.sessionId = null;
+          this.config.onSdkSessionIdCleared?.();
+          this.pinnedPreferencesPrompt = null;
+          this.preferencesDriftNotified = false;
+          yield { type: 'info', message: 'Session expired, restoring context...' };
+          yield* this.chat(userMessage, attachments, { isRetry: true });
+          return;
+        }
+
         if (isProcessError) {
-          // Include captured stderr in diagnostics - this is often where the real error is
-          const stderrContext = this.lastStderrOutput.length > 0
-            ? this.lastStderrOutput.join('\n')
-            : undefined;
           if (stderrContext) {
             debug('[SDK process error] Captured stderr:', stderrContext);
-          }
-
-          // Check for expired session error - SDK session no longer exists server-side
-          // This happens when sessions expire (TTL) or are cleaned up by Anthropic
-          const isSessionExpired = stderrContext?.includes('No conversation found with session ID');
-          debug('[SESSION_DEBUG] isSessionExpired:', isSessionExpired);
-
-          if (isSessionExpired && wasResuming && !_isRetry) {
-            debug('[SESSION_DEBUG] >>> TAKING PATH: Session expired recovery');
-            console.error('[ClaudeAgent] SDK session expired server-side, clearing and retrying fresh');
-            debug('[ClaudeAgent] SDK session expired server-side, clearing and retrying fresh');
-            this.sessionId = null;
-            // Clear pinned state so retry captures fresh values
-            this.pinnedPreferencesPrompt = null;
-            this.preferencesDriftNotified = false;
-            // Use 'info' instead of 'status' to show message without spinner
-            yield { type: 'info', message: 'Session expired, restoring context...' };
-            // Recursively call with isRetry=true (yield* delegates all events)
-            yield* this.chat(userMessage, attachments, { isRetry: true });
-            return;
           }
 
           // Check for Windows SDK setup error (missing .claude/skills directory)
@@ -1762,8 +1853,9 @@ export class ClaudeAgent extends BaseAgent {
         // Session-related retry: only if we were resuming and haven't retried yet
         debug('[SESSION_DEBUG] isProcessError=false, checking wasResuming fallback');
         if (wasResuming && !_isRetry) {
-          debug('[SESSION_DEBUG] >>> TAKING PATH: wasResuming fallback retry');
+          debug('[SESSION_RECOVERY] wasResuming fallback retry');
           this.sessionId = null;
+          this.config.onSdkSessionIdCleared?.();
           // Clear pinned state so retry captures fresh values
           this.pinnedPreferencesPrompt = null;
           this.preferencesDriftNotified = false;
@@ -2915,6 +3007,660 @@ export class ClaudeAgent extends BaseAgent {
       this.debug(`[runMiniCompletion] Failed: ${error}`);
       return null;
     }
+  }
+
+  // ============================================================
+  // Orchestrator — Deterministic Pipeline (Phase 6)
+  // ============================================================
+
+  /**
+   * Detect if the user message mentions an agent with orchestratable stages.
+   *
+   * Returns the first matched LoadedAgent that has controlFlow.stages defined,
+   * or null if the message doesn't mention an orchestrable agent.
+   *
+   * Detection logic:
+   * 1. Parse [agent:slug] mentions from the message
+   * 2. Load each mentioned agent's config.json
+   * 3. Return first agent with controlFlow.stages.length > 0
+   */
+  private detectOrchestratableAgent(userMessage: string): LoadedAgent | null {
+    if (!userMessage.includes('[agent:')) return null;
+
+    // Parse agent mentions — we only need agent slugs
+    const allAgentSlugs = this.getAllAgentSlugs();
+    const parsed = parseMentions(userMessage, [], [], allAgentSlugs);
+
+    if (parsed.agents.length === 0) return null;
+
+    // Find the first agent that has orchestratable stages
+    for (const slug of parsed.agents) {
+      const agent = loadAgent(this.workspaceRootPath, slug);
+      if (agent && agent.config?.controlFlow?.stages?.length > 0) {
+        return agent;
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Get all available agent slugs in the workspace.
+   * Uses loadWorkspaceAgents to extract slugs for mention parsing.
+   */
+  private getAllAgentSlugs(): string[] {
+    try {
+      return loadWorkspaceAgents(this.workspaceRootPath).map(a => a.slug);
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Detect if an orchestrator pipeline is paused for this session.
+   *
+   * Reads pipeline-state.json from the session's data directory.
+   * If the pipeline is paused, loads the agent and returns it.
+   * Used by chat() to route resume messages to orchestrator.resume()
+   * instead of SDK query().
+   *
+   * @param sessionId - Current session ID
+   * @returns Agent info if a paused orchestrator pipeline exists, null otherwise
+   */
+  private detectPausedOrchestrator(sessionId: string): { slug: string; agent: LoadedAgent } | null {
+    try {
+      const sessionPath = getSessionPath(this.workspaceRootPath, sessionId);
+      const state = PipelineState.loadFrom(sessionPath);
+      if (!state || !state.isPaused) return null;
+
+      // Section 16 (G2): Primary path — use agentSlug from pipeline-state.json directly
+      if (state.agentSlug) {
+        const agent = loadAgent(this.workspaceRootPath, state.agentSlug);
+        if (agent) {
+          this.onDebug?.(`[orchestrator] detectPausedOrchestrator: found via pipeline-state.json agentSlug=${state.agentSlug}`);
+          return { slug: state.agentSlug, agent };
+        }
+      }
+
+      // Fallback: scan bridge state files (backward compat for old pipeline-state.json without agentSlug)
+      const agentsDir = join(sessionPath, 'data', 'agents');
+      if (!existsSync(agentsDir)) return null;
+
+      const { readdirSync } = require('fs') as typeof import('fs');
+      const slugs = readdirSync(agentsDir, { withFileTypes: true })
+        .filter((d: { isDirectory: () => boolean }) => d.isDirectory())
+        .map((d: { name: string }) => d.name);
+
+      for (const slug of slugs) {
+        const bridgePath = join(agentsDir, slug, 'current-run-state.json');
+        if (!existsSync(bridgePath)) continue;
+
+        try {
+          const bridgeState = JSON.parse(readFileSync(bridgePath, 'utf-8'));
+          if (bridgeState.orchestratorMode && bridgeState.pausedAtStage !== undefined) {
+            const agent = loadAgent(this.workspaceRootPath, slug);
+            if (agent) {
+              this.onDebug?.(`[orchestrator] detectPausedOrchestrator: found via bridge state slug=${slug}`);
+              return { slug, agent };
+            }
+          }
+        } catch {
+          // Corrupted bridge state — skip
+        }
+      }
+
+      this.onDebug?.(`[orchestrator] detectPausedOrchestrator: pipeline isPaused but no agent found`);
+    } catch {
+      // Cannot read session state — not paused
+    }
+    return null;
+  }
+
+  /**
+   * Write a bridge state file so the session layer (sessions.ts) can detect
+   * that an orchestrator pipeline is paused.
+   *
+   * The session layer reads `{sessionPath}/data/agents/{slug}/current-run-state.json`
+   * to detect paused pipelines (for queue drain hold and UI state).
+   * The `orchestratorMode: true` flag distinguishes orchestrator from SDK pipelines.
+   */
+  private writeOrchestratorBridgeState(
+    sessionPath: string, agentSlug: string, stage: number, runId: string,
+  ): void {
+    const agentDataDir = join(sessionPath, 'data', 'agents', agentSlug);
+    mkdirSync(agentDataDir, { recursive: true });
+    const statePath = join(agentDataDir, 'current-run-state.json');
+    writeFileSync(statePath, JSON.stringify({
+      runId,
+      pausedAtStage: stage,
+      orchestratorMode: true,
+      currentStage: stage,
+      completedStages: Array.from({ length: stage + 1 }, (_, i) => i),
+      startedAt: new Date().toISOString(),
+      lastEventAt: new Date().toISOString(),
+    }, null, 2), 'utf-8');
+    this.onDebug?.(`[orchestrator] writeOrchestratorBridgeState: agent=${agentSlug} stage=${stage} runId=${runId} path=${statePath}`);
+  }
+
+  /**
+   * Clear the bridge state file after orchestrator completes, errors, or resumes.
+   * Prevents stale paused-pipeline detection on subsequent messages.
+   */
+  private clearOrchestratorBridgeState(sessionPath: string, agentSlug: string): void {
+    try {
+      const statePath = join(sessionPath, 'data', 'agents', agentSlug, 'current-run-state.json');
+      const existed = existsSync(statePath);
+      if (existed) unlinkSync(statePath);
+      this.onDebug?.(`[orchestrator] clearOrchestratorBridgeState: agent=${agentSlug} existed=${existed}`);
+    } catch {
+      // Best-effort cleanup — non-fatal
+    }
+  }
+
+  /**
+   * Detect if the current session has a completed prior orchestrator run.
+   * Returns the session ID to use as previousSessionId, or undefined.
+   *
+   * Strategy: Check if `{sessionPath}/data/answer.json` exists.
+   * If it does AND the agent has followUp.enabled, this is a follow-up.
+   * The previousSessionId is the CURRENT session ID (same-session follow-up).
+   *
+   * Only activates when the agent's config has `followUp.enabled: true`.
+   * Cross-session follow-ups are out of scope — future enhancement via explicit UI.
+   */
+  private resolveFollowUpSessionId(
+    sessionPath: string,
+    sessionId: string,
+    agentConfig: OrchestratorAgentConfig,
+  ): string | undefined {
+    if (!agentConfig.followUp?.enabled) return undefined;
+
+    const answerJsonPath = join(sessionPath, 'data', 'answer.json');
+    if (!existsSync(answerJsonPath)) return undefined;
+
+    this.onDebug?.(
+      `[orchestrator] Follow-up auto-detected: answer.json exists at ${answerJsonPath}`,
+    );
+    return sessionId;
+  }
+
+  /**
+   * Convert a LoadedAgent's config to the orchestrator's AgentConfig type.
+   * Maps from the richer agents/types.ts AgentConfig to the simpler orchestrator/types.ts AgentConfig.
+   */
+  private toOrchestratorAgentConfig(agent: LoadedAgent): OrchestratorAgentConfig {
+    const cfg = agent.config;
+    return {
+      slug: agent.slug,
+      name: agent.metadata.name,
+      controlFlow: {
+        stages: cfg.controlFlow.stages.map(s => ({
+          id: s.id,
+          name: s.name,
+          description: s.description,
+        })),
+        pauseAfterStages: cfg.controlFlow.pauseAfterStages,
+        repairUnits: cfg.controlFlow.repairUnits?.map(ru => ({
+          stages: Array.isArray(ru.stages) ? [...ru.stages] : [],
+          maxIterations: ru.maxIterations,
+          feedbackField: ru.feedbackField,
+        })),
+      },
+      output: {
+        titleTemplate: (cfg.output as unknown as Record<string, unknown>)?.['titleTemplate'] as string | undefined,
+        citationFormat: cfg.output?.citationFormat,
+      },
+      // Pass through orchestrator config from config.json (F1 fix)
+      // Maps from agents/types.ts inline type to orchestrator/types.ts OrchestratorConfig
+      orchestrator: cfg.orchestrator?.enabled
+        ? {
+            enabled: true,
+            model: cfg.orchestrator.model,
+            thinking: cfg.orchestrator.thinking as { type: 'adaptive' | 'enabled' | 'disabled' } | undefined,
+            effort: cfg.orchestrator.effort as 'max' | 'high' | 'medium' | 'low' | undefined,
+            depthModeEffort: cfg.orchestrator.depthModeEffort,
+            contextWindow: cfg.orchestrator.contextWindow,
+            minOutputBudget: cfg.orchestrator.minOutputBudget,
+            budgetUsd: cfg.orchestrator.budgetUsd,
+            perStageDesiredTokens: cfg.orchestrator.perStageDesiredTokens
+              ? Object.fromEntries(
+                  Object.entries(cfg.orchestrator.perStageDesiredTokens)
+                    .map(([k, v]) => [Number(k), v]),
+                ) as Record<number, number>
+              : undefined,
+            useBAML: cfg.orchestrator.useBAML,
+            bamlFallbackToZod: cfg.orchestrator.bamlFallbackToZod,
+          }
+        : undefined,
+      // Resolve per-stage prompt files from agent directory (Phase 7)
+      promptsDir: agent.path ? join(agent.path, 'prompts') : undefined,
+      // Follow-up configuration for delta retrieval gating (Section 18)
+      followUp: cfg.followUp ? {
+        enabled: cfg.followUp.enabled,
+        deltaRetrieval: cfg.followUp.deltaRetrieval,
+      } : undefined,
+    };
+  }
+
+  /**
+   * Get an auth token for the orchestrator's LLM client.
+   * Reads from the same env vars that sessions.ts sets before creating the agent.
+   * OAuth token is preferred; falls back to API key.
+   */
+  private async getOrchestratorAuthToken(): Promise<string> {
+    const oauthToken = process.env['CLAUDE_CODE_OAUTH_TOKEN'];
+    if (oauthToken) return oauthToken;
+
+    const apiKey = process.env['ANTHROPIC_API_KEY'];
+    if (apiKey) return apiKey;
+
+    throw new Error('No auth token available for orchestrator. Set CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY.');
+  }
+
+  /**
+   * Run the deterministic orchestrator pipeline instead of SDK query().
+   *
+   * Maps OrchestratorEvent → onAgentEvent callback (for stage/pipeline events)
+   * and yields AgentEvent (for text/complete events that flow through chat()).
+   *
+   * Event architecture:
+   * - Stage events (started, completed, repair, pause, run_completed) →
+   *   emitted via this.onAgentEvent callback → sessions.ts → renderer
+   * - Text content → yielded as AgentEvent { type: 'text_delta' / 'text_complete' }
+   * - Completion → yielded as AgentEvent { type: 'complete' }
+   *
+   * This matches the existing event flow pattern used by session-scoped tools
+   * (agent_stage_gate), ensuring the renderer's event processor and agentRunStateAtom
+   * work identically for both SDK-driven and orchestrator-driven pipelines.
+   */
+  private async *runOrchestrator(
+    userMessage: string,
+    loadedAgent: LoadedAgent,
+  ): AsyncGenerator<AgentEvent> {
+    const sessionId = this.config.session?.id ?? `orch-${Date.now()}`;
+    const sessionPath = getSessionPath(this.workspaceRootPath, sessionId);
+    const agentConfig = this.toOrchestratorAgentConfig(loadedAgent);
+    const runId = `orch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const agentSlug = loadedAgent.slug;
+
+    this.onDebug?.(`[orchestrator] Starting pipeline for agent=${agentSlug} runId=${runId}`);
+
+    // Section 16 (G3): Track exit reason to conditionally clear bridge state
+    let exitReason: OrchestratorExitReason = 'completed';
+
+    // Create cost tracker with budget from agent config or default
+    const budgetUsd = agentConfig.orchestrator?.budgetUsd ?? 50;
+    const costTracker = new CostTracker({ budgetUsd });
+
+    // ── MCP Bridge wiring ──────────────────────────────────────────────
+    // Connect to the agent's required MCP source for programmatic tool calls.
+    // The lifecycle manager ensures cleanup on completion or error.
+    let mcpBridge: OrchestratorMcpBridge_T | null = null;
+    const mcpLifecycle = new McpLifecycleManager();
+
+    try {
+      // Find first required MCP source from agent metadata
+      const mcpSourceSlug = loadedAgent.metadata.sources
+        ?.find(s => s.required)?.slug;
+
+      if (mcpSourceSlug) {
+        try {
+          const sourceConfig = loadSourceConfig(this.workspaceRootPath, mcpSourceSlug);
+          if (sourceConfig?.mcp) {
+            const hasWebsearchStage = agentConfig.controlFlow.stages.some(s => s.name === 'websearch_calibration');
+            if (hasWebsearchStage && !process.env['BRAVE_API_KEY']) {
+              this.onDebug?.(
+                '[orchestrator] Warning: BRAVE_API_KEY is not set. ' +
+                'Stage 1 web search may return zero results; calibration will be skipped deterministically.',
+              );
+            }
+            const transportConfig = extractTransportConfig(
+              sourceConfig.mcp as unknown as Record<string, unknown>,
+              this.workspaceRootPath,
+            );
+            this.onDebug?.(
+              `[orchestrator] MCP bridge connect attempt: source=${mcpSourceSlug} ` +
+              `transport=${transportConfig.transport} command=${transportConfig.command ?? '<none>'} ` +
+              `cwd=${transportConfig.cwd ?? '<none>'}`,
+            );
+            const mcpClient = await mcpLifecycle.connect(transportConfig);
+            mcpBridge = new OrchestratorMcpBridge(mcpClient);
+            this.onDebug?.(`[orchestrator] MCP bridge connected: ${mcpSourceSlug}`);
+          } else {
+            this.onDebug?.(`[orchestrator] Source '${mcpSourceSlug}' has no MCP config — bridge skipped`);
+          }
+        } catch (mcpError) {
+          // MCP connection failure is non-fatal — stages 2/4 have null-bridge guards
+          this.onDebug?.(
+            `[orchestrator] MCP bridge connection failed (non-fatal): ` +
+            `${mcpError instanceof Error ? mcpError.message : String(mcpError)}`,
+          );
+        }
+      }
+
+      // ── Follow-up auto-detection (Section 21) ─────────────────────
+      // Check if a prior completed orchestrator run exists in the same session.
+      // If so, pass its session ID so follow-up context is loaded at pipeline start.
+      const previousSessionId = this.resolveFollowUpSessionId(sessionPath, sessionId, agentConfig);
+      if (previousSessionId) {
+        this.onDebug?.(
+          `[orchestrator] Follow-up mode: previousSessionId=${previousSessionId} (same-session auto-detect)`,
+        );
+      }
+
+      // ── Create orchestrator instance ───────────────────────────────
+      // Inside try block so create() failures are caught and yield 'complete' (F7 fix)
+      const orchestrator = AgentOrchestrator.create(
+        {
+          sessionId,
+          sessionPath,
+          getAuthToken: () => this.getOrchestratorAuthToken(),
+          onStreamEvent: (event) => {
+            // Forward text deltas for debug logging.
+            // Real-time streaming to UI is limited by the generator pattern —
+            // callbacks can't yield. Stage text is accumulated and yielded
+            // as intermediate text events between stages (F5 mitigation).
+            if (event.type === 'text_delta' && event.text) {
+              this.onDebug?.(`[orchestrator] stream: ${event.text.slice(0, 50)}...`);
+            }
+          },
+          onDebug: this.onDebug ? (msg: string) => this.onDebug?.(msg) : undefined,
+          previousSessionId, // Section 21: auto-detected from prior answer.json
+        },
+        mcpBridge,
+        costTracker,
+        agentConfig.orchestrator ?? undefined,
+      );
+
+      // ── Pipeline event loop ────────────────────────────────────────
+      exitReason = yield* this.processOrchestratorEvents(
+        orchestrator.run(userMessage, agentConfig),
+        agentSlug, runId, sessionPath,
+      );
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      this.onDebug?.(`[orchestrator] Pipeline error: ${errorMessage}`);
+      yield { type: 'error', message: `Orchestrator error: ${errorMessage}` };
+      this.onAgentEvent?.({
+        type: 'agent_run_completed',
+        agentSlug,
+        runId,
+        data: { verificationStatus: 'error', error: errorMessage },
+      });
+      exitReason = 'error';
+    }
+
+    // Always yield complete at the end (F7 fix — now reachable even if create() throws)
+    // Section 16: Wrap in try/finally so MCP cleanup runs even when
+    // sessions.ts returns from the for-await loop on 'complete' (which
+    // calls generator.return(), making post-yield code unreachable).
+    // Bridge state is only cleared on 'completed' exit — preserved on 'paused' for resume detection.
+    try {
+      yield { type: 'complete' };
+    } finally {
+      this.onDebug?.(`[orchestrator] Cleanup: exitReason=${exitReason}`);
+      // Only clear bridge state when pipeline is done — preserve on pause for resume detection (G4)
+      if (exitReason !== 'paused') {
+        this.clearOrchestratorBridgeState(sessionPath, agentSlug);
+      }
+      // Ensure MCP client is closed — guaranteed by finally block (all exit paths)
+      try {
+        await mcpLifecycle.close();
+      } catch {
+        // Best-effort MCP cleanup
+      }
+    }
+  }
+
+  /**
+   * Resume a paused orchestrator pipeline.
+   *
+   * Called when the user sends a follow-up message and a paused orchestrator
+   * pipeline is detected for the session. Routes to orchestrator.resume()
+   * instead of orchestrator.run().
+   */
+  private async *resumeOrchestrator(
+    userMessage: string,
+    loadedAgent: LoadedAgent,
+  ): AsyncGenerator<AgentEvent> {
+    const sessionId = this.config.session?.id ?? `orch-${Date.now()}`;
+    const sessionPath = getSessionPath(this.workspaceRootPath, sessionId);
+    const agentConfig = this.toOrchestratorAgentConfig(loadedAgent);
+    const runId = `orch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const agentSlug = loadedAgent.slug;
+
+    this.onDebug?.(`[orchestrator] Resuming pipeline for agent=${agentSlug} runId=${runId}`);
+
+    // Section 16 (G3): Track exit reason to conditionally clear bridge state
+    let exitReason: OrchestratorExitReason = 'completed';
+
+    // Section 16 (G7): Do NOT clear bridge state before pipeline starts.
+    // If MCP connect fails or resume throws, bridge state must survive for retry.
+    // Conditional clear in the finally block handles all exits.
+
+    // Re-create cost tracker (costs from earlier stages are in pipeline-state.json, not tracked here)
+    const budgetUsd = agentConfig.orchestrator?.budgetUsd ?? 50;
+    const costTracker = new CostTracker({ budgetUsd });
+
+    // ── MCP Bridge wiring (same as runOrchestrator) ────────────────
+    let mcpBridge: OrchestratorMcpBridge_T | null = null;
+    const mcpLifecycle = new McpLifecycleManager();
+
+    try {
+      const mcpSourceSlug = loadedAgent.metadata.sources
+        ?.find(s => s.required)?.slug;
+
+      if (mcpSourceSlug) {
+        try {
+          const sourceConfig = loadSourceConfig(this.workspaceRootPath, mcpSourceSlug);
+          if (sourceConfig?.mcp) {
+            const hasWebsearchStage = agentConfig.controlFlow.stages.some(s => s.name === 'websearch_calibration');
+            if (hasWebsearchStage && !process.env['BRAVE_API_KEY']) {
+              this.onDebug?.(
+                '[orchestrator] Warning: BRAVE_API_KEY is not set. ' +
+                'Stage 1 web search may return zero results; calibration will be skipped deterministically.',
+              );
+            }
+            const transportConfig = extractTransportConfig(
+              sourceConfig.mcp as unknown as Record<string, unknown>,
+              this.workspaceRootPath,
+            );
+            this.onDebug?.(
+              `[orchestrator] MCP bridge connect attempt (resume): source=${mcpSourceSlug} ` +
+              `transport=${transportConfig.transport} command=${transportConfig.command ?? '<none>'} ` +
+              `cwd=${transportConfig.cwd ?? '<none>'}`,
+            );
+            const mcpClient = await mcpLifecycle.connect(transportConfig);
+            mcpBridge = new OrchestratorMcpBridge(mcpClient);
+            this.onDebug?.(`[orchestrator] MCP bridge connected for resume: ${mcpSourceSlug}`);
+          }
+        } catch (mcpError) {
+          this.onDebug?.(
+            `[orchestrator] MCP bridge connection failed on resume (non-fatal): ` +
+            `${mcpError instanceof Error ? mcpError.message : String(mcpError)}`,
+          );
+        }
+      }
+
+      // Create orchestrator instance for resume
+      const orchestrator = AgentOrchestrator.create(
+        {
+          sessionId,
+          sessionPath,
+          getAuthToken: () => this.getOrchestratorAuthToken(),
+          onStreamEvent: (event) => {
+            if (event.type === 'text_delta' && event.text) {
+              this.onDebug?.(`[orchestrator] resume stream: ${event.text.slice(0, 50)}...`);
+            }
+          },
+          onDebug: this.onDebug ? (msg: string) => this.onDebug?.(msg) : undefined,
+        },
+        mcpBridge,
+        costTracker,
+        agentConfig.orchestrator ?? undefined,
+      );
+
+      // ── Resume pipeline from paused state ──────────────────────────
+      exitReason = yield* this.processOrchestratorEvents(
+        orchestrator.resume(userMessage, agentConfig),
+        agentSlug, runId, sessionPath,
+      );
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      this.onDebug?.(`[orchestrator] Resume error: ${errorMessage}`);
+      yield { type: 'error', message: `Orchestrator resume error: ${errorMessage}` };
+      this.onAgentEvent?.({
+        type: 'agent_run_completed',
+        agentSlug,
+        runId,
+        data: { verificationStatus: 'error', error: errorMessage },
+      });
+      exitReason = 'error';
+    }
+
+    // Section 16: Wrap in try/finally so MCP cleanup runs even when
+    // sessions.ts returns from the for-await loop on 'complete' (which
+    // calls generator.return(), making post-yield code unreachable).
+    // Bridge state is only cleared on 'completed' exit — preserved on 'paused' for resume detection.
+    try {
+      yield { type: 'complete' };
+    } finally {
+      this.onDebug?.(`[orchestrator] Resume cleanup: exitReason=${exitReason}`);
+      // Only clear bridge state when pipeline is done — preserve on pause for resume detection (G4)
+      if (exitReason !== 'paused') {
+        this.clearOrchestratorBridgeState(sessionPath, agentSlug);
+      }
+      // Ensure MCP client is closed — guaranteed by finally block (all exit paths)
+      try {
+        await mcpLifecycle.close();
+      } catch {
+        // Best-effort MCP cleanup
+      }
+    }
+  }
+
+  /**
+   * Process orchestrator events — shared between run() and resume().
+   *
+   * Maps OrchestratorEvent → AgentEvent yields + onAgentEvent callbacks.
+   * Extracts the common event loop to avoid code duplication between
+   * runOrchestrator() and resumeOrchestrator().
+   */
+  private async *processOrchestratorEvents(
+    events: AsyncGenerator<import('./orchestrator/types.ts').OrchestratorEvent>,
+    agentSlug: string,
+    runId: string,
+    sessionPath: string,
+  ): AsyncGenerator<AgentEvent, OrchestratorExitReason> {
+    // Section 16 (G3): Track exit reason as generator return value
+    let exitReason: OrchestratorExitReason = 'completed';
+
+    for await (const event of events) {
+      switch (event.type) {
+        case 'orchestrator_stage_start':
+          this.onAgentEvent?.({
+            type: 'agent_stage_started',
+            agentSlug,
+            runId,
+            data: {
+              stage: event.stage,
+              stageName: event.name,
+            },
+          });
+          break;
+
+        case 'orchestrator_stage_complete':
+          this.onAgentEvent?.({
+            type: 'agent_stage_completed',
+            agentSlug,
+            runId,
+            data: {
+              stage: event.stage,
+              stageName: event.name,
+              ...(event.stageOutput ?? {}),
+            },
+          });
+          // F5: Yield intermediate text so UI shows stage progress between LLM calls
+          yield {
+            type: 'text_complete',
+            text: `**Stage ${event.stage} (${event.name})** completed.`,
+            isIntermediate: true,
+          };
+          break;
+
+        case 'orchestrator_repair_start':
+          this.onAgentEvent?.({
+            type: 'agent_repair_iteration',
+            agentSlug,
+            runId,
+            data: {
+              iteration: event.iteration,
+              scores: event.scores,
+            },
+          });
+          break;
+
+        case 'orchestrator_pause':
+          // Section 16 (G8): Write bridge state BEFORE yield to prevent generator.return() cancellation
+          this.writeOrchestratorBridgeState(sessionPath, agentSlug, event.stage, runId);
+
+          // Yield pause message as assistant text so user sees the analysis
+          yield { type: 'text_complete', text: event.message, isIntermediate: false };
+
+          // Emit stage gate pause for renderer's agentRunStateAtom
+          this.onAgentStagePause?.({
+            agentSlug,
+            stage: event.stage,
+            runId,
+            data: { message: event.message, orchestratorMode: true },
+          });
+          exitReason = 'paused';
+          break;
+
+        case 'orchestrator_complete':
+          this.onAgentEvent?.({
+            type: 'agent_run_completed',
+            agentSlug,
+            runId,
+            data: {
+              verificationStatus: 'completed',
+              totalCostUsd: event.totalCostUsd,
+              stageCount: event.stageCount,
+            },
+          });
+          exitReason = 'completed';
+          break;
+
+        case 'orchestrator_budget_exceeded':
+          yield { type: 'error', message: `Budget exceeded: $${event.totalCost.toFixed(2)}` };
+          this.onAgentEvent?.({
+            type: 'agent_run_completed',
+            agentSlug,
+            runId,
+            data: { verificationStatus: 'budget_exceeded' },
+          });
+          exitReason = 'error';
+          break;
+
+        case 'text':
+          yield { type: 'text_complete', text: event.text, isIntermediate: false };
+          break;
+
+        case 'orchestrator_error':
+          yield { type: 'error', message: `Stage ${event.stage} error: ${event.error}` };
+          this.onAgentEvent?.({
+            type: 'agent_run_completed',
+            agentSlug,
+            runId,
+            data: { verificationStatus: 'error', error: event.error },
+          });
+          exitReason = 'error';
+          break;
+      }
+    }
+
+    this.onDebug?.(`[orchestrator] processOrchestratorEvents exiting: exitReason=${exitReason}`);
+    return exitReason;
   }
 
   // ============================================================

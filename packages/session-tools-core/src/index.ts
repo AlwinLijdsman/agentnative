@@ -151,6 +151,8 @@ export {
   handleAgentState,
   // Agent Validate
   handleAgentValidate,
+  // Agent Render Output
+  handleAgentRenderOutput,
 } from './handlers/index.ts';
 
 export type {
@@ -167,4 +169,5 @@ export type {
   AgentStageGateArgs,
   AgentStateArgs,
   AgentValidateArgs,
+  AgentRenderOutputArgs,
 } from './handlers/index.ts';

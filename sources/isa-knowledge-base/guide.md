@@ -9,6 +9,14 @@ MCP source providing hybrid search, graph traversal, verification, context forma
 - `VOYAGE_API_KEY` for vector search (optional — falls back to keyword-only without it)
 - `BRAVE_API_KEY` for web search enrichment (optional — returns empty gracefully without it)
 
+### Runtime environment note (Electron + MCP subprocess)
+
+`isa_web_search` reads `BRAVE_API_KEY` from the process environment inherited by the MCP subprocess.
+
+- Recommended: set `BRAVE_API_KEY` in your shell/user environment before launching Agentnative.
+- Do **not** store `BRAVE_API_KEY` in `sources/*/config.json`.
+- If missing, Stage 1 web search degrades safely to zero results with warnings.
+
 ## Tools
 
 ### Search & Retrieval (Phase 12)

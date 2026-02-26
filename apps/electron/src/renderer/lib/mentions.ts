@@ -19,14 +19,6 @@ import { parseMentions, stripAllMentions, type ParsedMentions } from '@craft-age
 export { parseMentions, stripAllMentions, type ParsedMentions }
 
 // ============================================================================
-// Constants
-// ============================================================================
-
-// Workspace ID character class for regex: word chars, spaces (NOT newlines), hyphens, dots
-// Using literal space instead of \s to avoid matching newlines which would break parsing
-const WS_ID_CHARS = '[\\w .-]'
-
-// ============================================================================
 // Types
 // ============================================================================
 
@@ -78,7 +70,7 @@ export function findMentionMatches(
   // Match skill mentions: [skill:slug] or [skill:workspaceId:slug]
   // The pattern captures the full match and extracts the slug (last component)
   // Workspace IDs can contain spaces, hyphens, underscores, and dots
-  const skillPattern = new RegExp(`(\\[skill:(?:${WS_ID_CHARS}+:)?([\\w-]+)\\])`, 'g')
+  const skillPattern = /(\[skill:(?:[^\]]*:)?([\w-]+)\])/g
   while ((match = skillPattern.exec(text)) !== null) {
     const slug = match[2]
     if (availableSkillSlugs.includes(slug)) {
@@ -92,7 +84,7 @@ export function findMentionMatches(
   }
 
   // Match agent mentions: [agent:slug] or [agent:workspaceId:slug]
-  const agentPattern = new RegExp(`(\\[agent:(?:${WS_ID_CHARS}+:)?([\\w-]+)\\])`, 'g')
+  const agentPattern = /(\[agent:(?:[^\]]*:)?([\w-]+)\])/g
   while ((match = agentPattern.exec(text)) !== null) {
     const slug = match[2]
     if (availableAgentSlugs.includes(slug)) {
@@ -154,13 +146,13 @@ export function removeMention(text: string, type: MentionItemType, id: string): 
       break
     case 'agent':
       // Match both [agent:slug] and [agent:workspaceId:slug]
-      pattern = new RegExp(`\\[agent:(?:${WS_ID_CHARS}+:)?${escapeRegExp(id)}\\]`, 'g')
+      pattern = new RegExp(`\\[agent:(?:[^\\]]*:)?${escapeRegExp(id)}\\]`, 'g')
       break
     case 'skill':
     default:
       // Match both [skill:slug] and [skill:workspaceId:slug]
       // Workspace IDs can contain spaces, hyphens, underscores, and dots
-      pattern = new RegExp(`\\[skill:(?:${WS_ID_CHARS}+:)?${escapeRegExp(id)}\\]`, 'g')
+      pattern = new RegExp(`\\[skill:(?:[^\\]]*:)?${escapeRegExp(id)}\\]`, 'g')
       break
   }
 

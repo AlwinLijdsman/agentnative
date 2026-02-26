@@ -6,7 +6,11 @@
   "main": "src/index.ts",
   "types": "src/index.ts",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./renderer": "./src/handlers/agent-render-output/renderer.ts",
+    "./renderer-types": "./src/handlers/agent-render-output/types.ts",
+    "./renderer-config": "./src/handlers/agent-render-output/config-loader.ts",
+    "./renderer-linker": "./src/handlers/agent-render-output/source-linker.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",

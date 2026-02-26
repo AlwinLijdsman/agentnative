@@ -24,6 +24,7 @@ import {
 import type { SessionToolContext } from '../context.ts';
 import type { ToolResult } from '../types.ts';
 import { successResponse, errorResponse } from '../response.ts';
+import { injectSourceBlocks } from './agent-render-output/renderer.ts';
 
 // ============================================================
 // Types
@@ -100,7 +101,11 @@ interface StageGateConfig {
 /**
  * Lightweight JSON schema for validating stage outputs.
  * Intentionally simple — no external deps, ~80 lines.
- * Validation emits warnings, never blocks completion.
+ *
+ * Enforcement modes:
+ * - "warn" (default): validation emits warnings but never blocks completion.
+ * - "block": validation failures return allowed:false with a repair message,
+ *   forcing the agent to fix the output before the stage can complete.
  */
 interface StageOutputSchemaProperty {
   type?: 'string' | 'number' | 'boolean' | 'array' | 'object';
@@ -113,6 +118,10 @@ interface StageOutputSchemaProperty {
 interface StageOutputSchema {
   required?: string[];
   properties?: Record<string, StageOutputSchemaProperty>;
+  /** When "block", validation failures prevent stage completion. Default: "warn". */
+  enforcement?: 'warn' | 'block';
+  /** Message returned to the agent when enforcement is "block" and validation fails. */
+  blockMessage?: string;
 }
 
 interface ValidationResult {
@@ -654,7 +663,8 @@ function handleComplete(
 
   state.lastEventAt = now;
 
-  // Stage output schema validation (warnings only, never blocks)
+  // Stage output schema validation
+  // Enforcement modes: "warn" (default) logs warnings; "block" rejects completion.
   let validationWarnings: string[] | undefined;
   if (args.data && config.controlFlow.stageOutputSchemas) {
     const schema = config.controlFlow.stageOutputSchemas[String(stage)];
@@ -662,13 +672,143 @@ function handleComplete(
       const validation = validateStageOutput(args.data, schema);
       if (!validation.valid) {
         validationWarnings = validation.warnings;
+        const enforcement = schema.enforcement ?? 'warn';
+
         appendEvent(ctx, args.agentSlug, {
-          type: 'stage_output_validation_warning',
+          type: enforcement === 'block' ? 'stage_output_validation_blocked' : 'stage_output_validation_warning',
           timestamp: now,
           runId: state.runId,
-          data: { stage, warnings: validation.warnings },
+          data: { stage, warnings: validation.warnings, enforcement },
         });
+
+        // Block completion when enforcement is "block"
+        if (enforcement === 'block') {
+          // Undo the stage completion — remove from completedStages
+          state.completedStages = state.completedStages.filter((s) => s !== stage);
+          state.lastEventAt = now;
+          writeRunState(ctx, args.agentSlug, state);
+
+          const repairMessage = schema.blockMessage
+            ?? `Stage ${stage} output validation failed. Fix the following issues and re-complete the stage: ${validation.warnings.join('; ')}`;
+
+          return makeResult(state, config, {
+            allowed: false,
+            reason: repairMessage,
+            validationWarnings,
+          });
+        }
       }
+    }
+  }
+
+  // Post-validation: verify Stage 5 output file actually exists on disk.
+  // Schema validation only checks field presence/type — this ensures the agent
+  // actually wrote the file before claiming answer_delivered: true.
+  if (stage === 5 && args.data?.output_file_path && typeof args.data.output_file_path === 'string') {
+    const rawPath = args.data.output_file_path as string;
+    // Strip leading ./ for consistent path resolution
+    const fileName = rawPath.replace(/^\.\//, '');
+    // Detect absolute paths: Windows drive letter (C:\) or Unix root (/)
+    const isAbsolute = /^[a-zA-Z]:[\\/]/.test(rawPath) || rawPath.startsWith('/');
+
+    // Build candidate paths based on whether the path is absolute or relative.
+    // Absolute paths are checked directly first (agent in safe mode writes to plans
+    // folder and may provide the full path). Relative paths are resolved against
+    // common write targets.
+    const candidatePaths: string[] = [];
+    if (isAbsolute) {
+      // Absolute path — check it directly first
+      candidatePaths.push(rawPath);
+    }
+    // Always check plans folder, session root, and process CWD with the basename
+    const baseName = rawPath.replace(/^.*[\\/]/, ''); // Extract filename from any path
+    candidatePaths.push(
+      join(ctx.plansFolderPath, baseName),
+      join(ctx.workspacePath, 'sessions', ctx.sessionId, baseName),
+      join(process.cwd(), baseName),
+    );
+    // For relative paths (not absolute, not starting with ./), also try the raw path
+    if (!isAbsolute && fileName !== baseName) {
+      candidatePaths.push(join(ctx.plansFolderPath, fileName));
+    }
+
+    const foundPath = candidatePaths.find((p) => ctx.fs.exists(p));
+
+    if (!foundPath) {
+      // File doesn't exist — block completion
+      state.completedStages = state.completedStages.filter((s) => s !== stage);
+      state.lastEventAt = now;
+      writeRunState(ctx, args.agentSlug, state);
+
+      appendEvent(ctx, args.agentSlug, {
+        type: 'stage_output_file_missing',
+        timestamp: now,
+        runId: state.runId,
+        data: { stage, output_file_path: rawPath, checked_paths: candidatePaths },
+      });
+
+      return makeResult(state, config, {
+        allowed: false,
+        reason: `Stage 5 BLOCKED: output file "${rawPath}" not found on disk. You MUST produce the research output file BEFORE completing Stage 5. Preferred: call agent_render_research_output. Alternative: use the Write tool to save to ./isa-research-output.md. Then re-complete Stage 5 with answer_delivered: true.`,
+        validationWarnings: [`output_file_path: file "${rawPath}" does not exist`],
+      });
+    }
+
+    // File exists — read content for auto-injection into chat and log verification event
+    let outputFileContent: string | undefined;
+    try {
+      outputFileContent = ctx.fs.readFile(foundPath);
+    } catch {
+      // Non-fatal: file exists but can't be read — proceed without content
+    }
+
+    appendEvent(ctx, args.agentSlug, {
+      type: 'stage_output_file_verified',
+      timestamp: now,
+      runId: state.runId,
+      data: {
+        stage,
+        output_file_path: rawPath,
+        verified_path: foundPath,
+        ...(outputFileContent ? { output_file_content: outputFileContent } : {}),
+      },
+    });
+
+    // Post-process: inject > **Sources** blockquotes if missing.
+    // The LLM almost never calls agent_render_research_output (uses Write directly),
+    // so we deterministically inject source blocks here using Stage 4's source_texts.
+    if (outputFileContent && !outputFileContent.includes('> **Sources**')) {
+      const sourceTexts = extractSourceTextsFromState(state, ctx, args.agentSlug);
+      if (Object.keys(sourceTexts).length > 0) {
+        const citRegex = loadCitationRegexFromConfig(ctx, args.agentSlug);
+        if (citRegex) {
+          const injected = injectSourceBlocksIntoContent(outputFileContent, sourceTexts, citRegex);
+          if (injected !== outputFileContent) {
+            outputFileContent = injected;
+            // Write the enhanced content back to disk
+            try {
+              ctx.fs.writeFile(foundPath, outputFileContent);
+              appendEvent(ctx, args.agentSlug, {
+                type: 'source_blocks_injected',
+                timestamp: now,
+                runId: state.runId,
+                data: {
+                  stage,
+                  sourceTextsCount: Object.keys(sourceTexts).length,
+                  path: foundPath,
+                },
+              });
+            } catch {
+              // Non-fatal: proceed with the injected content in memory
+            }
+          }
+        }
+      }
+    }
+
+    // Store output file content on args.data so it flows through to agent_stage_completed event
+    if (outputFileContent) {
+      (args.data as Record<string, unknown>).output_file_content = outputFileContent;
     }
   }
 
@@ -1253,6 +1393,99 @@ function handleResume(
       ? { modifications: state.pendingModifications }
       : {}),
   });
+}
+
+// ============================================================
+// Source Block Post-Processing Helpers
+// ============================================================
+
+/**
+ * Extract source_texts from Stage 4's stageOutputs.
+ * Falls back to reading the Stage 4 intermediates file if stageOutputs is empty.
+ */
+function extractSourceTextsFromState(
+  state: RunState,
+  ctx: SessionToolContext,
+  agentSlug: string,
+): Record<string, string> {
+  // Try stageOutputs first (stored when Stage 4 completed)
+  const stage4Output = state.stageOutputs[4] as Record<string, unknown> | undefined;
+  if (stage4Output?.source_texts && typeof stage4Output.source_texts === 'object') {
+    const texts = stage4Output.source_texts as Record<string, unknown>;
+    // Filter to only string values
+    const result: Record<string, string> = {};
+    for (const [key, val] of Object.entries(texts)) {
+      if (typeof val === 'string' && val.length > 0) {
+        result[key] = val;
+      }
+    }
+    if (Object.keys(result).length > 0) return result;
+  }
+
+  // Fallback: try reading Stage 4 intermediates file
+  const runDir = join(getAgentDataDir(ctx, agentSlug), 'runs', state.runId);
+  const intermediatesDir = join(runDir, 'evidence', 'intermediates');
+
+  // Try common naming patterns for Stage 4
+  for (const name of ['stage4_verify.json', 'stage4_verify_iter0.json']) {
+    const filePath = join(intermediatesDir, name);
+    if (ctx.fs.exists(filePath)) {
+      try {
+        const raw = JSON.parse(ctx.fs.readFile(filePath));
+        const data = raw?.data as Record<string, unknown> | undefined;
+        if (data?.source_texts && typeof data.source_texts === 'object') {
+          const texts = data.source_texts as Record<string, unknown>;
+          const result: Record<string, string> = {};
+          for (const [key, val] of Object.entries(texts)) {
+            if (typeof val === 'string' && val.length > 0) {
+              result[key] = val;
+            }
+          }
+          if (Object.keys(result).length > 0) return result;
+        }
+      } catch {
+        // Non-fatal
+      }
+    }
+  }
+
+  return {};
+}
+
+/**
+ * Load citationRegex from the agent's config.json output section.
+ */
+function loadCitationRegexFromConfig(ctx: SessionToolContext, agentSlug: string): string | null {
+  const configPath = join(ctx.agentsPath, agentSlug, 'config.json');
+  if (!ctx.fs.exists(configPath)) return null;
+  try {
+    const raw = JSON.parse(ctx.fs.readFile(configPath));
+    const regex = raw?.output?.citationRegex;
+    return typeof regex === 'string' ? regex : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Split content into sections by ## headings and inject source blocks into each.
+ * Uses the same injectSourceBlocks() from the renderer for consistency.
+ */
+function injectSourceBlocksIntoContent(
+  content: string,
+  sourceTexts: Record<string, string>,
+  citationRegex: string,
+): string {
+  // Split on ## headings, keeping the heading with its content
+  const sections = content.split(/(?=^## )/m).filter((s) => s.trim().length > 0);
+
+  const processed = sections.map((section) => {
+    // Skip if section already has source blocks
+    if (section.includes('> **Sources**')) return section;
+    return injectSourceBlocks(section, sourceTexts, citationRegex);
+  });
+
+  return processed.join('\n\n');
 }
 
 // ============================================================

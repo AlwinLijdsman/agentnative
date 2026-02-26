@@ -163,6 +163,30 @@ describe('E2E Auto-Enable Agent-Required Sources', () => {
     assert.deepEqual(parsed.agents, ['isa-deep-research'], 'should detect workspace-scoped agent mention');
   });
 
+  it('parseMentions handles [agent:fullWindowsPath:slug] format', () => {
+    const agents = loadWorkspaceAgents(WORKSPACE_ROOT);
+    const agentSlugs = agents.map(a => a.slug);
+
+    const parsed = parseMentions(
+      '[agent:C:\\dev\\deving\\agentnative:isa-deep-research] query',
+      [], [], agentSlugs
+    );
+
+    assert.deepEqual(parsed.agents, ['isa-deep-research'], 'should detect agent mention with full Windows path workspace ID');
+  });
+
+  it('parseMentions handles [agent:unixPath:slug] format', () => {
+    const agents = loadWorkspaceAgents(WORKSPACE_ROOT);
+    const agentSlugs = agents.map(a => a.slug);
+
+    const parsed = parseMentions(
+      '[agent:/home/user/projects/agentnative:isa-deep-research] query',
+      [], [], agentSlugs
+    );
+
+    assert.deepEqual(parsed.agents, ['isa-deep-research'], 'should detect agent mention with Unix path workspace ID');
+  });
+
   // ── C3: isa-knowledge-base source is loadable and usable ──
 
   it('isa-knowledge-base source exists on disk and loads correctly', () => {
@@ -193,6 +217,18 @@ describe('E2E Auto-Enable Agent-Required Sources', () => {
       'existing sources should be preserved');
     assert.ok(result.finalEnabledSlugs.includes('isa-knowledge-base'),
       'new source should be in final list');
+    assert.equal(result.warnings.length, 0, 'no warnings expected');
+  });
+
+  it('auto-enables isa-knowledge-base when agent mentioned with full path workspace ID', () => {
+    const result = simulateAutoEnable(
+      '[agent:C:\\dev\\deving\\agentnative:isa-deep-research] What are ISA 315 requirements?',
+      ['agentnative'],
+      WORKSPACE_ROOT,
+    );
+
+    assert.ok(result.addedSlugs.includes('isa-knowledge-base'),
+      'isa-knowledge-base should be added even with full path workspace ID');
     assert.equal(result.warnings.length, 0, 'no warnings expected');
   });
 

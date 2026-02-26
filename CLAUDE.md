@@ -14,11 +14,18 @@ pnpm run test                   # Run tests
 pnpm run test:e2e               # All E2E tests (stage-gate, session validation, stage0 pause)
 pnpm run test:e2e:live          # Live SDK tests (requires CLAUDE_CODE_OAUTH_TOKEN)
 pnpm run test:e2e:live:auto     # Live SDK tests with auto-extracted token (reads ~/.craft-agent/credentials.enc)
+npx tsx scripts/test-orchestrator-live-e2e.ts  # Live orchestrator pipeline E2E (real API, ~$0.05)
 ```
 
 > **For agents running E2E tests**: Use `test:e2e:live:auto` or set the token first:
 > ```powershell
+> # Preferred: Read from Claude Code CLI credential store (auto-refreshes on CLI launch)
+> $creds = Get-Content "$env:USERPROFILE\.claude\.credentials.json" | ConvertFrom-Json
+> $env:CLAUDE_CODE_OAUTH_TOKEN = $creds.claudeAiOauth.accessToken
+>
+> # Fallback: Read from Craft Agent encrypted store
 > $env:CLAUDE_CODE_OAUTH_TOKEN = (npx tsx scripts/extract-oauth-token.ts)
+>
 > pnpm run test:e2e:live
 > ```
 
@@ -57,6 +64,7 @@ Available via `/` prefix in Claude Code CLI sessions.
 | `/an-implement-phased` | Execute plan.md one phase at a time with approval | For careful, step-by-step implementation |
 | `/an-code-researcher` | Read-only codebase analysis with architecture tracing | Explore and understand existing code |
 | `/an-adversarial-reviewer` | Adversarial review (TypeScript, Electron, security) | Final check before shipping |
+| `/an-clean-plan-commit-push` | Archive completed plan, commit, push | After implementation is tested and working |
 
 ### General Template Commands (Python/Streamlit)
 
@@ -98,6 +106,26 @@ Available for PDF operations when configured. Key capabilities:
 | Page Operations | `pdf_merge`, `pdf_split`, `pdf_rotate_pages`, `pdf_delete_pages` |
 | Creation | `pdf_create_tool`, `pdf_from_text_tool`, `pdf_from_html_tool` |
 | Conversion | `pdf_to_docx_tool`, `pdf_to_images_tool`, `pdf_to_html_tool` |
+
+## Session-Scoped Agent Tools
+
+Tools registered in `packages/shared/src/agent/session-scoped-tools.ts`, implemented in `packages/session-tools-core/src/handlers/`.
+
+| Tool | Handler Module | Purpose |
+|------|---------------|---------|
+| `agent_stage_gate` | `agent-stage-gate/` | Pipeline stage lifecycle (start, complete, resume, repair) |
+| `agent_state` | `agent-state/` | Persistent key-value state across conversation turns |
+| `agent_render_research_output` | `agent-render-output/` | Assemble structured research documents from `FinalAnswer` data |
+
+### `agent_render_research_output`
+
+Programmatically assembles research output documents. Domain-specific behavior (citation format, PDF linking) is configured via the agent's `config.json` `output` section.
+
+Key components:
+- **`renderer.ts`** — `renderDocument()` assembles 10-section markdown, `injectSourceBlocks()` adds verbatim source text
+- **`source-linker.ts`** — `createSourceLinker('isa-pdf' | 'noop')` factory for domain-specific PDF links
+- **`config-loader.ts`** — 3-layer config merge: defaults ← agent config ← runtime overrides
+- **`types.ts`** — `FinalAnswer`, `RenderConfig`, `SourceLinker`, `Citation` interfaces
 
 ## Do NOT
 

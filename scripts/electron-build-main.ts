@@ -69,12 +69,18 @@ function getBuildDefines(): string[] {
     "SENTRY_ELECTRON_INGEST_URL",
   ];
 
-  return definedVars.map((varName) => {
+  const defines = definedVars.map((varName) => {
     const value = process.env[varName] || "";
     // Escape quotes so esbuild sees a JS string literal after shell processing
     // On Windows, shell:true uses cmd.exe where \" is a literal quote
     return `--define:process.env.${varName}=\\"${value}\\"`;
   });
+
+  // Embed build timestamp so stale builds are immediately visible (Section 21)
+  const timestamp = new Date().toISOString();
+  defines.push(`--define:process.env.BUILD_TIMESTAMP=\\"${timestamp}\\"`);
+
+  return defines;
 }
 
 async function waitForFileStable(filePath: string, timeoutMs = 10000): Promise<boolean> {

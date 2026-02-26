@@ -89,6 +89,10 @@ import { checkForUpdatesOnLaunch, setWindowManager as setAutoUpdateWindowManager
 // Initialize electron-log for renderer process support
 log.initialize()
 
+// Log build timestamp for stale-build detection (Section 21)
+// BUILD_TIMESTAMP is embedded at build time via esbuild --define
+console.log('[main] Build timestamp:', process.env.BUILD_TIMESTAMP ?? 'unknown')
+
 // Enable debug/perf in dev mode (running from source)
 if (isDebugMode) {
   process.env.CRAFT_DEBUG = '1'

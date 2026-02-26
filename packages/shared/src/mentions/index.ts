@@ -18,6 +18,9 @@
 
 // Workspace ID character class for regex: word chars, spaces (NOT newlines), hyphens, dots
 // Using literal space instead of \s to avoid matching newlines which would break parsing
+// NOTE: Agent/skill patterns now use [^\]]* to support Windows paths (colons, backslashes).
+// Kept exported for backward compatibility.
+/** @deprecated No longer used internally. Agent/skill patterns use permissive [^\]]* match. */
 export const WS_ID_CHARS = '[\\w .-]'
 
 // ============================================================================
@@ -81,7 +84,7 @@ export function parseMentions(
   // Match skill mentions: [skill:slug] or [skill:workspaceId:slug]
   // The pattern captures the last component (slug) after any number of colons
   // Workspace IDs can contain spaces, hyphens, underscores, and dots
-  const skillPattern = new RegExp(`\\[skill:(?:${WS_ID_CHARS}+:)?([\\w-]+)\\]`, 'g')
+  const skillPattern = /\[skill:(?:[^\]]*:)?([\w-]+)\]/g
   while ((match = skillPattern.exec(text)) !== null) {
     const slug = match[1]!
     if (availableSkillSlugs.includes(slug) && !result.skills.includes(slug)) {
@@ -91,7 +94,7 @@ export function parseMentions(
 
   // Match agent mentions: [agent:slug] or [agent:workspaceId:slug]
   // Same pattern as skills but with agent: prefix
-  const agentPattern = new RegExp(`\\[agent:(?:${WS_ID_CHARS}+:)?([\\w-]+)\\]`, 'g')
+  const agentPattern = /\[agent:(?:[^\]]*:)?([\w-]+)\]/g
   while ((match = agentPattern.exec(text)) !== null) {
     const slug = match[1]!
     if (availableAgentSlugs.includes(slug) && !result.agents.includes(slug)) {
@@ -132,9 +135,9 @@ export function stripAllMentions(text: string): string {
     .replace(/\[source:[\w-]+\]/g, '')
     // Remove [skill:slug] or [skill:workspaceId:slug]
     // Workspace IDs can contain spaces, hyphens, underscores, and dots
-    .replace(new RegExp(`\\[skill:(?:${WS_ID_CHARS}+:)?[\\w-]+\\]`, 'g'), '')
+    .replace(/\[skill:(?:[^\]]*:)?[\w-]+\]/g, '')
     // Remove [agent:slug] or [agent:workspaceId:slug]
-    .replace(new RegExp(`\\[agent:(?:${WS_ID_CHARS}+:)?[\\w-]+\\]`, 'g'), '')
+    .replace(/\[agent:(?:[^\]]*:)?[\w-]+\]/g, '')
     // Remove [file:path]
     .replace(/\[file:[^\]]+\]/g, '')
     // Remove [folder:path]

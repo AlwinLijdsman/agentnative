@@ -512,20 +512,10 @@ For large files (>2000 lines), use {path, startLine, endLine} to select a portio
         );
       }
 
-      // OAuth tokens cannot be used for direct API calls - Anthropic's API only accepts API keys
-      // The main agent works with OAuth because the Claude Code SDK has special internal handling,
-      // but the basic Anthropic SDK used here does not support OAuth authentication.
-      if (!apiKey && oauthToken) {
-        return errorResponse(
-          'call_llm requires an Anthropic API key.\n\n' +
-          'You are signed in with Claude OAuth (Max subscription), which works for the main agent ' +
-          'but cannot be used for secondary API calls.\n\n' +
-          'To use call_llm:\n' +
-          '1. Add an Anthropic API key in Settings → API Key\n' +
-          '2. The API key will be used only for call_llm subtasks\n\n' +
-          'Alternative: Use the Task tool to spawn subagents (works with OAuth).'
-        );
-      }
+      // OAuth tokens CAN be used for direct API calls via authToken + beta header (G8).
+      // The Anthropic SDK supports Bearer auth through the `authToken` constructor option
+      // combined with the `oauth-2025-04-20` beta header. Works for Claude Max subscriptions.
+      const useOAuth = !apiKey && !!oauthToken;
 
       // ========================================
       // PROCESS ATTACHMENTS
@@ -585,11 +575,18 @@ For large files (>2000 lines), use {path, startLine, endLine} to select a portio
 
       const baseUrl = connection?.baseUrl;
 
-      // Build client with API key (OAuth-only case already handled above with clear error)
-      const client = new Anthropic({
-        apiKey: apiKey!,
-        ...(baseUrl ? { baseURL: baseUrl } : {}),
-      });
+      // Build client — prefer API key; fall back to OAuth Bearer auth (G8)
+      const client = useOAuth
+        ? new Anthropic({
+            authToken: oauthToken!,
+            apiKey: null,               // Explicitly null — prevent env var pickup
+            ...(baseUrl ? { baseURL: baseUrl } : {}),
+            defaultHeaders: { 'anthropic-beta': 'oauth-2025-04-20' },
+          })
+        : new Anthropic({
+            apiKey: apiKey!,
+            ...(baseUrl ? { baseURL: baseUrl } : {}),
+          });
 
       // ========================================
       // BUILD REQUEST
@@ -612,9 +609,16 @@ For large files (>2000 lines), use {path, startLine, endLine} to select a portio
         ...(temperature !== undefined ? { temperature } : {}),
       };
 
-      // Add thinking configuration
+      // Add thinking configuration (G22)
       if (thinkingEnabled) {
-        request.thinking = { type: 'enabled', budget_tokens: thinkingBudget };
+        if (model.startsWith('claude-opus-4') || model.startsWith('claude-sonnet-4')) {
+          // Opus 4+ and Sonnet 4+ support adaptive thinking — let Claude decide when/how much to think
+          // @ts-expect-error — SDK types don't define 'adaptive' yet (G17)
+          request.thinking = { type: 'adaptive' };
+        } else {
+          // Older models (Opus 3.5, Sonnet 3.5) use explicit thinking budget
+          request.thinking = { type: 'enabled', budget_tokens: thinkingBudget };
+        }
       }
 
       // Add structured output via tool use pattern

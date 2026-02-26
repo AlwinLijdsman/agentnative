@@ -76,7 +76,7 @@ import { CraftMcpClient } from '@craft-agent/shared/mcp'
 import { type Session, type Message, type SessionEvent, type FileAttachment, type StoredAttachment, type SendMessageOptions, IPC_CHANNELS, generateMessageId } from '../shared/types'
 import { formatPathsToRelative, formatToolInputPaths, perf, encodeIconToDataUrl, getEmojiIcon, resetSummarizationClient, resolveToolIcon } from '@craft-agent/shared/utils'
 import { loadWorkspaceSkills, loadAllSkills, type LoadedSkill } from '@craft-agent/shared/skills'
-import { loadWorkspaceAgents } from '@craft-agent/shared/agents'
+import { loadWorkspaceAgents, resolveAgentEnvironment } from '@craft-agent/shared/agents'
 import { parseMentions } from '@craft-agent/shared/mentions'
 import type { ToolDisplayMeta } from '@craft-agent/core/types'
 import { getToolIconsDir, isCodexModel, getMiniModel, DEFAULT_MODEL, DEFAULT_CODEX_MODEL } from '@craft-agent/shared/config'
@@ -2950,16 +2950,23 @@ export class SessionManager {
           sessionLog.debug(`[stage-gate][pause] pauseLocked=true`)
 
           // Mark the executing agent_stage_gate tool as completed.
-          const stageTool = managed.messages.find(
-            m => m.toolName?.includes('agent_stage_gate') && m.toolStatus === 'executing'
-          )
-          if (stageTool) {
-            stageTool.toolStatus = 'completed'
-            stageTool.content = `Stage ${stage} completed. Awaiting approval.`
-            stageTool.toolResult = JSON.stringify({ pauseRequired: true, stage, data })
-            sessionLog.debug(`[stage-gate][pause] marked tool completed toolUseId=${stageTool.toolUseId}`)
+          // In orchestrator flow (data.orchestratorMode === true), no such tool exists —
+          // the pause is emitted directly from the pipeline generator. Skip the lookup.
+          const isOrchestratorMode = data?.['orchestratorMode'] === true
+          if (!isOrchestratorMode) {
+            const stageTool = managed.messages.find(
+              m => m.toolName?.includes('agent_stage_gate') && m.toolStatus === 'executing'
+            )
+            if (stageTool) {
+              stageTool.toolStatus = 'completed'
+              stageTool.content = `Stage ${stage} completed. Awaiting approval.`
+              stageTool.toolResult = JSON.stringify({ pauseRequired: true, stage, data })
+              sessionLog.debug(`[stage-gate][pause] marked tool completed toolUseId=${stageTool.toolUseId}`)
+            } else {
+              sessionLog.warn(`[stage-gate][pause] no executing agent_stage_gate tool found to mark completed`)
+            }
           } else {
-            sessionLog.warn(`[stage-gate][pause] no executing agent_stage_gate tool found to mark completed`)
+            sessionLog.debug(`[stage-gate][pause] orchestrator mode — skipping tool lookup`)
           }
 
           // Send stage_gate_pause event to renderer
@@ -2996,17 +3003,46 @@ export class SessionManager {
               stageName: (event.data.stageName as string) ?? 'unknown',
             }, managed.workspace.id)
             break
-          case 'agent_stage_completed':
+          case 'agent_stage_completed': {
+            const completedStage = event.data.stage as number
             this.sendEvent({
               type: 'agent_stage_completed',
               sessionId: managed.id,
               agentSlug: event.agentSlug,
               runId: event.runId,
-              stage: event.data.stage as number,
+              stage: completedStage,
               stageName: (event.data.stageName as string) ?? 'unknown',
               data: event.data,
             }, managed.workspace.id)
+
+            // Auto-inject output file content into chat when Stage 5 completes.
+            // This ensures the full research report is shown in the chat regardless
+            // of whether the LLM includes it inline (which it often doesn't).
+            if (completedStage === 5 && typeof event.data.output_file_content === 'string') {
+              const fileContent = event.data.output_file_content as string
+              if (fileContent.length > 0) {
+                sessionLog.info(`Auto-injecting Stage 5 output file content (${fileContent.length} chars) into chat`)
+                const outputMessage: Message = {
+                  id: generateMessageId(),
+                  role: 'assistant',
+                  content: fileContent,
+                  timestamp: this.monotonic(),
+                  isIntermediate: false,
+                }
+                managed.messages.push(outputMessage)
+                managed.lastMessageRole = 'assistant'
+                managed.lastFinalMessageId = outputMessage.id
+                this.sendEvent({
+                  type: 'text_complete',
+                  sessionId: managed.id,
+                  text: fileContent,
+                  isIntermediate: false,
+                }, managed.workspace.id)
+                this.persistSession(managed)
+              }
+            }
             break
+          }
           case 'agent_repair_iteration':
             this.sendEvent({
               type: 'agent_repair_iteration',
@@ -3954,7 +3990,9 @@ export class SessionManager {
    */
   private getPausedAgentResumeContext(sessionPath: string): string | null {
     const agentsDir = join(sessionPath, 'data', 'agents')
-    if (!existsSync(agentsDir)) return null
+    if (!existsSync(agentsDir)) {
+      // Section 16 (G6): No agents dir — fall through to pipeline-state.json check
+    } else {
 
     try {
       const slugs = readdirSync(agentsDir, { withFileTypes: true })
@@ -3968,31 +4006,37 @@ export class SessionManager {
         try {
           const state = JSON.parse(readFileSync(stateFile, 'utf8'))
           if (state.pausedAtStage !== undefined && state.pausedAtStage !== null) {
+            // Orchestrator pipelines handle their own resume via
+            // ClaudeAgent.detectPausedOrchestrator() → resumeOrchestrator().
+            // Return a minimal marker so hasPausedPipeline checks still work
+            // (queue drain hold), but don't inject SDK tool instructions.
+            if (state.orchestratorMode) {
+              sessionLog.debug('[orchestrator] getPausedAgentResumeContext: found via bridge state', { slug, stage: state.pausedAtStage })
+              return `<orchestrator_pipeline_paused agentSlug="${slug}" pausedAtStage="${state.pausedAtStage}" />`
+            }
             const nextStage = state.pausedAtStage + 1
             return (
               `<agent_pipeline_resume agentSlug="${slug}" pausedAtStage="${state.pausedAtStage}" runId="${state.runId}" nextStage="${nextStage}">` +
-              `\nThe ${slug} agent pipeline is PAUSED after stage ${state.pausedAtStage} (completed stages: ${JSON.stringify(state.completedStages)}).` +
-              `\nIMPORTANT: Only resume the pipeline if the user's message CLEARLY indicates a decision about the paused pipeline.` +
+              `\nMANDATORY: The ${slug} agent pipeline is PAUSED after stage ${state.pausedAtStage}. Your FIRST action in this turn MUST be calling agent_stage_gate — either resume or abort. Do NOT generate any text before calling the tool.` +
               `\n` +
-              `\nExplicit proceed signals (case-insensitive): "proceed", "continue", "go ahead", "looks good", "approved", "yes", "lgtm", "ok", "next"` +
-              `\nExplicit abort signals: "abort", "cancel", "stop", "nevermind", "no"` +
-              `\nExplicit modify signals: the message includes specific requested changes to the paused stage output` +
+              `\nCRITICAL: Do NOT re-present the output from stage ${state.pausedAtStage}. That stage is already complete. Your only job is to call the resume tool.` +
               `\n` +
-              `\nIf the user's message matches a proceed signal:` +
-              `\n  1. Call agent_stage_gate({ agentSlug: "${slug}", action: "resume", data: { decision: "proceed" } })` +
-              `\n  2. Then call agent_stage_gate({ agentSlug: "${slug}", action: "start", stage: ${nextStage} })` +
+              `\nProceed signals (case-insensitive): "proceed", "continue", "go ahead", "looks good", "approved", "yes", "lgtm", "ok", "next", "1", "go", "sure", "do it"` +
+              `\nAbort signals: "abort", "cancel", "stop", "nevermind", "no", "2" (when only two options and second is abort/cancel)` +
+              `\nModify signals: the message includes specific requested changes, or "modify", "change", "adjust", "2" (when second option is modify)` +
               `\n` +
-              `\nIf the user's message matches an abort signal:` +
-              `\n  1. Call agent_stage_gate({ agentSlug: "${slug}", action: "resume", data: { decision: "abort" } })` +
+              `\nIf proceed → call these two tools IN ORDER:` +
+              `\n  agent_stage_gate({ agentSlug: "${slug}", action: "resume", data: { decision: "proceed" } })` +
+              `\n  agent_stage_gate({ agentSlug: "${slug}", action: "start", stage: ${nextStage} })` +
               `\n` +
-              `\nIf the user's message matches a modify signal:` +
-              `\n  1. Call agent_stage_gate({ agentSlug: "${slug}", action: "resume", data: { decision: "modify", modifications: { ... } } })` +
-              `\n  2. Then call agent_stage_gate({ agentSlug: "${slug}", action: "start", stage: ${nextStage} })` +
+              `\nIf abort → call:` +
+              `\n  agent_stage_gate({ agentSlug: "${slug}", action: "resume", data: { decision: "abort" } })` +
               `\n` +
-              `\nIf the user's message is unrelated to the paused pipeline:` +
-              `\n  - Do NOT call resume.` +
-              `\n  - Do NOT call start.` +
-              `\n  - Respond to the user normally, then remind them the pipeline remains paused and ask for explicit 'proceed', 'modify', or 'abort'.` +
+              `\nIf modify → call these two tools IN ORDER:` +
+              `\n  agent_stage_gate({ agentSlug: "${slug}", action: "resume", data: { decision: "modify", modifications: { ... } } })` +
+              `\n  agent_stage_gate({ agentSlug: "${slug}", action: "start", stage: ${nextStage} })` +
+              `\n` +
+              `\nIf the message is clearly unrelated to the pipeline, respond normally and remind the user the pipeline is paused.` +
               `\n</agent_pipeline_resume>`
             )
           }
@@ -4002,6 +4046,31 @@ export class SessionManager {
       }
     } catch {
       // Cannot read agents dir - skip
+    }
+
+    } // end of existsSync(agentsDir) else block
+
+    // Section 16 (G2): Fallback — check pipeline-state.json directly.
+    // Bridge state may have been cleared (e.g., by generator.return() triggering finally).
+    // Pipeline-state.json is the durable source of truth for pause status.
+    try {
+      const pipelineStatePath = join(sessionPath, 'data', 'pipeline-state.json')
+      if (existsSync(pipelineStatePath)) {
+        const raw = JSON.parse(readFileSync(pipelineStatePath, 'utf8'))
+        const pauseCount = (raw.events as Array<{ type: string }>)?.filter(e => e.type === 'pause_requested').length ?? 0
+        const resumeCount = (raw.events as Array<{ type: string }>)?.filter(e => e.type === 'resumed').length ?? 0
+        if (pauseCount > resumeCount && raw.agentSlug) {
+          const lastPause = [...(raw.events as Array<{ type: string; stage?: number }>)].reverse().find(e => e.type === 'pause_requested')
+          const pausedStage = lastPause?.stage ?? -1
+          sessionLog.debug('[orchestrator] getPausedAgentResumeContext: found via pipeline-state.json fallback', {
+            agentSlug: raw.agentSlug,
+            pausedStage,
+          })
+          return `<orchestrator_pipeline_paused agentSlug="${raw.agentSlug}" pausedAtStage="${pausedStage}" />`
+        }
+      }
+    } catch {
+      // Malformed pipeline-state.json — skip
     }
 
     return null
@@ -4208,52 +4277,77 @@ export class SessionManager {
     // Pre-enabling them here avoids the agent wasting tool calls to discover and activate sources at runtime.
     if (message.includes('[agent:')) {
       try {
-        const agents = loadWorkspaceAgents(workspaceRootPath)
-        const agentSlugs = agents.map(a => a.slug)
-        const parsed = parseMentions(message, [], [], agentSlugs)
+        const agentList = loadWorkspaceAgents(workspaceRootPath)
+        const resolution = resolveAgentEnvironment(
+          message,
+          agentList,
+          allSources,
+          managed.enabledSourceSlugs || [],
+        )
 
-        if (parsed.agents.length > 0) {
-          const slugSet = new Set(managed.enabledSourceSlugs || [])
-          let sourcesAdded = false
+        // Log all diagnostics
+        for (const diag of resolution.diagnostics) {
+          sessionLog.debug(`[auto-enable] ${diag.step}: ${diag.detail}`)
+        }
 
-          for (const agentSlug of parsed.agents) {
-            const agent_ = agents.find(a => a.slug === agentSlug)
-            if (!agent_?.metadata.sources) continue
+        // Log warnings and emit user-visible warning messages
+        for (const warn of resolution.warnings) {
+          sessionLog.warn(`[auto-enable] ${warn.detail}`)
+          this.sendEvent({
+            type: 'info',
+            sessionId: managed.id,
+            message: `Source "${warn.sourceSlug}" for agent could not be enabled: ${warn.reason === 'not_found' ? 'not found in workspace' : 'not usable (disabled or needs authentication)'}`,
+            level: 'warning',
+          }, managed.workspace.id)
+        }
 
-            for (const sourceBinding of agent_.metadata.sources) {
-              if (!sourceBinding.required) continue
-              if (slugSet.has(sourceBinding.slug)) continue
-
-              // Check if source exists and is usable
-              const sourceCandidates = getSourcesBySlugs(workspaceRootPath, [sourceBinding.slug])
-              if (sourceCandidates.length === 0) {
-                sessionLog.warn(`Required source ${sourceBinding.slug} for agent ${agentSlug} not found in workspace`)
-                continue
-              }
-              if (!isSourceUsable(sourceCandidates[0])) {
-                sessionLog.warn(`Required source ${sourceBinding.slug} for agent ${agentSlug} is not usable (disabled or requires authentication)`)
-                continue
-              }
-
-              slugSet.add(sourceBinding.slug)
-              sourcesAdded = true
-              sessionLog.info(`Auto-enabled required source ${sourceBinding.slug} for agent ${agentSlug}`)
+        // Check if ALL required sources failed for any agent
+        for (const agentSlug of resolution.matchedAgents) {
+          const agentDef = agentList.find(a => a.slug === agentSlug)
+          const requiredSources = agentDef?.metadata.sources?.filter(s => s.required) ?? []
+          if (requiredSources.length > 0) {
+            const allFailed = requiredSources.every(s =>
+              resolution.warnings.some(w => w.agentSlug === agentSlug && w.sourceSlug === s.slug)
+            )
+            if (allFailed) {
+              this.sendEvent({
+                type: 'info',
+                sessionId: managed.id,
+                message: `All required sources for agent "${agentSlug}" failed to enable — the agent may not function correctly.`,
+                level: 'error',
+              }, managed.workspace.id)
             }
           }
-
-          if (sourcesAdded) {
-            managed.enabledSourceSlugs = Array.from(slugSet)
-            this.persistSession(managed)
-            this.sendEvent({
-              type: 'sources_changed',
-              sessionId: managed.id,
-              enabledSourceSlugs: managed.enabledSourceSlugs,
-            }, managed.workspace.id)
-          }
         }
+
+        // Apply state changes
+        if (resolution.slugsToAdd.length > 0) {
+          const slugSet = new Set(managed.enabledSourceSlugs || [])
+          for (const slug of resolution.slugsToAdd) {
+            slugSet.add(slug)
+            sessionLog.info(`[auto-enable] Auto-enabled required source ${slug}`)
+          }
+          managed.enabledSourceSlugs = Array.from(slugSet)
+          this.persistSession(managed)
+          this.sendEvent({
+            type: 'sources_changed',
+            sessionId: managed.id,
+            enabledSourceSlugs: managed.enabledSourceSlugs,
+          }, managed.workspace.id)
+
+          // User-visible success message
+          this.sendEvent({
+            type: 'info',
+            sessionId: managed.id,
+            message: `Auto-enabled source${resolution.slugsToAdd.length > 1 ? 's' : ''}: ${resolution.slugsToAdd.join(', ')}`,
+            level: 'success',
+          }, managed.workspace.id)
+        }
+
         sendSpan.mark('agent.sources.resolved')
       } catch (e) {
-        sessionLog.warn('Failed to auto-enable agent required sources:', e)
+        const err = e instanceof Error ? e : new Error(String(e))
+        sessionLog.warn(`[auto-enable] Failed to auto-enable agent required sources: ${err.message}`, err.stack)
       }
     }
 
@@ -4341,8 +4435,23 @@ export class SessionManager {
       // agent_stage_gate({ action: "resume" }) before continuing.
       const resumeContext = this.getPausedAgentResumeContext(chatSessionDir)
       if (resumeContext) {
-        sessionLog.info('Injecting agent stage gate resume context for paused pipeline')
-        message = resumeContext + '\n\n' + message
+        if (resumeContext.includes('<orchestrator_pipeline_paused')) {
+          // Orchestrator pipelines handle resume via ClaudeAgent.detectPausedOrchestrator().
+          // Don't inject SDK tool instructions — just clear the pause lock.
+          sessionLog.info('Orchestrator pipeline paused — resume handled by orchestrator detection')
+        } else {
+          // SDK flow: inject agent_stage_gate resume instructions into the message
+          sessionLog.info('Injecting agent stage gate resume context for paused pipeline')
+          message = resumeContext + '\n\n' + message
+        }
+
+        // Clear the pause lock so the agent can call resume in this new processing context.
+        // The lock was set during onAgentStagePause to prevent same-turn LLM self-resume.
+        // Now that the user has sent a new message (we're in sendMessage), it's safe to unlock.
+        if (managed.pauseLocked) {
+          managed.pauseLocked = false
+          sessionLog.info('[stage-gate] Cleared pauseLocked — user-initiated resume via new message')
+        }
       }
 
       sendSpan.mark('chat.starting')
@@ -4583,6 +4692,18 @@ export class SessionManager {
       await this.setTodoState(sessionId, 'done')
     }
 
+    // 3b. Fallback: Auto-inject agent output file content into chat.
+    //     When a multi-stage agent (ISA Deep Research) completes Stage 5 with an
+    //     output file, the LLM often produces only a brief summary. This fallback
+    //     reads the agent event log after the turn ends and injects the full file
+    //     content as the primary response if it wasn't already shown.
+    //     Works regardless of backend (ClaudeAgent/CopilotAgent) since it reads
+    //     directly from the agent events log on disk.
+    if (reason === 'complete') {
+      sessionLog.debug('[orchestrator] onProcessingStopped: checking for agent output file injection')
+      this.tryInjectAgentOutputFile(managed)
+    }
+
     // 4. Check queue and process or complete
     // If any agent pipeline is paused, do not auto-drain queued messages.
     // This prevents auto-continuation without an explicit post-pause user decision.
@@ -4620,6 +4741,245 @@ export class SessionManager {
 
     // 5. Always persist
     this.persistSession(managed)
+  }
+
+  /**
+   * Fallback: inject agent output file content into the chat after the turn ends.
+   *
+   * Supports two pipeline backends:
+   * 1. SDK-based agent pipeline: reads `agent-events.jsonl` for Stage 5 completion
+   * 2. Orchestrator pipeline: reads `pipeline-state.json` for Stage 5 output data
+   *
+   * Reads the output file from disk and injects it as a non-intermediate assistant
+   * message. Skips injection if the file content is already present in messages.
+   *
+   * This mechanism works independently of the onAgentEvent callback pipeline,
+   * making it reliable across all backends (ClaudeAgent, CopilotAgent, CodexAgent).
+   */
+  private tryInjectAgentOutputFile(managed: ManagedSession): void {
+    try {
+      const sessionPath = getSessionStoragePath(managed.workspace.rootPath, managed.id)
+
+      // ── Strategy 1: Orchestrator pipeline — check pipeline-state.json ──
+      // The orchestrator saves state at {sessionPath}/data/pipeline-state.json
+      // with stageOutputs containing output_file_path for Stage 5.
+      const pipelineStateFile = join(sessionPath, 'data', 'pipeline-state.json')
+      if (existsSync(pipelineStateFile)) {
+        try {
+          const pipelineRaw = readFileSync(pipelineStateFile, 'utf-8')
+          const pipelineSnapshot = JSON.parse(pipelineRaw) as {
+            stageOutputs?: Record<string, { data?: Record<string, unknown> }>
+          }
+
+          // Check if stage 5 has output data with a file path
+          const stage5Output = pipelineSnapshot.stageOutputs?.['5']
+          if (stage5Output?.data) {
+            const outputFilePath = stage5Output.data['output_file_path'] as string | undefined
+            const outputFileContent = stage5Output.data['output_file_content'] as string | undefined
+
+            // Prefer reading the file content directly from state (set by P0 fix)
+            // Fall back to reading from disk via output_file_path
+            let fileContent: string | undefined = outputFileContent
+
+            if (!fileContent && outputFilePath) {
+              const resolvedPath = this.resolveOutputFilePath(outputFilePath, sessionPath, managed.workingDirectory)
+              if (resolvedPath) {
+                try {
+                  fileContent = readFileSync(resolvedPath, 'utf-8')
+                } catch {
+                  // File read failed — continue to other strategies
+                }
+              }
+            }
+
+            // If we still don't have content, try scanning plans/ directory
+            if (!fileContent) {
+              fileContent = this.scanPlansDirectoryForOutput(sessionPath)
+            }
+
+            if (fileContent && fileContent.length >= 100) {
+              const injected = this.injectOutputIfNotPresent(managed, fileContent, 'orchestrator pipeline-state')
+              if (injected) return
+            }
+          }
+        } catch {
+          // Malformed pipeline-state.json — continue to agent-events.jsonl path
+        }
+      }
+
+      // ── Strategy 2: SDK-based agent pipeline — check agent-events.jsonl ──
+      const agentsDir = join(sessionPath, 'data', 'agents')
+
+      // Find agent data directories
+      let agentSlugs: string[]
+      try {
+        agentSlugs = readdirSync(agentsDir)
+      } catch {
+        return // No agent data directory — not an agent session
+      }
+
+      for (const agentSlug of agentSlugs) {
+        const eventsFile = join(agentsDir, agentSlug, 'agent-events.jsonl')
+        if (!existsSync(eventsFile)) continue
+
+        // Read agent events and find Stage 5 completion with output_file_path
+        let eventsContent: string
+        try {
+          eventsContent = readFileSync(eventsFile, 'utf-8')
+        } catch {
+          continue
+        }
+
+        const lines = eventsContent.trim().split('\n')
+        for (const line of lines) {
+          try {
+            const event = JSON.parse(line) as { type: string; data: Record<string, unknown> }
+            if (event.type !== 'stage_completed' || event.data.stage !== 5) continue
+            if (typeof event.data.output_file_path !== 'string') continue
+
+            const outputFilePath = event.data.output_file_path as string
+            const resolvedPath = this.resolveOutputFilePath(outputFilePath, sessionPath, managed.workingDirectory)
+
+            if (!resolvedPath) {
+              sessionLog.debug(`[output-inject] Stage 5 output file not found: ${outputFilePath}`)
+              continue
+            }
+
+            // Read the file content
+            let fileContent: string
+            try {
+              fileContent = readFileSync(resolvedPath, 'utf-8')
+            } catch {
+              continue
+            }
+
+            if (fileContent.length >= 100) {
+              const injected = this.injectOutputIfNotPresent(managed, fileContent, `agent-events (${resolvedPath})`)
+              if (injected) return
+            }
+          } catch {
+            // Skip malformed lines
+          }
+        }
+      }
+    } catch (error) {
+      sessionLog.debug(`[output-inject] Error in fallback output injection:`, error instanceof Error ? error.message : String(error))
+    }
+  }
+
+  /**
+   * Resolve an output file path — handles absolute and relative paths.
+   * Checks several candidate locations: absolute, plans/, session root, working directory.
+   */
+  private resolveOutputFilePath(
+    outputFilePath: string,
+    sessionPath: string,
+    workingDirectory?: string,
+  ): string | undefined {
+    // Try absolute path first
+    const isAbsolutePath = /^[a-zA-Z]:[\\/]/.test(outputFilePath) || outputFilePath.startsWith('/')
+    if (isAbsolutePath && existsSync(outputFilePath)) {
+      return outputFilePath
+    }
+
+    // Try plans folder and session root with basename
+    const baseName = outputFilePath.replace(/^.*[\\/]/, '').replace(/^\.\//, '')
+    const plansPath = join(sessionPath, 'plans', baseName)
+    const sessionRootPath = join(sessionPath, baseName)
+    const cwdPath = workingDirectory ? join(workingDirectory, baseName) : undefined
+
+    if (existsSync(plansPath)) return plansPath
+    if (existsSync(sessionRootPath)) return sessionRootPath
+    if (cwdPath && existsSync(cwdPath)) return cwdPath
+
+    return undefined
+  }
+
+  /**
+   * Scan the plans/ directory for the most likely output file.
+   * Used when no explicit output_file_path is available.
+   * Prefers `isa-research-output.md`, falls back to largest .md file.
+   */
+  private scanPlansDirectoryForOutput(sessionPath: string): string | undefined {
+    const plansDir = join(sessionPath, 'plans')
+    if (!existsSync(plansDir)) return undefined
+
+    try {
+      const files = readdirSync(plansDir).filter(f => f.endsWith('.md'))
+      if (files.length === 0) return undefined
+
+      // Prefer the known default output filename
+      const defaultFile = files.find(f => f === 'isa-research-output.md')
+      if (defaultFile) {
+        try {
+          return readFileSync(join(plansDir, defaultFile), 'utf-8')
+        } catch {
+          // fall through
+        }
+      }
+
+      // Fallback: read the largest .md file (most likely the research output)
+      let largestContent: string | undefined
+      let largestSize = 0
+      for (const file of files) {
+        try {
+          const content = readFileSync(join(plansDir, file), 'utf-8')
+          if (content.length > largestSize) {
+            largestSize = content.length
+            largestContent = content
+          }
+        } catch {
+          // skip unreadable files
+        }
+      }
+
+      return largestContent
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * Inject output content into chat if not already present.
+   * Returns true if injection was performed, false if skipped (already present or too short).
+   */
+  private injectOutputIfNotPresent(managed: ManagedSession, fileContent: string, source: string): boolean {
+    // Check if the content is already in the chat messages
+    // Compare first 200 chars to avoid false negatives from minor formatting differences
+    const contentPrefix = fileContent.substring(0, 200)
+    const alreadyInjected = managed.messages.some(m =>
+      m.role === 'assistant' && !m.isIntermediate && m.content.includes(contentPrefix)
+    )
+
+    if (alreadyInjected) {
+      sessionLog.debug(`[output-inject] Stage 5 output already present in chat, skipping (source: ${source})`)
+      return false
+    }
+
+    // Inject the file content as a non-intermediate assistant message
+    sessionLog.info(`[output-inject] Injecting Stage 5 output file (${fileContent.length} chars) from ${source}`)
+    const outputMessage: Message = {
+      id: generateMessageId(),
+      role: 'assistant',
+      content: fileContent,
+      timestamp: this.monotonic(),
+      isIntermediate: false,
+    }
+    managed.messages.push(outputMessage)
+    managed.lastMessageRole = 'assistant'
+    managed.lastFinalMessageId = outputMessage.id
+
+    // Send to renderer as a text_complete event
+    this.sendEvent({
+      type: 'text_complete',
+      sessionId: managed.id,
+      text: fileContent,
+      isIntermediate: false,
+    }, managed.workspace.id)
+
+    this.persistSession(managed)
+    sessionLog.info(`[output-inject] Stage 5 output successfully injected into chat (source: ${source})`)
+    return true
   }
 
   /**

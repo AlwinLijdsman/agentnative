@@ -48,6 +48,7 @@ import {
   handleAgentStageGate,
   handleAgentState,
   handleAgentValidate,
+  handleAgentRenderOutput,
   // Types
   type ToolResult,
   type AuthRequest,
@@ -278,6 +279,51 @@ const agentValidateSchema = {
   agentSlug: z.string().describe('The slug of the agent to validate'),
 };
 
+const agentRenderOutputSchema = {
+  agentSlug: z.string().describe('The slug of the agent (e.g. "isa-deep-research")'),
+  finalAnswer: z.object({
+    originalQuery: z.string().describe('The original user query'),
+    synthesis: z.string().describe('Raw synthesis text from Stage 3'),
+    citations: z.array(z.object({
+      sourceRef: z.string(),
+      claim: z.string(),
+      verified: z.boolean(),
+      matchLevel: z.string().optional(),
+      errorCategory: z.string().optional(),
+    })).describe('Citations from verification'),
+    verificationScores: z.object({
+      entity_grounding: z.object({ score: z.number(), passed: z.boolean() }),
+      citation_accuracy: z.object({ score: z.number(), passed: z.boolean() }),
+      relation_preservation: z.object({ score: z.number(), passed: z.boolean() }),
+      contradictions: z.object({ count: z.number(), passed: z.boolean() }),
+    }).describe('Verification scores from Stage 4'),
+    sourceTexts: z.record(z.string(), z.string()).describe('Map of sourceRef → verbatim paragraph text'),
+    subQueries: z.array(z.object({
+      query: z.string(),
+      role: z.string(),
+      standards: z.array(z.string()),
+      paragraphsFound: z.number().optional(),
+    })).describe('Sub-queries from Stage 0'),
+    depthMode: z.string().describe('Depth mode: quick, standard, or deep'),
+    webReferences: z.array(z.object({
+      url: z.string(),
+      title: z.string(),
+      insight: z.string(),
+      sourceType: z.string().optional(),
+    })).optional().describe('Web references from Stage 1'),
+    priorSections: z.array(z.object({
+      sectionNum: z.number(),
+      heading: z.string(),
+      excerpt: z.string(),
+    })).optional().describe('Prior research sections for follow-ups'),
+    followupNumber: z.number().optional().describe('Follow-up number (0 = first query)'),
+    outOfScopeNotes: z.string().optional().describe('Notes about out-of-scope topics'),
+    confidencePerSection: z.record(z.string(), z.string()).optional(),
+  }).describe('Complete pipeline output from Stages 0-4'),
+  renderConfig: z.record(z.string(), z.unknown()).optional().describe('Runtime config overrides (merged with agent config.json output section)'),
+  outputDir: z.string().optional().describe('Output directory path (defaults to session plans folder)'),
+};
+
 const transformDataSchema = {
   language: z.enum(['python3', 'node', 'bun']).describe('Script runtime to use'),
   script: z.string().describe('Transform script source code. Receives input file paths as command-line args (sys.argv[1:] or process.argv.slice(2)), last arg is the output file path.'),
@@ -431,6 +477,23 @@ Use this tool when you need to transform large datasets (20+ rows) into structur
 - pauseAfterStages reference valid stage IDs
 - Verification thresholds are numeric 0-1
 - Required sources exist in the workspace`,
+
+  agent_render_research_output: `Assemble a complete structured research document from pipeline outputs.
+
+This tool programmatically renders a research document from the data collected across Stages 0-4. It deterministically assembles:
+- Title + metadata header
+- Original question blockquote
+- Confidence qualifier based on verification scores
+- Synthesis body with injected source blocks (verbatim ISA text per section)
+- Verification summary table
+- Citations used table with source links
+- External references (web sources)
+- Prior research references (for follow-ups)
+- Research decomposition appendix
+
+**Domain customization** is loaded from the agent's config.json \`output\` section. ISA agents get PDF linking via ISAPDFLinker; other agents use NoOpLinker.
+
+**Usage:** Call this tool in Stage 5 after building the sourceTexts map from Stage 4 verification results.`,
 
   source_credential_prompt: `Prompt the user to enter credentials for a source.
 
@@ -729,6 +792,35 @@ export function getSessionScopedTools(
     // agent_validate
     tool('agent_validate', TOOL_DESCRIPTIONS.agent_validate, agentValidateSchema, async (args) => {
       const result = await handleAgentValidate(ctx, args);
+      return convertResult(result);
+    }),
+
+    // agent_render_research_output
+    tool('agent_render_research_output', TOOL_DESCRIPTIONS.agent_render_research_output, agentRenderOutputSchema, async (args) => {
+      const result = await handleAgentRenderOutput(ctx, args as {
+        agentSlug: string;
+        finalAnswer: {
+          originalQuery: string;
+          synthesis: string;
+          citations: Array<{ sourceRef: string; claim: string; verified: boolean; matchLevel?: string; errorCategory?: string }>;
+          verificationScores: {
+            entity_grounding: { score: number; passed: boolean };
+            citation_accuracy: { score: number; passed: boolean };
+            relation_preservation: { score: number; passed: boolean };
+            contradictions: { count: number; passed: boolean };
+          };
+          sourceTexts: Record<string, string>;
+          subQueries: Array<{ query: string; role: string; standards: string[]; paragraphsFound?: number }>;
+          depthMode: string;
+          webReferences?: Array<{ url: string; title: string; insight: string; sourceType?: string }>;
+          priorSections?: Array<{ sectionNum: number; heading: string; excerpt: string }>;
+          followupNumber?: number;
+          outOfScopeNotes?: string;
+          confidencePerSection?: Record<string, string>;
+        };
+        renderConfig?: Partial<Record<string, unknown>>;
+        outputDir?: string;
+      });
       return convertResult(result);
     }),
 

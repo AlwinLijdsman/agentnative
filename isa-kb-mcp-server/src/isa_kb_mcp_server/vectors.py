@@ -99,13 +99,17 @@ def get_embedding(text: str) -> list[float] | None:
 
     Returns:
         A 1024-dimensional embedding vector, or None if Voyage AI
-        is not available.
+        is not available or the text is empty/blank.
 
     Raises:
         Exception: On Voyage AI API errors (rate limits, auth, etc.).
     """
     if not _voyage_available or _voyage_client is None:
         logger.debug("Voyage AI not available, skipping embedding")
+        return None
+
+    if not text or not text.strip():
+        logger.warning("Empty/blank text passed to get_embedding, returning None")
         return None
 
     result = _voyage_client.embed(

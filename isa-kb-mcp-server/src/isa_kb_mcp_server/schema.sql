@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS GuideSection (
     id VARCHAR PRIMARY KEY,
     heading VARCHAR,
     content VARCHAR,
+    enriched_content VARCHAR,
     embedding FLOAT[1024],
     source_doc VARCHAR
 );
