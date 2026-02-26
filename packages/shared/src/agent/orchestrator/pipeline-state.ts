@@ -35,6 +35,10 @@ const STATE_FILENAME = 'pipeline-state.json';
 /** JSON-serializable representation of PipelineState (Map → Record). */
 interface PipelineStateSnapshot {
   readonly sessionId: string;
+  /** Agent slug for self-describing state (G1 — detection without bridge state). Optional for backward compat with pre-Section 16 files. */
+  readonly agentSlug?: string;
+  /** Session ID of the previous session — enables follow-up context reload across resume boundaries (Section 20 F1/F4/F5). */
+  readonly previousSessionId?: string;
   readonly events: readonly StageEvent[];
   readonly currentStage: number;
   /** Stage outputs as a plain object (Map serialized to Record). */
@@ -50,6 +54,12 @@ interface PipelineStateSnapshot {
 export class PipelineState {
   /** Session ID for state persistence and event correlation. */
   readonly sessionId: string;
+
+  /** Agent slug for self-describing state — enables detection without bridge state (Section 16 G1). */
+  readonly agentSlug: string;
+
+  /** Session ID of the previous session — enables follow-up context reload across resume boundaries (Section 20 F1/F4/F5). */
+  readonly previousSessionId?: string;
 
   /** Append-only event log — complete audit trail. */
   readonly events: readonly StageEvent[];
@@ -74,16 +84,20 @@ export class PipelineState {
     events: readonly StageEvent[],
     currentStage: number,
     stageOutputs: ReadonlyMap<number, StageResult>,
+    agentSlug: string = '',
+    previousSessionId?: string,
   ) {
     this.sessionId = sessionId;
+    this.agentSlug = agentSlug;
+    this.previousSessionId = previousSessionId;
     this.events = events;
     this.currentStage = currentStage;
     this.stageOutputs = stageOutputs;
   }
 
   /** Create a fresh pipeline state for a new session. */
-  static create(sessionId: string): PipelineState {
-    return new PipelineState(sessionId, [], -1, new Map());
+  static create(sessionId: string, agentSlug: string = '', previousSessionId?: string): PipelineState {
+    return new PipelineState(sessionId, [], -1, new Map(), agentSlug, previousSessionId);
   }
 
   // ──────────────────────────────────────────────────────────────────────────
@@ -175,6 +189,8 @@ export class PipelineState {
       [...this.events, stamped],
       newCurrentStage,
       this.stageOutputs,
+      this.agentSlug,
+      this.previousSessionId,
     );
   }
 
@@ -192,6 +208,8 @@ export class PipelineState {
       this.events,
       this.currentStage,
       newOutputs,
+      this.agentSlug,
+      this.previousSessionId,
     );
   }
 
@@ -235,6 +253,8 @@ export class PipelineState {
     }
     return {
       sessionId: this.sessionId,
+      ...(this.agentSlug ? { agentSlug: this.agentSlug } : {}),
+      ...(this.previousSessionId ? { previousSessionId: this.previousSessionId } : {}),
       events: this.events,
       currentStage: this.currentStage,
       stageOutputs,
@@ -255,6 +275,8 @@ export class PipelineState {
       snapshot.events,
       snapshot.currentStage,
       stageOutputs,
+      snapshot.agentSlug ?? '',
+      snapshot.previousSessionId,
     );
   }
 

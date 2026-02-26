@@ -35,6 +35,18 @@ export interface BuildStageContextOptions {
   tokenBudget?: number;
   /** Feedback from a failed verification — included in repair iterations (G15). */
   repairFeedback?: string;
+  /** Narrative web research context from Stage 1 calibration (Section 17, F1). */
+  webResearchContext?: string;
+  /** Structured web sources from Stage 1 calibration (Section 17, F2). */
+  webSources?: Array<{ url: string; title: string; insight: string; sourceType?: string }>;
+  /** Prior answer text for follow-up synthesis (Section 18, F7). */
+  priorAnswerText?: string;
+  /** Parsed prior answer sections with P1/P2 IDs (Section 18, F13). */
+  priorSections?: Array<{ sectionId: string; heading: string; excerpt: string }>;
+  /** Follow-up number (1 = first follow-up, 2 = second, etc.) (Section 18). */
+  followupNumber?: number;
+  /** Prior research context hint for decomposition awareness (Section 18, F11). */
+  priorContextHint?: string;
 }
 
 // ============================================================================
@@ -95,7 +107,107 @@ export function buildStageContext(options: BuildStageContextOptions): string {
     sections.push(wrapXml('ISA_CONTEXT', formatted));
   }
 
-  // 4. Repair feedback (if in repair iteration — G15)
+  // 4. Web research context — enumerated sources + narrative (Section 17, F1/F2)
+  if (options.webSources?.length || options.webResearchContext) {
+    const sourceList = (options.webSources ?? [])
+      .map((s, i) => `[W${i + 1}] ${s.title} — ${s.url}\n    Insight: ${s.insight}`)
+      .join('\n');
+    const narrative = options.webResearchContext ?? '';
+    const contextParts = [
+      sourceList ? `Web Sources (labels assigned in order below):\n${sourceList}` : '',
+      sourceList
+        ? '\nIMPORTANT: You MUST write these [W1], [W2], etc. labels inline in your body text ' +
+          'wherever a claim is informed or shaped by the corresponding web source. ' +
+          'Example: "...the inherent risk framework [W1] drives all subsequent procedures..."\n' +
+          'Each inline [W#] label MUST have a matching WEB_REF| marker in that section\'s Sources blockquote.'
+        : '',
+      narrative ? `\nContext:\n${narrative}` : '',
+    ].filter(Boolean).join('\n\n');
+    sections.push(wrapXml('WEB_RESEARCH_CONTEXT', contextParts));
+    console.info(
+      `[ContextBuilder] WEB_RESEARCH_CONTEXT section: ${(options.webSources ?? []).length} sources, ${narrative.length} chars context`,
+    );
+  }
+
+  // 5. Prior answer context — for follow-up synthesis (Section 18, F7/F13)
+  if (options.priorAnswerText) {
+    const sectionIndex = (options.priorSections ?? [])
+      .map(ps => `- **[${ps.sectionId}] ${ps.heading}**: ${ps.excerpt}`)
+      .join('\n');
+    const parts = [
+      'The user asked a follow-up question. Build on this prior answer,',
+      'avoid repeating the same content, and focus on new aspects.',
+      sectionIndex ? `\n### Prior Answer Section Index\n${sectionIndex}` : '',
+      `\n### Prior Answer\n${options.priorAnswerText}`,
+    ].filter(Boolean);
+    sections.push(wrapXml('PRIOR_ANSWER_CONTEXT', parts.join('\n')));
+    console.info(
+      `[ContextBuilder] PRIOR_ANSWER_CONTEXT section: ${(options.priorSections ?? []).length} sections, ` +
+      `${options.priorAnswerText.length} chars answer, followup #${options.followupNumber ?? '?'}`,
+    );
+  }
+
+  // 6. Prior research context hint — for Stage 0 decomposition awareness (Section 18, F11)
+  if (options.priorContextHint) {
+    sections.push(wrapXml('PRIOR_RESEARCH_CONTEXT',
+      'The user is asking a follow-up question. Use this context to avoid ' +
+      'repeating previously explored topics and focus on new or deeper aspects:\n\n' +
+      options.priorContextHint,
+    ));
+  }
+
+  // 7. Synthesis instructions — conditional instructions injected at runtime (Section 18, F2)
+  if (options.stageName === 'synthesize') {
+    const conditionalInstructions: string[] = [];
+
+    if (options.webSources?.length || options.webResearchContext) {
+      conditionalInstructions.push(
+        'REQUIRED — WEB SOURCE LABELLING:\n' +
+        'You MUST include [W1], [W2], etc. inline in your body text wherever a claim ' +
+        'is informed by a web source from <WEB_RESEARCH_CONTEXT>. This is mandatory — ' +
+        'the renderer depends on finding these labels to link references.\n\n' +
+        'For each [W#] label you write in the body text, you MUST also emit a matching ' +
+        'WEB_REF marker on its own line inside the > **Sources** blockquote of that section:\n' +
+        '> WEB_REF|<url>|<one-line insight>\n\n' +
+        'Example body text: "...the inherent risk framework [W1] drives all subsequent procedures..."\n' +
+        'Example Sources block entry:\n' +
+        '> WEB_REF|https://iaasb.org/isa-540|Inherent risk framework drives procedures\n\n' +
+        'Across the full answer, you should reference at least 2 distinct web sources ' +
+        'inline if 2 or more are available. Do not cluster all web labels in one section.',
+      );
+    }
+
+    if (options.priorSections?.length) {
+      conditionalInstructions.push(
+        'REQUIRED — PRIOR RESEARCH LABELLING:\n' +
+        'You MUST include [P1], [P2], etc. inline in your body text wherever a claim ' +
+        'builds on prior research from <PRIOR_ANSWER_CONTEXT>. Labels correspond to ' +
+        'section IDs in the Prior Answer Section Index.\n\n' +
+        'For each [P#] label you write in the body text, you MUST also emit a matching ' +
+        'PRIOR_REF marker on its own line inside the > **Sources** blockquote:\n' +
+        '> PRIOR_REF|<section_id>|<heading>|<1-3 sentence excerpt of the specific prior finding being referenced>\n\n' +
+        'The excerpt MUST be a substantive summary (1-3 sentences) of the specific prior research ' +
+        'finding being referenced — enough for a reader to understand what prior work is being ' +
+        'built upon without needing to read the full prior answer. Include the key conclusion or ' +
+        'finding, not just a fragment.\n\n' +
+        'Place PRIOR_REF markers AFTER ISA sources but BEFORE WEB_REF markers.\n' +
+        'Example body text: "...building on the risk framework identified in earlier research [P1]..."\n' +
+        'Example Sources block entry:\n' +
+        '> PRIOR_REF|P1|Risk Assessment|ISA 540 (Revised) establishes a rigorous framework requiring auditors to evaluate three fundamental elements — methods, significant assumptions, and data inputs — when testing how management made an accounting estimate.',
+      );
+    }
+
+    if (conditionalInstructions.length) {
+      sections.push(wrapXml('SYNTHESIS_INSTRUCTIONS',
+        conditionalInstructions.join('\n\n'),
+      ));
+      console.info(
+        `[ContextBuilder] SYNTHESIS_INSTRUCTIONS section: ${conditionalInstructions.length} instruction(s)`,
+      );
+    }
+  }
+
+  // 8. Repair feedback (if in repair iteration — G15)
   if (options.repairFeedback) {
     sections.push(wrapXml('REPAIR_FEEDBACK', options.repairFeedback));
   }

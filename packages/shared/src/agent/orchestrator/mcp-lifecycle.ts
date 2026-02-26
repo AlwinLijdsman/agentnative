@@ -29,6 +29,7 @@
  */
 
 import { CraftMcpClient, type McpClientConfig } from '../../mcp/client.ts';
+import { isAbsolute, resolve } from 'node:path';
 
 // ============================================================================
 // SOURCE CONFIG TYPES — Input from sources/*/config.json
@@ -229,6 +230,7 @@ function toClientConfig(config: McpSourceTransportConfig): McpClientConfig {
  */
 export function extractTransportConfig(
   mcpBlock: Record<string, unknown> | undefined,
+  workspaceRootPath: string,
 ): McpSourceTransportConfig {
   if (!mcpBlock) {
     throw new Error('Source config.json has no "mcp" block');
@@ -241,13 +243,29 @@ export function extractTransportConfig(
     );
   }
 
+  const rawCommand = mcpBlock['command'] as string | undefined;
+  const rawCwd = mcpBlock['cwd'] as string | undefined;
+
+  const resolvedCwd = rawCwd
+    ? (isAbsolute(rawCwd) ? rawCwd : resolve(workspaceRootPath, rawCwd))
+    : undefined;
+
+  // Preserve PATH lookups for executable names; only resolve path-like commands.
+  const resolvedCommand = rawCommand && isPathLike(rawCommand)
+    ? (isAbsolute(rawCommand) ? rawCommand : resolve(workspaceRootPath, rawCommand))
+    : rawCommand;
+
   return {
     transport,
-    command: mcpBlock['command'] as string | undefined,
+    command: resolvedCommand,
     args: mcpBlock['args'] as string[] | undefined,
-    cwd: mcpBlock['cwd'] as string | undefined,
+    cwd: resolvedCwd,
     env: mcpBlock['env'] as Record<string, string> | undefined,
     url: mcpBlock['url'] as string | undefined,
     headers: mcpBlock['headers'] as Record<string, string> | undefined,
   };
+}
+
+function isPathLike(command: string): boolean {
+  return command.includes('/') || command.includes('\\');
 }

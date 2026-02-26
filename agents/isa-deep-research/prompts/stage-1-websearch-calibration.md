@@ -76,3 +76,15 @@ Return a JSON object:
 - `web_research_context` must include the "IMPORTANT" disclaimer
 - Each web source must have `url`, `title`, and `source_type`
 - Consider query expansion terms from web results (specific terminology, regulation references)
+
+## When No Web Search Results Are Available
+
+If `<WEB_SEARCH_RESULTS>` indicates no web results were available, you MUST:
+
+1. Set `"skipped": true` in the output
+2. Set `"web_sources": []` — an empty array
+3. Set `"web_queries_executed": 0`
+4. Pass through Stage 0 sub-queries unchanged in `intent_changes` (all empty arrays)
+5. Set `"query_plan_refined": false`
+
+**NEVER fabricate, hallucinate, or invent web source URLs.** If no web search results were provided, you have zero web sources. Do not make up URLs, titles, or domains.

@@ -1,0 +1,65 @@
+{
+  "timestamp": "2026-02-25T15:50:18.631Z",
+  "query": "What should I consider when testing insurance reserves under ISA 540?",
+  "totalDurationSec": 0.291,
+  "totalCostUsd": 0,
+  "pipelineCompleted": false,
+  "allOrchestrator": true,
+  "stageReports": [
+    {
+      "stageId": 0,
+      "stageName": "analyze_query",
+      "verdict": "FAIL",
+      "method": "LLM",
+      "duration": 0.29,
+      "notes": "FAILED — did not pause at stage 0"
+    },
+    {
+      "stageId": 1,
+      "stageName": "websearch_calibration",
+      "verdict": "FAIL",
+      "method": "LLM",
+      "duration": 0,
+      "notes": "Events: orchestrator_error"
+    },
+    {
+      "stageId": 2,
+      "stageName": "retrieve",
+      "verdict": "FAIL",
+      "method": "MCP",
+      "duration": 0,
+      "notes": "Stage never started — pipeline may have stopped early"
+    },
+    {
+      "stageId": 3,
+      "stageName": "synthesize",
+      "verdict": "FAIL",
+      "method": "LLM",
+      "duration": 0,
+      "notes": "Stage never started — pipeline may have stopped early"
+    },
+    {
+      "stageId": 4,
+      "stageName": "verify",
+      "verdict": "FAIL",
+      "method": "MCP",
+      "duration": 0,
+      "notes": "Stage never started — pipeline may have stopped early"
+    },
+    {
+      "stageId": 5,
+      "stageName": "output",
+      "verdict": "FAIL",
+      "method": "Render",
+      "duration": 0,
+      "notes": "Stage never started — pipeline may have stopped early"
+    }
+  ],
+  "eventSequence": [
+    "start(0)",
+    "err(0)",
+    "err(-1)",
+    "err(-1)"
+  ],
+  "allStagesPass": false
+}

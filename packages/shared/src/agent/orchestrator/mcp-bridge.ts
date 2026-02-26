@@ -149,6 +149,9 @@ const WebSearchResultSchema = z.object({
     url: z.string(),
     snippet: z.string(),
   })),
+  warnings: z.array(z.string()).optional(),
+  queries_executed: z.number().optional(),
+  analysis_hints: z.array(z.string()).optional(),
 }).or(z.array(z.object({
   title: z.string(),
   url: z.string(),
@@ -207,14 +210,19 @@ export class OrchestratorMcpBridge implements McpBridge {
    * @returns Web search results with titles, URLs, and snippets
    */
   async webSearch(query: string): Promise<WebSearchResult> {
-    const raw = await this.mcpClient.callTool(ISA_TOOLS.webSearch, { query });
+    const raw = await this.mcpClient.callTool(ISA_TOOLS.webSearch, { queries: [query] });
     const parsed = parseMcpResult(raw, WebSearchResultSchema, ISA_TOOLS.webSearch);
 
     // Normalize: schema accepts both wrapped and unwrapped array forms
     if (Array.isArray(parsed)) {
       return { query, results: parsed };
     }
-    return { query: parsed.query ?? query, results: parsed.results };
+    return {
+      query: parsed.query ?? query,
+      results: parsed.results,
+      warnings: parsed.warnings,
+      queriesExecuted: parsed.queries_executed,
+    };
   }
 
   /**

@@ -176,6 +176,99 @@ export interface AgentConfig {
    * When unset, falls back to built-in placeholder prompts.
    */
   promptsDir?: string;
+  /** Follow-up configuration (optional — gated by agent config). Section 18. */
+  followUp?: {
+    enabled?: boolean;
+    deltaRetrieval?: boolean;
+  };
+}
+
+// ============================================================================
+// NORMALIZED DATA TYPES — For pause-formatter data normalization
+// ============================================================================
+
+/** Normalized sub-query — common shape across BAML and Zod paths. */
+export interface NormalizedSubQuery {
+  /** Sub-query text (from BAML `.text` or Zod `.query`). */
+  text: string;
+  /** Role of this sub-query (Zod provides this; BAML defaults to 'unknown'). */
+  role?: string;
+  /** Target ISA standards for this sub-query. */
+  standards: string[];
+  /** Search strategy hint (BAML path only). */
+  searchStrategy?: string;
+}
+
+/** Normalized query plan — common shape for Stage 0 output from either BAML or Zod path. */
+export interface NormalizedQueryPlan {
+  /** Original user query. */
+  originalQuery: string;
+  /** Clarity score (0.0–1.0). */
+  clarityScore: number;
+  /** Recommended action ('proceed' or 'clarify'). */
+  recommendedAction?: string;
+  /** Assumptions the LLM made about the query. */
+  assumptions: string[];
+  /** Alternative ways to interpret the query. */
+  alternativeInterpretations: string[];
+  /** Clarifying questions for the user (when clarity < 0.7). */
+  clarificationQuestions: string[];
+  /** Primary ISA standards relevant to the query. */
+  primaryStandards: string[];
+  /** Decomposed sub-queries. */
+  subQueries: NormalizedSubQuery[];
+  /** Depth mode (e.g., 'deep', 'quick', 'standard'). */
+  depth: string;
+  /** Scope classification (e.g., 'cross-standard', 'single-standard'). */
+  scope: string;
+  /** Whether authority sources were identified. */
+  authoritySourcesPresent: boolean;
+  /** Refined version of the query (BAML path). */
+  refinedQuery?: string;
+}
+
+/** Normalized calibration — common shape for Stage 1 output from either BAML or Zod path. */
+export interface NormalizedCalibration {
+  /** Whether calibration was skipped (no web search results). */
+  skipped: boolean;
+  /** Execution status for Stage 1 web search behavior. */
+  executionStatus?: 'user_skipped' | 'unavailable' | 'no_results' | 'calibrated';
+  /** Calibration summary text. */
+  summary: string;
+  /** Sub-queries added during calibration. */
+  queriesAdded: Array<{ query: string; role: string; reason: string }>;
+  /** Sub-queries modified during calibration. */
+  queriesModified: Array<{ original: string; modified: string; reason: string }>;
+  /** Sub-queries demoted/removed during calibration. */
+  queriesDemoted: Array<{ query: string; reason: string }>;
+  /** Whether the scope was changed by calibration. */
+  scopeChanged: boolean;
+  /** Number of web sources used in calibration. */
+  webSourceCount: number;
+  /** Warnings from web search execution (e.g., missing BRAVE_API_KEY). */
+  warnings?: string[];
+  /** Whether the query plan was refined by calibration. */
+  queryPlanRefined: boolean;
+}
+
+/** Deterministic telemetry for Stage 1 web search execution. */
+export interface WebSearchExecutionTelemetry {
+  /** Whether MCP bridge was available for Stage 1 calls. */
+  mcpConnected: boolean;
+  /** Query source used for Stage 1 search query extraction. */
+  querySource: 'authority_sources' | 'queries' | 'sub_queries' | 'none';
+  /** Number of candidate queries prepared from Stage 0 output. */
+  queriesPlanned: number;
+  /** Number of MCP calls attempted. */
+  queriesAttempted: number;
+  /** Number of MCP calls that succeeded (even if empty results). */
+  queriesSucceeded: number;
+  /** Number of web result items returned across all successful calls. */
+  resultsCount: number;
+  /** Aggregate warnings from execution and tool responses. */
+  warnings: string[];
+  /** High-level status for deterministic pause rendering and diagnostics. */
+  status: 'user_skipped' | 'unavailable' | 'no_results' | 'calibrated';
 }
 
 // ============================================================================
@@ -206,6 +299,7 @@ export type StageEventType =
   | 'llm_call'
   | 'mcp_tool_call'
   | 'pause_requested'
+  | 'pause_formatted'
   | 'resumed';
 
 /** A single event in the pipeline event log. */
@@ -223,6 +317,9 @@ export interface StageEvent {
 // ============================================================================
 // ORCHESTRATOR EVENTS — Yielded to UI via AsyncGenerator
 // ============================================================================
+
+/** Exit reason from processOrchestratorEvents — signals why the generator ended (Section 16 G3). */
+export type OrchestratorExitReason = 'paused' | 'completed' | 'error';
 
 /** Events yielded by the orchestrator to the UI layer. */
 export type OrchestratorEvent =
@@ -249,6 +346,10 @@ export interface OrchestratorOptions {
   getAuthToken: () => Promise<string>;
   /** Optional callback for streaming progress to UI. */
   onStreamEvent?: (event: StreamEvent) => void;
+  /** Optional callback for structured diagnostic logging (threads ClaudeAgent.onDebug into orchestrator). */
+  onDebug?: (message: string) => void;
+  /** Session ID of a prior completed research run for follow-up context (Section 18, F12). */
+  previousSessionId?: string;
 }
 
 // ============================================================================
@@ -277,6 +378,10 @@ export interface WebSearchResult {
     url: string;
     snippet: string;
   }>;
+  /** Optional warnings from MCP tool (e.g., missing BRAVE_API_KEY). */
+  warnings?: string[];
+  /** Number of queries actually executed by MCP tool (if provided). */
+  queriesExecuted?: number;
 }
 
 // ============================================================================
@@ -322,4 +427,32 @@ export function createNullCostTracker(): CostTrackerPort {
     withinBudget: () => true,
     get totalCostUsd() { return 0; },
   };
+}
+
+// ============================================================================
+// FOLLOW-UP CONTEXT — Prior research data for follow-up queries (Section 18)
+// ============================================================================
+
+/** Prior section from a previous research answer, parsed for follow-up context. */
+export interface FollowUpPriorSection {
+  sectionNum: number;
+  sectionId: string;       // e.g. "P1", "P2"
+  heading: string;
+  excerpt: string;          // Truncated to ~500 chars
+}
+
+/** Context loaded from a prior research session for follow-up queries. */
+export interface FollowUpContext {
+  /** Follow-up number (1 = first follow-up, 2 = second, etc.). */
+  followupNumber: number;
+  /** Full answer text from the prior session. */
+  priorAnswerText: string;
+  /** Original query from the prior session. */
+  priorQuery: string;
+  /** Sub-queries from the prior session (max 5 for context hint). */
+  priorSubQueries: Array<{ text: string; role: string; standards: string[] }>;
+  /** Paragraph IDs from prior citations — used for retrieval delta filtering. */
+  priorParagraphIds: string[];
+  /** Parsed sections from the prior answer with P1/P2 IDs. */
+  priorSections: FollowUpPriorSection[];
 }

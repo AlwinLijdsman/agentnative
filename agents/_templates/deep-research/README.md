@@ -1,6 +1,8 @@
 # Deep Research Agent Template
 
-Create a new multi-stage research agent from this template. The template provides the full 5-stage pipeline (Analyze → Retrieve → Synthesize → Verify → Output) with repair loops, verification axes, and progressive disclosure — all backed by stage gate enforcement.
+Create a new multi-stage research agent from this template. The orchestrator drives a deterministic stage pipeline (Analyze → Retrieve → Synthesize → Verify → Output) with repair loops, verification axes, and progressive disclosure.
+
+**Architecture: Orchestrator-driven.** Stage logic lives in `prompts/stage-*.md` files. Pipeline configuration lives in `config.json`. `AGENT.md` provides frontmatter metadata only (name, description, sources) — the body is intentionally empty.
 
 ## Prerequisites
 
@@ -17,9 +19,15 @@ Pick a kebab-case slug for your agent (e.g., `gaap-deep-research`, `gdpr-deep-re
 ```
 agents/
 └── {your-slug}/
-    ├── AGENT.md
-    ├── config.json
-    └── icon.svg
+    ├── AGENT.md          ← Frontmatter metadata only (name, description, sources)
+    ├── config.json       ← Pipeline config (stages, depth modes, verification)
+    ├── icon.svg
+    └── prompts/          ← Stage logic (one .md file per stage)
+        ├── stage-0-analyze.md
+        ├── stage-1-retrieve.md
+        ├── stage-2-synthesize.md
+        ├── stage-3-verify.md
+        └── stage-4-output.md
 ```
 
 ### 2. Define your placeholders
@@ -132,17 +140,33 @@ The `{{MCP_TOOLS}}` placeholder is a YAML list for the AGENT.md frontmatter:
       - isa_web_search
 ```
 
-### 8. Generate the files
+### 8. Write stage prompts
+
+Create a `prompts/` directory in your agent folder. Write one markdown file per stage:
+
+| File | Purpose |
+|------|---------|
+| `stage-0-analyze.md` | Query decomposition, clarity gate, sub-query generation |
+| `stage-1-retrieve.md` | Search strategy, hop traversal, context formatting |
+| `stage-2-synthesize.md` | Synthesis instructions, citation format, section structure |
+| `stage-3-verify.md` | Verification axes, threshold checks, repair instructions |
+| `stage-4-output.md` | Output rendering, state update, file writing |
+
+Each prompt file is injected by the orchestrator as the system prompt for that stage. The orchestrator automatically provides stage context (previous stage outputs, pipeline state) — your prompts focus on domain-specific instructions.
+
+See `agents/isa-deep-research/prompts/` for the reference implementation.
+
+### 9. Generate the config files
 
 Replace all `{{PLACEHOLDER}}` values in both templates and save as:
-- `agents/{your-slug}/AGENT.md`
-- `agents/{your-slug}/config.json`
+- `agents/{your-slug}/AGENT.md` (frontmatter-only, from `AGENT.md.template`)
+- `agents/{your-slug}/config.json` (from `config.json.template`)
 
-### 9. Add an icon
+### 10. Add an icon
 
 Create or copy an `icon.svg` to `agents/{your-slug}/icon.svg`. Recommended: 24x24 viewBox, single-color design that represents the domain.
 
-### 10. Validate
+### 11. Validate
 
 Run the agent validator to check your configuration:
 
@@ -152,6 +176,7 @@ agent_validate({ agentSlug: "{your-slug}" })
 
 This checks:
 - AGENT.md has valid YAML frontmatter with required `name` and `description` fields
+- AGENT.md body may be empty (expected for orchestrator-driven agents)
 - config.json has valid `controlFlow` with sequential stage IDs starting at 0
 - `repairUnits` reference valid stage pairs
 - `pauseAfterStages` reference valid stage IDs
@@ -159,22 +184,27 @@ This checks:
 
 ## Architecture Reference
 
+The `AgentOrchestrator` drives execution as a deterministic TypeScript for-loop over stages defined in `config.json`. Each stage loads its prompt from `prompts/stage-N-*.md`.
+
 ```
-Stage 0: Analyze Query
-    │  ↓ (pause for user review)
-Stage 1: Retrieve
-    │
-Stage 2: Synthesize  ←──┐
-    │                    │  Repair Loop
-Stage 3: Verify     ────┘  (max N iterations)
-    │
-Stage 4: Output
+AgentOrchestrator.run()
+  │
+  for each stage in config.controlFlow.stages:
+  │   ├── StageRunner.runStage(N)
+  │   │     └── loads prompts/stage-N-*.md as system prompt
+  │   │     └── Claude SDK query() with stage context
+  │   ├── pause check (if N in pauseAfterStages)
+  │   └── repair loop (if stage is in a repairUnit and verification failed)
+  │
+  └── pipeline complete
 ```
 
-- **Stage gate** enforces strict sequential execution
-- **Repair loop** re-runs Synthesize → Verify until all thresholds pass (or max iterations)
-- **Pause after Stage 0** lets the user review the query plan before retrieval begins
-- **Follow-up protocol** uses accumulated state for delta retrieval across runs
+Key properties:
+- **Deterministic** — stages run in order, no SDK tool-calling for flow control
+- **Repair loop** — re-runs Synthesize → Verify until all thresholds pass (or max iterations)
+- **Pause after Stage 0** — lets the user review the query plan before retrieval begins
+- **AGENT.md** — frontmatter-only metadata (name, description, sources) consumed by the UI
+- **Follow-up protocol** — uses accumulated state for delta retrieval across runs
 
 ## Quick Reference: ISA Deep Research
 

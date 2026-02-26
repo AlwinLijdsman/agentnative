@@ -243,6 +243,10 @@
       "refFormat": "[P{num}]",
       "excerptLength": 200
     },
+    "webReference": {
+      "refFormat": "[W{num}]",
+      "linkToOriginal": true
+    },
     "confidence": {
       "qualifierThresholds": { "high": 0.85, "medium": 0.70 }
     },
@@ -275,7 +279,7 @@
     "budgetUsd": 10.0,
     "perStageDesiredTokens": {
       "0": 16384,
-      "1": 8192,
+      "1": 24576,
       "3": 128000,
       "5": 0
     },

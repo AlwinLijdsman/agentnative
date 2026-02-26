@@ -19,26 +19,34 @@ import type { OrchestratorLlmClient } from './llm-client.ts';
 import type { PipelineState } from './pipeline-state.ts';
 import type {
   AgentConfig,
+  FollowUpContext,
   McpBridge,
   OrchestratorConfig,
   RetrievalParagraph,
   StageConfig,
   StageResult,
   StreamEvent,
+  WebSearchExecutionTelemetry,
   WebSearchResult,
 } from './types.ts';
 import { ZERO_USAGE } from './types.ts';
-import { buildStageContext } from './context-builder.ts';
+import { buildStageContext, wrapXml } from './context-builder.ts';
 import { extractRawJson } from './json-extractor.ts';
+import { buildPriorContextHint } from './follow-up-context.ts';
 
 // BAML adapter — feature-flagged, uses dynamic imports (Phase 10)
 import { callBamlStage0, callBamlStage1, callBamlStage3 } from './baml-adapter.ts';
 
 // Renderer imports for deterministic output stage (Phase 8)
 import { renderDocument } from '@craft-agent/session-tools-core/renderer';
-import type { FinalAnswer, RenderConfig, Citation, VerificationScores, SubQuery } from '@craft-agent/session-tools-core/renderer-types';
+import type { FinalAnswer, RenderConfig, Citation, VerificationScores, SubQuery, WebReference } from '@craft-agent/session-tools-core/renderer-types';
 import { mergeRenderConfig, extractOutputConfig } from '@craft-agent/session-tools-core/renderer-config';
 import { createSourceLinker } from '@craft-agent/session-tools-core/renderer-linker';
+
+// Synthesis post-processor — deterministic label injection safety net (Section 19)
+import { postProcessSynthesis } from './synthesis-post-processor.ts';
+
+const MAX_STAGE1_WEB_QUERIES = 5;
 
 // ============================================================================
 // STAGE RUNNER
@@ -70,20 +78,21 @@ export class StageRunner {
     state: PipelineState,
     userMessage: string,
     agentConfig: AgentConfig,
+    followUpContext?: FollowUpContext | null,
   ): Promise<StageResult> {
     switch (stage.name) {
       case 'analyze_query':
-        return this.runAnalyzeQuery(stage, state, userMessage, agentConfig);
+        return this.runAnalyzeQuery(stage, state, userMessage, agentConfig, followUpContext);
       case 'websearch_calibration':
         return this.runWebsearchCalibration(stage, state, agentConfig);
       case 'retrieve':
-        return this.runRetrieve(stage, state, agentConfig);
+        return this.runRetrieve(stage, state, agentConfig, followUpContext);
       case 'synthesize':
-        return this.runSynthesize(stage, state, agentConfig);
+        return this.runSynthesize(stage, state, agentConfig, followUpContext);
       case 'verify':
         return this.runVerify(stage, state, agentConfig);
       case 'output':
-        return this.runOutput(stage, state, agentConfig);
+        return this.runOutput(stage, state, agentConfig, followUpContext);
       default:
         throw new Error(
           `Unknown stage handler: '${stage.name}' (stage ${stage.id}). ` +
@@ -109,6 +118,7 @@ export class StageRunner {
     _state: PipelineState,
     userMessage: string,
     agentConfig: AgentConfig,
+    followUpContext?: FollowUpContext | null,
   ): Promise<StageResult> {
     const orchestratorConfig = agentConfig.orchestrator;
     const useBAML = orchestratorConfig?.useBAML === true;
@@ -150,9 +160,20 @@ export class StageRunner {
       stage.id, stage.name, agentConfig, buildAnalyzeQueryPromptFallback,
     );
 
+    // Enhance user message with prior context hint for follow-up awareness (Section 18, F11)
+    let enhancedMessage = userMessage;
+    if (followUpContext) {
+      const hint = buildPriorContextHint(followUpContext);
+      enhancedMessage += '\n\n' + wrapXml('PRIOR_RESEARCH_CONTEXT',
+        'The user is asking a follow-up question. Use this context to avoid ' +
+        'repeating previously explored topics and focus on new or deeper aspects:\n\n' +
+        hint,
+      );
+    }
+
     const result = await this.llmClient.call({
       systemPrompt,
-      userMessage,
+      userMessage: enhancedMessage,
       desiredMaxTokens: desiredTokens,
       effort: this.getStageEffort(orchestratorConfig),
       onStreamEvent: this.onStreamEvent,
@@ -164,7 +185,39 @@ export class StageRunner {
       ? parsed as Record<string, unknown>
       : { rawText: result.text };
 
-    const queryCount = Array.isArray(data['queries']) ? data['queries'].length : 0;
+    // ── Normalize: ensure top-level 'queries' key exists ──────────────
+    // The LLM returns { query_plan: { sub_queries: [...] } } but downstream
+    // stages (1, 2) expect data['queries']. The BAML path already normalizes
+    // this; the Zod path must do the same.
+    if (!Array.isArray(data['queries'])) {
+      const plan = data['query_plan'] as Record<string, unknown> | undefined;
+      const subQueries = plan?.['sub_queries'] ?? data['sub_queries'];
+      if (Array.isArray(subQueries)) {
+        data['queries'] = (subQueries as Array<Record<string, unknown>>).map(sq => ({
+          text: (sq['query'] ?? sq['text'] ?? '') as string,
+          intent: (sq['intent'] ?? sq['role'] ?? '') as string,
+          priority: (sq['priority'] ?? 1) as number,
+        }));
+      }
+    }
+
+    const queryCount = Array.isArray(data['queries']) ? (data['queries'] as unknown[]).length : 0;
+
+    // Diagnostic: detect overlap between new sub-queries and prior sub-queries (Section 21, F4)
+    if (followUpContext?.priorSubQueries?.length && Array.isArray(data['queries'])) {
+      const priorTexts = new Set(followUpContext.priorSubQueries.map(sq => sq.text.toLowerCase().trim()));
+      const newQueries = data['queries'] as Array<Record<string, unknown>>;
+      const overlapping = newQueries.filter(sq => {
+        const text = ((sq['text'] ?? sq['query'] ?? '') as string).toLowerCase().trim();
+        return priorTexts.has(text);
+      });
+      if (overlapping.length > 0) {
+        console.info(
+          `[stage0] Warning: ${overlapping.length}/${newQueries.length} new sub-queries overlap with prior: ` +
+          overlapping.map(sq => (sq['text'] ?? sq['query'] ?? '') as string).join('; '),
+        );
+      }
+    }
 
     return {
       text: result.text,
@@ -189,34 +242,94 @@ export class StageRunner {
   ): Promise<StageResult> {
     // 1. Get query plan from previous stage (stage 0)
     const queryPlanStage = state.getStageOutput(0);
-    if (!queryPlanStage?.data?.['queries']) {
+    const selectedQueries = this.selectWebSearchQueries(queryPlanStage?.data);
+
+    const execution: WebSearchExecutionTelemetry = {
+      mcpConnected: this.mcpBridge !== null,
+      querySource: selectedQueries.source,
+      queriesPlanned: selectedQueries.queries.length,
+      queriesAttempted: 0,
+      queriesSucceeded: 0,
+      resultsCount: 0,
+      warnings: [],
+      status: 'no_results',
+    };
+
+    if (selectedQueries.queries.length === 0) {
+      execution.status = 'no_results';
       return {
         text: 'No queries to calibrate',
         summary: 'Skipped — no query plan from stage 0',
         usage: ZERO_USAGE,
-        data: {},
+        data: {
+          websearch_calibration: { skipped: true },
+          queries: [],
+          webResults: [],
+          webSearchExecution: execution,
+        },
       };
     }
 
     // 2. Run web searches via McpBridge for each query
     const webResults: WebSearchResult[] = [];
     if (this.mcpBridge) {
-      const queries = queryPlanStage.data['queries'] as Array<{ text: string }>;
-      for (const query of queries) {
+      if (!process.env['BRAVE_API_KEY']) {
+        execution.warnings.push('BRAVE_API_KEY not configured. Web search results may be empty.');
+      }
+
+      for (const query of selectedQueries.queries) {
+        execution.queriesAttempted += 1;
         try {
-          const searchResult = await this.mcpBridge.webSearch(query.text);
-          webResults.push(searchResult);
+          const searchResult = await this.mcpBridge.webSearch(query);
+          execution.queriesSucceeded += 1;
+          if (searchResult.warnings?.length) {
+            execution.warnings.push(...searchResult.warnings);
+          }
+          const resultCount = searchResult.results.length;
+          execution.resultsCount += resultCount;
+          if (resultCount > 0) {
+            webResults.push(searchResult);
+          }
         } catch (error) {
           console.warn(
-            `[StageRunner] Web search failed for query "${query.text}":`,
+            `[StageRunner] Web search failed for query "${query}":`,
             error instanceof Error ? error.message : error,
           );
-          webResults.push({ query: query.text, results: [] });
+          const message = error instanceof Error ? error.message : String(error);
+          execution.warnings.push(`Query failed: ${query.slice(0, 80)} (${message})`);
         }
       }
     } else {
       console.warn('[StageRunner] No McpBridge available — skipping web searches');
+      execution.status = 'unavailable';
+      execution.warnings.push('MCP bridge unavailable; Stage 1 web search could not run.');
     }
+
+    execution.warnings = [...new Set(execution.warnings)];
+
+    // ── Empty webResults guard (Section 20 — Bug 3, F8) ──────────────────
+    // When no web search results exist, short-circuit with a skipped result.
+    // This prevents the LLM from fabricating web sources and avoids
+    // constructing a fake BAML type (F8).
+    if (webResults.length === 0) {
+      if (execution.status !== 'unavailable') {
+        execution.status = 'no_results';
+      }
+      console.warn('[StageRunner] Stage 1: no web search results — returning skipped calibration');
+      return {
+        text: 'Web search calibration skipped — no web results available',
+        summary: 'Skipped — no web search results',
+        usage: ZERO_USAGE,
+        data: {
+          websearch_calibration: { skipped: true },
+          queries: selectedQueries.queries.map(text => ({ text })),
+          webResults: [],
+          webSearchExecution: execution,
+        },
+      };
+    }
+
+    execution.status = 'calibrated';
 
     const orchestratorConfig = agentConfig.orchestrator;
     const useBAML = orchestratorConfig?.useBAML === true;
@@ -226,14 +339,14 @@ export class StageRunner {
       try {
         const authToken = await this.getAuthToken();
         const bamlResult = await callBamlStage1(
-          JSON.stringify(queryPlanStage.data),
+          JSON.stringify(queryPlanStage?.data ?? {}),
           JSON.stringify(webResults),
           authToken,
         );
         if (bamlResult) {
           return {
             text: JSON.stringify(bamlResult, null, 2),
-            summary: `Calibrated ${bamlResult.queries.length} queries with ${webResults.length} web searches (BAML)`,
+            summary: `Calibrated ${bamlResult.queries.length} queries with ${execution.resultsCount} web results (BAML)`,
             usage: ZERO_USAGE, // TODO(baml-usage): BAML client doesn't expose token usage — cost tracking is blind to BAML stages
             data: {
               queries: bamlResult.queries.map(q => ({
@@ -243,6 +356,7 @@ export class StageRunner {
               })),
               calibration: bamlResult,
               webResults,
+              webSearchExecution: execution,
             },
           };
         }
@@ -264,14 +378,14 @@ export class StageRunner {
     );
     const userContent = buildStageContext({
       stageName: 'websearch_calibration',
-      previousOutputs: { queryPlan: queryPlanStage.data },
+      previousOutputs: { queryPlan: queryPlanStage?.data ?? {} },
       agentConfig,
     });
 
     // Append web results as additional context
     const webContext = webResults.length > 0
       ? `\n\n<WEB_SEARCH_RESULTS>\n${JSON.stringify(webResults, null, 2)}\n</WEB_SEARCH_RESULTS>`
-      : '';
+      : '\n\n<WEB_SEARCH_RESULTS>\nNo web search results were available. Do NOT fabricate or hallucinate web sources. Set skipped: true and web_sources: [].\n</WEB_SEARCH_RESULTS>';
 
     const result = await this.llmClient.call({
       systemPrompt,
@@ -287,14 +401,58 @@ export class StageRunner {
       ? parsed as Record<string, unknown>
       : { rawText: result.text, webResults };
 
+    // Deterministic truthfulness guard: runtime telemetry is source of truth.
+    const websearchCalibration = data['websearch_calibration'];
+    if (websearchCalibration && typeof websearchCalibration === 'object') {
+      (websearchCalibration as Record<string, unknown>)['web_queries_executed'] = execution.queriesAttempted;
+      (websearchCalibration as Record<string, unknown>)['warnings'] = execution.warnings;
+    }
+
+    // Truncation diagnostic (Section 20 — Bug 2, F7)
+    // If JSON parsing failed and output tokens are near the limit, the LLM likely truncated output.
+    // Diagnostic-only — no repair attempt (F7: repair produces semantically incomplete results).
+    if (parsed == null && result.usage.outputTokens >= desiredTokens * 0.95) {
+      console.warn(
+        `[StageRunner] Stage 1 likely truncated: outputTokens=${result.usage.outputTokens} >= 95% of desiredTokens=${desiredTokens}. ` +
+        `JSON extraction failed. Consider increasing perStageDesiredTokens.1 in config.json.`,
+      );
+    }
+
     const queryCount = Array.isArray(data['queries']) ? data['queries'].length : 'N/A';
 
     return {
       text: result.text,
-      summary: `Calibrated ${queryCount} queries with ${webResults.length} web searches`,
+      summary: `Calibrated ${queryCount} queries with ${execution.resultsCount} web results`,
       usage: result.usage,
-      data: { ...data, webResults },
+      data: { ...data, webResults, webSearchExecution: execution },
     };
+  }
+
+  private selectWebSearchQueries(
+    stage0Data: Record<string, unknown> | undefined,
+  ): { source: WebSearchExecutionTelemetry['querySource']; queries: string[] } {
+    if (!stage0Data) {
+      return { source: 'none', queries: [] };
+    }
+
+    const queryPlan = stage0Data['query_plan'] as Record<string, unknown> | undefined;
+    const authoritySources = queryPlan?.['authority_sources'] as Record<string, unknown> | undefined;
+    const authorityQueries = toStringArray(authoritySources?.['search_queries']);
+    if (authorityQueries.length > 0) {
+      return { source: 'authority_sources', queries: sanitizeQueries(authorityQueries) };
+    }
+
+    const normalizedQueries = toQueryObjects(stage0Data['queries']).map((item) => item.text);
+    if (normalizedQueries.length > 0) {
+      return { source: 'queries', queries: sanitizeQueries(normalizedQueries) };
+    }
+
+    const subQueries = toQueryObjects(queryPlan?.['sub_queries']).map((item) => item.text);
+    if (subQueries.length > 0) {
+      return { source: 'sub_queries', queries: sanitizeQueries(subQueries) };
+    }
+
+    return { source: 'none', queries: [] };
   }
 
   /**
@@ -309,7 +467,8 @@ export class StageRunner {
   private async runRetrieve(
     stage: StageConfig,
     state: PipelineState,
-    _agentConfig: AgentConfig,
+    agentConfig: AgentConfig,
+    followUpContext?: FollowUpContext | null,
   ): Promise<StageResult> {
     if (!this.mcpBridge) {
       return {
@@ -323,7 +482,10 @@ export class StageRunner {
     // Read calibrated queries (prefer websearch_calibration, fall back to analyze_query)
     const calibration = state.getStageOutput(stage.id - 1);
     const queryPlan = state.getStageOutput(0);
-    const querySource = calibration?.data?.['queries'] ?? queryPlan?.data?.['queries'];
+    // Defense-in-depth: also check query_plan.sub_queries (raw Zod path)
+    const querySource = calibration?.data?.['queries']
+      ?? queryPlan?.data?.['queries']
+      ?? (queryPlan?.data?.['query_plan'] as Record<string, unknown> | undefined)?.['sub_queries'];
 
     if (!querySource || !Array.isArray(querySource)) {
       return {
@@ -355,6 +517,21 @@ export class StageRunner {
       }
     }
 
+    // Delta filtering: remove paragraphs already cited in prior research (Section 18, F10)
+    if (followUpContext?.priorParagraphIds?.length && agentConfig.followUp?.deltaRetrieval !== false) {
+      const priorSet = new Set(followUpContext.priorParagraphIds);
+      const beforeCount = allParagraphs.length;
+      const filtered = allParagraphs.filter(p => !priorSet.has(p.id));
+      if (filtered.length < beforeCount) {
+        console.info(
+          `[StageRunner] Delta filtering: removed ${beforeCount - filtered.length} prior paragraphs, ` +
+          `${filtered.length} remaining`,
+        );
+      }
+      // Replace in-place (allParagraphs is let-accessible via splice)
+      allParagraphs.splice(0, allParagraphs.length, ...filtered);
+    }
+
     // Sort by relevance score (highest first)
     allParagraphs.sort((a, b) => b.score - a.score);
 
@@ -379,6 +556,7 @@ export class StageRunner {
     stage: StageConfig,
     state: PipelineState,
     agentConfig: AgentConfig,
+    followUpContext?: FollowUpContext | null,
   ): Promise<StageResult> {
     const orchestratorConfig = agentConfig.orchestrator;
 
@@ -394,6 +572,11 @@ export class StageRunner {
       (e) => e.type === 'stage_started' && e.data['repairIteration'] !== undefined,
     );
     const repairFeedback = lastRepairEvent?.data['feedback'] as string | undefined;
+
+    // Extract web references and context from Stage 1 data (Section 17, F1/F2)
+    const calibrationRecord = (calibration ?? {}) as Record<string, unknown>;
+    const webSources = extractWebReferences(calibrationRecord);
+    const webResearchContext = extractWebResearchContext(calibrationRecord);
 
     const useBAML = orchestratorConfig?.useBAML === true;
 
@@ -411,6 +594,13 @@ export class StageRunner {
           agentConfig,
           tokenBudget: 70_000,
           repairFeedback,
+          webSources,
+          webResearchContext,
+          priorAnswerText: followUpContext?.priorAnswerText,
+          priorSections: followUpContext?.priorSections?.map(ps => ({
+            sectionId: ps.sectionId, heading: ps.heading, excerpt: ps.excerpt,
+          })),
+          followupNumber: followUpContext?.followupNumber,
         });
 
         const bamlResult = await callBamlStage3(
@@ -420,12 +610,18 @@ export class StageRunner {
           repairFeedback,
         );
         if (bamlResult) {
+          // Run deterministic post-processing to ensure inline labels exist (Section 19)
+          const priorInputs = (followUpContext?.priorSections ?? []).map(ps => ({
+            sectionId: ps.sectionId, heading: ps.heading, excerpt: ps.excerpt, sectionNum: ps.sectionNum,
+          }));
+          const ppResult = postProcessSynthesis(bamlResult.synthesis, webSources, priorInputs);
+
           return {
-            text: bamlResult.synthesis,
+            text: ppResult.synthesis,
             summary: `Synthesis complete: ${bamlResult.citations.length} citations (BAML)`,
             usage: ZERO_USAGE, // TODO(baml-usage): BAML client doesn't expose token usage — cost tracking is blind to BAML stages
             data: {
-              synthesis: bamlResult.synthesis,
+              synthesis: ppResult.synthesis,
               citations: bamlResult.citations,
               confidence: bamlResult.confidence,
               gaps: bamlResult.gaps,
@@ -459,6 +655,13 @@ export class StageRunner {
       agentConfig,
       tokenBudget: 70_000,
       repairFeedback,
+      webSources,
+      webResearchContext,
+      priorAnswerText: followUpContext?.priorAnswerText,
+      priorSections: followUpContext?.priorSections?.map(ps => ({
+        sectionId: ps.sectionId, heading: ps.heading, excerpt: ps.excerpt,
+      })),
+      followupNumber: followUpContext?.followupNumber,
     });
 
     const result = await this.llmClient.call({
@@ -473,6 +676,21 @@ export class StageRunner {
     const data = (parsed != null && typeof parsed === 'object')
       ? parsed as Record<string, unknown>
       : { rawText: result.text };
+
+    // Run deterministic post-processing to ensure inline labels exist (Section 19)
+    const synthesisText = (typeof data['synthesis'] === 'string')
+      ? data['synthesis']
+      : result.text;
+
+    const priorInputs = (followUpContext?.priorSections ?? []).map(ps => ({
+      sectionId: ps.sectionId, heading: ps.heading, excerpt: ps.excerpt, sectionNum: ps.sectionNum,
+    }));
+    const ppResult = postProcessSynthesis(synthesisText, webSources, priorInputs);
+
+    // Write back post-processed synthesis
+    if (typeof data['synthesis'] === 'string') {
+      data['synthesis'] = ppResult.synthesis;
+    }
 
     return {
       text: result.text,
@@ -579,9 +797,11 @@ export class StageRunner {
     _stage: StageConfig,
     state: PipelineState,
     agentConfig: AgentConfig,
+    followUpContext?: FollowUpContext | null,
   ): Promise<StageResult> {
     // 1. Gather data from previous stages
     const queryPlanOutput = state.getStageOutput(0);
+    const calibrationOutput = state.getStageOutput(1);
     const synthesisOutput = state.getStageOutput(3);
     const verificationOutput = state.getStageOutput(4);
 
@@ -647,6 +867,10 @@ export class StageRunner {
       paragraphsFound: sq['paragraphsFound'] as number | undefined,
     }));
 
+    // Extract web references from Stage 1 calibration data (F3, F6)
+    const calibrationData = calibrationOutput?.data ?? {};
+    const webReferences = extractWebReferences(calibrationData);
+
     const finalAnswer: FinalAnswer = {
       originalQuery,
       synthesis: (synthesisData['synthesis'] ?? synthesisOutput.text) as string,
@@ -657,6 +881,15 @@ export class StageRunner {
       depthMode,
       outOfScopeNotes: synthesisData['out_of_scope_notes'] as string | undefined,
       confidencePerSection: synthesisData['confidence_per_section'] as Record<string, string> | undefined,
+      webReferences: webReferences.length > 0 ? webReferences : undefined,
+      // Follow-up context wiring (Section 18, F10/F12)
+      priorSections: followUpContext?.priorSections?.map(ps => ({
+        sectionNum: ps.sectionNum,
+        sectionId: ps.sectionId,
+        heading: ps.heading,
+        excerpt: ps.excerpt,
+      })),
+      followupNumber: followUpContext?.followupNumber,
     };
 
     // 3. Load render config from agent's config.json (3-layer merge: defaults <- agent <- runtime)
@@ -691,6 +924,35 @@ export class StageRunner {
     const outputPath = join(plansDir, outputFileName);
     writeFileSync(outputPath, document, 'utf-8');
 
+    // 6b. Save machine-readable answer.json for follow-up context loading (Section 18, F9)
+    const answerJson = {
+      version: 1,
+      answer: finalAnswer.synthesis,
+      original_query: finalAnswer.originalQuery,
+      followup_number: finalAnswer.followupNumber ?? 0,
+      depth_mode: finalAnswer.depthMode,
+      citations: finalAnswer.citations.map(c => ({
+        source_ref: c.sourceRef,
+        claim: c.claim,
+        paragraph_id: c.sourceRef,
+      })),
+      sub_queries: finalAnswer.subQueries.map(sq => ({
+        text: sq.query,
+        role: sq.role,
+        standards: sq.standards,
+      })),
+      web_references: (finalAnswer.webReferences ?? []).map(wr => ({
+        url: wr.url,
+        title: wr.title,
+        insight: wr.insight,
+        sourceType: wr.sourceType,
+      })),
+    };
+    const dataDir = join(this.sessionPath, 'data');
+    mkdirSync(dataDir, { recursive: true });
+    const answerJsonPath = join(dataDir, 'answer.json');
+    writeFileSync(answerJsonPath, JSON.stringify(answerJson, null, 2), 'utf-8');
+
     // 7. Count sections for metadata
     const sectionsCount = (document.match(/^## /gm) ?? []).length;
 
@@ -704,6 +966,10 @@ export class StageRunner {
         totalCitations: citations.length,
         sectionsCount,
         sourceTextsUsed: Object.keys(sourceTexts).length,
+        // P0 fix: Include file content so sessions.ts auto-inject handler can
+        // display the research output in chat (checks event.data.output_file_content)
+        output_file_content: document,
+        output_file_path: outputPath,
       },
     };
   }
@@ -733,6 +999,113 @@ export class StageRunner {
   ): 'max' | 'high' | 'medium' | 'low' {
     return (orchestratorConfig?.effort ?? 'max') as 'max' | 'high' | 'medium' | 'low';
   }
+}
+
+function toStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is string => typeof item === 'string');
+}
+
+function toQueryObjects(value: unknown): Array<{ text: string }> {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => {
+      if (!item || typeof item !== 'object') return null;
+      const record = item as Record<string, unknown>;
+      const text = record['text'] ?? record['query'];
+      if (typeof text !== 'string') return null;
+      return { text };
+    })
+    .filter((item): item is { text: string } => item != null);
+}
+
+function sanitizeQueries(queries: string[]): string[] {
+  const normalized = queries
+    .map((query) => query.trim())
+    .filter((query) => query.length > 0);
+  return [...new Set(normalized)].slice(0, MAX_STAGE1_WEB_QUERIES);
+}
+
+// ============================================================================
+// WEB REFERENCE EXTRACTION — Extract web refs from Stage 1 data (F3, F6)
+// ============================================================================
+
+/**
+ * Extract web references from Stage 1 (websearch_calibration) data.
+ *
+ * Handles both data shapes:
+ * - Zod path: `stageData.websearch_calibration.web_sources` → array of {url, title, relevance_note, source_type, domain}
+ * - BAML path: `stageData.webResults` → array of WebSearchResult ({title, url, snippet})
+ *
+ * Returns empty array if neither path has data (graceful degradation).
+ * Pattern reference: `pause-formatter.ts` `normalizeStage1Data()` handles same branching.
+ */
+export function extractWebReferences(stageData: Record<string, unknown>): WebReference[] {
+  // Zod path: stageData.websearch_calibration.web_sources
+  const wsCalibration = stageData['websearch_calibration'] as Record<string, unknown> | undefined;
+  if (wsCalibration && Array.isArray(wsCalibration['web_sources'])) {
+    const webSources = wsCalibration['web_sources'] as Array<Record<string, unknown>>;
+    const refs = webSources.map(s => ({
+      url: (s['url'] ?? '') as string,
+      title: (s['title'] ?? '') as string,
+      insight: (s['relevance_note'] ?? '') as string,
+      sourceType: (s['source_type'] ?? 'web') as string,
+    }));
+    console.info(`[StageRunner] extractWebReferences: found ${refs.length} web refs (path: zod)`);
+    return refs;
+  }
+
+  // BAML path: stageData.webResults → WebSearchResult[]
+  if (Array.isArray(stageData['webResults'])) {
+    const webResults = stageData['webResults'] as Array<Record<string, unknown>>;
+    const refs: WebReference[] = [];
+    for (const wr of webResults) {
+      const results = (wr['results'] ?? []) as Array<Record<string, unknown>>;
+      for (const r of results) {
+        refs.push({
+          url: (r['url'] ?? '') as string,
+          title: (r['title'] ?? '') as string,
+          insight: (r['snippet'] ?? '') as string,
+          sourceType: 'web',
+        });
+      }
+    }
+    console.info(`[StageRunner] extractWebReferences: found ${refs.length} web refs (path: baml)`);
+    return refs;
+  }
+
+  console.info('[StageRunner] extractWebReferences: no web references found');
+  return [];
+}
+
+/**
+ * Extract web research context narrative from Stage 1 data.
+ *
+ * Handles both data shapes:
+ * - Zod path: `stageData.websearch_calibration.web_research_context` (string)
+ * - BAML path: `stageData.calibration.calibration_summary` (fallback)
+ *
+ * Returns empty string if missing.
+ */
+export function extractWebResearchContext(stageData: Record<string, unknown>): string {
+  // Zod path
+  const wsCalibration = stageData['websearch_calibration'] as Record<string, unknown> | undefined;
+  if (wsCalibration && typeof wsCalibration['web_research_context'] === 'string') {
+    const ctx = wsCalibration['web_research_context'] as string;
+    console.info(`[StageRunner] extractWebResearchContext: ${ctx.length} chars (path: zod)`);
+    return ctx;
+  }
+
+  // BAML path
+  const calibration = stageData['calibration'] as Record<string, unknown> | undefined;
+  if (calibration && typeof calibration['calibration_summary'] === 'string') {
+    const ctx = calibration['calibration_summary'] as string;
+    console.info(`[StageRunner] extractWebResearchContext: ${ctx.length} chars (path: baml)`);
+    return ctx;
+  }
+
+  console.info('[StageRunner] extractWebResearchContext: no context found');
+  return '';
 }
 
 // ============================================================================

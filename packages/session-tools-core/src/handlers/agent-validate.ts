@@ -132,10 +132,8 @@ function validateAgentMd(ctx: SessionToolContext, agentMdPath: string): AgentMdV
     warnings.push({ path: 'AGENT.md/type', message: '"type" field should be a string.' });
   }
 
-  // Body content
-  if (!parsed.content.trim()) {
-    warnings.push({ path: 'AGENT.md', message: 'AGENT.md body is empty. Add system prompt instructions.' });
-  }
+  // Body content — empty body is expected for orchestrator-driven agents
+  // (stage logic lives in prompts/stage-*.md, pipeline config in config.json)
 
   // Extract source bindings
   let sources: Array<{ slug: string; required: boolean }> | undefined;

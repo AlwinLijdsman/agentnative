@@ -248,7 +248,11 @@ export interface LoadedAgent {
   slug: string;
   /** Parsed metadata from YAML frontmatter */
   metadata: AgentMetadata;
-  /** Full AGENT.md content (without frontmatter) */
+  /**
+   * Full AGENT.md content (without frontmatter).
+   * May be empty for orchestrator-driven agents where stage logic
+   * lives in prompts/stage-*.md and pipeline config in config.json.
+   */
   content: string;
   /** Parsed configuration from config.json */
   config: AgentConfig;

@@ -59,6 +59,11 @@ export interface RenderConfig {
     excerptLength: number;
   };
 
+  webReference?: {
+    refFormat: string;        // e.g. "[W{num}]"
+    linkToOriginal: boolean;  // whether to hyperlink to source URL
+  };
+
   confidence: {
     qualifierThresholds: {
       high: number;     // e.g. 0.85
@@ -107,6 +112,8 @@ export interface WebReference {
 
 export interface PriorSection {
   sectionNum: number;
+  /** String section ID, e.g. "P1", "P2". Optional for backward compat. */
+  sectionId?: string;
   heading: string;
   excerpt: string;
 }

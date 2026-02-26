@@ -3990,7 +3990,9 @@ export class SessionManager {
    */
   private getPausedAgentResumeContext(sessionPath: string): string | null {
     const agentsDir = join(sessionPath, 'data', 'agents')
-    if (!existsSync(agentsDir)) return null
+    if (!existsSync(agentsDir)) {
+      // Section 16 (G6): No agents dir — fall through to pipeline-state.json check
+    } else {
 
     try {
       const slugs = readdirSync(agentsDir, { withFileTypes: true })
@@ -4009,6 +4011,7 @@ export class SessionManager {
             // Return a minimal marker so hasPausedPipeline checks still work
             // (queue drain hold), but don't inject SDK tool instructions.
             if (state.orchestratorMode) {
+              sessionLog.debug('[orchestrator] getPausedAgentResumeContext: found via bridge state', { slug, stage: state.pausedAtStage })
               return `<orchestrator_pipeline_paused agentSlug="${slug}" pausedAtStage="${state.pausedAtStage}" />`
             }
             const nextStage = state.pausedAtStage + 1
@@ -4043,6 +4046,31 @@ export class SessionManager {
       }
     } catch {
       // Cannot read agents dir - skip
+    }
+
+    } // end of existsSync(agentsDir) else block
+
+    // Section 16 (G2): Fallback — check pipeline-state.json directly.
+    // Bridge state may have been cleared (e.g., by generator.return() triggering finally).
+    // Pipeline-state.json is the durable source of truth for pause status.
+    try {
+      const pipelineStatePath = join(sessionPath, 'data', 'pipeline-state.json')
+      if (existsSync(pipelineStatePath)) {
+        const raw = JSON.parse(readFileSync(pipelineStatePath, 'utf8'))
+        const pauseCount = (raw.events as Array<{ type: string }>)?.filter(e => e.type === 'pause_requested').length ?? 0
+        const resumeCount = (raw.events as Array<{ type: string }>)?.filter(e => e.type === 'resumed').length ?? 0
+        if (pauseCount > resumeCount && raw.agentSlug) {
+          const lastPause = [...(raw.events as Array<{ type: string; stage?: number }>)].reverse().find(e => e.type === 'pause_requested')
+          const pausedStage = lastPause?.stage ?? -1
+          sessionLog.debug('[orchestrator] getPausedAgentResumeContext: found via pipeline-state.json fallback', {
+            agentSlug: raw.agentSlug,
+            pausedStage,
+          })
+          return `<orchestrator_pipeline_paused agentSlug="${raw.agentSlug}" pausedAtStage="${pausedStage}" />`
+        }
+      }
+    } catch {
+      // Malformed pipeline-state.json — skip
     }
 
     return null
@@ -4672,6 +4700,7 @@ export class SessionManager {
     //     Works regardless of backend (ClaudeAgent/CopilotAgent) since it reads
     //     directly from the agent events log on disk.
     if (reason === 'complete') {
+      sessionLog.debug('[orchestrator] onProcessingStopped: checking for agent output file injection')
       this.tryInjectAgentOutputFile(managed)
     }
 
@@ -4717,8 +4746,11 @@ export class SessionManager {
   /**
    * Fallback: inject agent output file content into the chat after the turn ends.
    *
-   * Reads the agent-events.jsonl for Stage 5 completion with output_file_path,
-   * then reads the file from disk and injects it as a non-intermediate assistant
+   * Supports two pipeline backends:
+   * 1. SDK-based agent pipeline: reads `agent-events.jsonl` for Stage 5 completion
+   * 2. Orchestrator pipeline: reads `pipeline-state.json` for Stage 5 output data
+   *
+   * Reads the output file from disk and injects it as a non-intermediate assistant
    * message. Skips injection if the file content is already present in messages.
    *
    * This mechanism works independently of the onAgentEvent callback pipeline,
@@ -4727,6 +4759,55 @@ export class SessionManager {
   private tryInjectAgentOutputFile(managed: ManagedSession): void {
     try {
       const sessionPath = getSessionStoragePath(managed.workspace.rootPath, managed.id)
+
+      // ── Strategy 1: Orchestrator pipeline — check pipeline-state.json ──
+      // The orchestrator saves state at {sessionPath}/data/pipeline-state.json
+      // with stageOutputs containing output_file_path for Stage 5.
+      const pipelineStateFile = join(sessionPath, 'data', 'pipeline-state.json')
+      if (existsSync(pipelineStateFile)) {
+        try {
+          const pipelineRaw = readFileSync(pipelineStateFile, 'utf-8')
+          const pipelineSnapshot = JSON.parse(pipelineRaw) as {
+            stageOutputs?: Record<string, { data?: Record<string, unknown> }>
+          }
+
+          // Check if stage 5 has output data with a file path
+          const stage5Output = pipelineSnapshot.stageOutputs?.['5']
+          if (stage5Output?.data) {
+            const outputFilePath = stage5Output.data['output_file_path'] as string | undefined
+            const outputFileContent = stage5Output.data['output_file_content'] as string | undefined
+
+            // Prefer reading the file content directly from state (set by P0 fix)
+            // Fall back to reading from disk via output_file_path
+            let fileContent: string | undefined = outputFileContent
+
+            if (!fileContent && outputFilePath) {
+              const resolvedPath = this.resolveOutputFilePath(outputFilePath, sessionPath, managed.workingDirectory)
+              if (resolvedPath) {
+                try {
+                  fileContent = readFileSync(resolvedPath, 'utf-8')
+                } catch {
+                  // File read failed — continue to other strategies
+                }
+              }
+            }
+
+            // If we still don't have content, try scanning plans/ directory
+            if (!fileContent) {
+              fileContent = this.scanPlansDirectoryForOutput(sessionPath)
+            }
+
+            if (fileContent && fileContent.length >= 100) {
+              const injected = this.injectOutputIfNotPresent(managed, fileContent, 'orchestrator pipeline-state')
+              if (injected) return
+            }
+          }
+        } catch {
+          // Malformed pipeline-state.json — continue to agent-events.jsonl path
+        }
+      }
+
+      // ── Strategy 2: SDK-based agent pipeline — check agent-events.jsonl ──
       const agentsDir = join(sessionPath, 'data', 'agents')
 
       // Find agent data directories
@@ -4757,24 +4838,7 @@ export class SessionManager {
             if (typeof event.data.output_file_path !== 'string') continue
 
             const outputFilePath = event.data.output_file_path as string
-
-            // Resolve the file path — handle both absolute and relative paths
-            let resolvedPath: string | undefined
-            const isAbsolutePath = /^[a-zA-Z]:[\\/]/.test(outputFilePath) || outputFilePath.startsWith('/')
-            if (isAbsolutePath && existsSync(outputFilePath)) {
-              resolvedPath = outputFilePath
-            }
-            if (!resolvedPath) {
-              // Try plans folder and session root with basename
-              const baseName = outputFilePath.replace(/^.*[\\/]/, '').replace(/^\.\//, '')
-              const plansPath = join(sessionPath, 'plans', baseName)
-              const sessionRootPath = join(sessionPath, baseName)
-              const cwdPath = managed.workingDirectory ? join(managed.workingDirectory, baseName) : undefined
-
-              if (existsSync(plansPath)) resolvedPath = plansPath
-              else if (existsSync(sessionRootPath)) resolvedPath = sessionRootPath
-              else if (cwdPath && existsSync(cwdPath)) resolvedPath = cwdPath
-            }
+            const resolvedPath = this.resolveOutputFilePath(outputFilePath, sessionPath, managed.workingDirectory)
 
             if (!resolvedPath) {
               sessionLog.debug(`[output-inject] Stage 5 output file not found: ${outputFilePath}`)
@@ -4789,47 +4853,10 @@ export class SessionManager {
               continue
             }
 
-            if (fileContent.length < 100) {
-              sessionLog.debug(`[output-inject] Stage 5 output file too short (${fileContent.length} chars), skipping`)
-              continue
+            if (fileContent.length >= 100) {
+              const injected = this.injectOutputIfNotPresent(managed, fileContent, `agent-events (${resolvedPath})`)
+              if (injected) return
             }
-
-            // Check if the content is already in the chat messages
-            // Compare first 200 chars to avoid false negatives from minor formatting differences
-            const contentPrefix = fileContent.substring(0, 200)
-            const alreadyInjected = managed.messages.some(m =>
-              m.role === 'assistant' && !m.isIntermediate && m.content.includes(contentPrefix)
-            )
-
-            if (alreadyInjected) {
-              sessionLog.debug(`[output-inject] Stage 5 output already present in chat, skipping`)
-              continue
-            }
-
-            // Inject the file content as a non-intermediate assistant message
-            sessionLog.info(`[output-inject] Injecting Stage 5 output file (${fileContent.length} chars) from ${resolvedPath}`)
-            const outputMessage: Message = {
-              id: generateMessageId(),
-              role: 'assistant',
-              content: fileContent,
-              timestamp: this.monotonic(),
-              isIntermediate: false,
-            }
-            managed.messages.push(outputMessage)
-            managed.lastMessageRole = 'assistant'
-            managed.lastFinalMessageId = outputMessage.id
-
-            // Send to renderer as a text_complete event
-            this.sendEvent({
-              type: 'text_complete',
-              sessionId: managed.id,
-              text: fileContent,
-              isIntermediate: false,
-            }, managed.workspace.id)
-
-            this.persistSession(managed)
-            sessionLog.info(`[output-inject] Stage 5 output successfully injected into chat`)
-            return // Only inject once per session
           } catch {
             // Skip malformed lines
           }
@@ -4838,6 +4865,121 @@ export class SessionManager {
     } catch (error) {
       sessionLog.debug(`[output-inject] Error in fallback output injection:`, error instanceof Error ? error.message : String(error))
     }
+  }
+
+  /**
+   * Resolve an output file path — handles absolute and relative paths.
+   * Checks several candidate locations: absolute, plans/, session root, working directory.
+   */
+  private resolveOutputFilePath(
+    outputFilePath: string,
+    sessionPath: string,
+    workingDirectory?: string,
+  ): string | undefined {
+    // Try absolute path first
+    const isAbsolutePath = /^[a-zA-Z]:[\\/]/.test(outputFilePath) || outputFilePath.startsWith('/')
+    if (isAbsolutePath && existsSync(outputFilePath)) {
+      return outputFilePath
+    }
+
+    // Try plans folder and session root with basename
+    const baseName = outputFilePath.replace(/^.*[\\/]/, '').replace(/^\.\//, '')
+    const plansPath = join(sessionPath, 'plans', baseName)
+    const sessionRootPath = join(sessionPath, baseName)
+    const cwdPath = workingDirectory ? join(workingDirectory, baseName) : undefined
+
+    if (existsSync(plansPath)) return plansPath
+    if (existsSync(sessionRootPath)) return sessionRootPath
+    if (cwdPath && existsSync(cwdPath)) return cwdPath
+
+    return undefined
+  }
+
+  /**
+   * Scan the plans/ directory for the most likely output file.
+   * Used when no explicit output_file_path is available.
+   * Prefers `isa-research-output.md`, falls back to largest .md file.
+   */
+  private scanPlansDirectoryForOutput(sessionPath: string): string | undefined {
+    const plansDir = join(sessionPath, 'plans')
+    if (!existsSync(plansDir)) return undefined
+
+    try {
+      const files = readdirSync(plansDir).filter(f => f.endsWith('.md'))
+      if (files.length === 0) return undefined
+
+      // Prefer the known default output filename
+      const defaultFile = files.find(f => f === 'isa-research-output.md')
+      if (defaultFile) {
+        try {
+          return readFileSync(join(plansDir, defaultFile), 'utf-8')
+        } catch {
+          // fall through
+        }
+      }
+
+      // Fallback: read the largest .md file (most likely the research output)
+      let largestContent: string | undefined
+      let largestSize = 0
+      for (const file of files) {
+        try {
+          const content = readFileSync(join(plansDir, file), 'utf-8')
+          if (content.length > largestSize) {
+            largestSize = content.length
+            largestContent = content
+          }
+        } catch {
+          // skip unreadable files
+        }
+      }
+
+      return largestContent
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * Inject output content into chat if not already present.
+   * Returns true if injection was performed, false if skipped (already present or too short).
+   */
+  private injectOutputIfNotPresent(managed: ManagedSession, fileContent: string, source: string): boolean {
+    // Check if the content is already in the chat messages
+    // Compare first 200 chars to avoid false negatives from minor formatting differences
+    const contentPrefix = fileContent.substring(0, 200)
+    const alreadyInjected = managed.messages.some(m =>
+      m.role === 'assistant' && !m.isIntermediate && m.content.includes(contentPrefix)
+    )
+
+    if (alreadyInjected) {
+      sessionLog.debug(`[output-inject] Stage 5 output already present in chat, skipping (source: ${source})`)
+      return false
+    }
+
+    // Inject the file content as a non-intermediate assistant message
+    sessionLog.info(`[output-inject] Injecting Stage 5 output file (${fileContent.length} chars) from ${source}`)
+    const outputMessage: Message = {
+      id: generateMessageId(),
+      role: 'assistant',
+      content: fileContent,
+      timestamp: this.monotonic(),
+      isIntermediate: false,
+    }
+    managed.messages.push(outputMessage)
+    managed.lastMessageRole = 'assistant'
+    managed.lastFinalMessageId = outputMessage.id
+
+    // Send to renderer as a text_complete event
+    this.sendEvent({
+      type: 'text_complete',
+      sessionId: managed.id,
+      text: fileContent,
+      isIntermediate: false,
+    }, managed.workspace.id)
+
+    this.persistSession(managed)
+    sessionLog.info(`[output-inject] Stage 5 output successfully injected into chat (source: ${source})`)
+    return true
   }
 
   /**

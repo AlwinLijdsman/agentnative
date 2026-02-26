@@ -743,9 +743,15 @@ Please continue the conversation naturally from where we left off.
     }
 
     // Read matched AGENT.md content and wrap in <agent> XML tags
+    // Skip injection for orchestrator-driven agents (empty body; stage logic in prompts/)
     for (const slug of parsed.agents) {
       const agent = agents.find(a => a.slug === slug);
       if (agent) {
+        const isOrchestrated = (agent.config.controlFlow?.stages?.length ?? 0) > 0;
+        if (isOrchestrated && !agent.content.trim()) {
+          this.debug(`[extractSkillContent] Skipping orchestrated agent ${agent.slug} (empty body)`);
+          continue;
+        }
         this.debug(`[extractSkillContent] Loaded agent ${agent.slug} (${agent.content.length} chars)`);
         skillContents.push(`<agent name="${agent.slug}">\n${agent.content}\n</agent>`);
       }

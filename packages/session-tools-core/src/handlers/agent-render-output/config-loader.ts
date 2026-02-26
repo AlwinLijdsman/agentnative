@@ -32,6 +32,10 @@ const DEFAULT_RENDER_CONFIG: RenderConfig = {
     refFormat: '[P{num}]',
     excerptLength: 200,
   },
+  webReference: {
+    refFormat: '[W{num}]',
+    linkToOriginal: true,
+  },
   confidence: {
     qualifierThresholds: { high: 0.85, medium: 0.70 },
   },

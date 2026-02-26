@@ -28,12 +28,16 @@
  * ```
  */
 
+import { dirname } from 'path';
+import { loadFollowUpContext } from './follow-up-context.ts';
 import { OrchestratorLlmClient } from './llm-client.ts';
 import { PipelineState } from './pipeline-state.ts';
+import { formatPauseMessage } from './pause-formatter.ts';
 import { StageRunner } from './stage-runner.ts';
 import type {
   AgentConfig,
   CostTrackerPort,
+  FollowUpContext,
   McpBridge,
   OrchestratorConfig,
   OrchestratorEvent,
@@ -41,6 +45,7 @@ import type {
   StreamEvent,
 } from './types.ts';
 import { createNullCostTracker } from './types.ts';
+import { ZERO_USAGE } from './types.ts';
 
 // ============================================================================
 // RE-EXPORTS — Convenience imports for consumers
@@ -56,7 +61,13 @@ export { OrchestratorMcpBridge, parseMcpResult, extractMcpText } from './mcp-bri
 export { McpLifecycleManager, extractTransportConfig } from './mcp-lifecycle.ts';
 export { CostTracker } from './cost-tracker.ts';
 export type { CostTrackerConfig, CostReport } from './cost-tracker.ts';
+export { formatPauseMessage } from './pause-formatter.ts';
+export type { FormatPauseOptions, FormatPauseResult } from './pause-formatter.ts';
 export type { McpSourceTransportConfig } from './mcp-lifecycle.ts';
+
+// Follow-up context (Section 18)
+export { loadFollowUpContext, parseAnswerSections, buildPriorContextHint } from './follow-up-context.ts';
+export type { FollowUpContext, FollowUpPriorSection } from './types.ts';
 
 // BAML integration — Phase 10
 export { callBamlStage0, callBamlStage1, callBamlStage3, isBamlAvailable } from './baml-adapter.ts';
@@ -72,10 +83,62 @@ export type {
   AgentConfig,
   CostTrackerPort,
   McpBridge,
+  NormalizedCalibration,
+  NormalizedQueryPlan,
+  NormalizedSubQuery,
   OrchestratorConfig,
   OrchestratorEvent,
   OrchestratorOptions,
 } from './types.ts';
+
+// ============================================================================
+// RESUME INTENT PARSING (Section 20 — F2, F3, F6)
+// ============================================================================
+
+/** Result of parsing the user's resume response for skip intent. */
+export interface ResumeIntent {
+  /** Whether the next stage should be skipped (e.g., "No web search"). */
+  skipNextStage: boolean;
+}
+
+/**
+ * Parse the user's resume response to detect stage-skip intent.
+ *
+ * Only active at the Stage 0→1 boundary (pausedAtStage === 0).
+ * Conservative matching with default-to-run fallback (F6).
+ *
+ * Recognized skip patterns:
+ * - "B" or "b." (option B from Stage 0 prompt)
+ * - "no web search" / "no websearch"
+ * - "proceed directly"
+ * - "skip web"
+ * - "no, proceed" / "no. proceed"
+ *
+ * @param userResponse - The user's text response to the pause prompt
+ * @param pausedAtStage - The stage number the pipeline was paused at
+ * @returns ResumeIntent with skipNextStage flag
+ */
+export function parseResumeIntent(userResponse: string, pausedAtStage: number): ResumeIntent {
+  // Only apply skip detection at Stage 0→1 boundary
+  if (pausedAtStage !== 0) {
+    return { skipNextStage: false };
+  }
+
+  const text = userResponse.trim();
+
+  // Conservative patterns — default-to-run (F6)
+  const skipPatterns = [
+    /^b\.?\s*$/i,                          // "B", "b.", "b"
+    /^b\b[.,]?\s/i,                        // "B. No — proceed" etc.
+    /\bno\b.*\bweb\s*search/i,             // "no web search" / "no websearch"
+    /\bproceed\s+directly/i,               // "proceed directly"
+    /\bskip\b.*\bweb/i,                    // "skip web", "skip the web search"
+    /^no[,.]?\s*proceed/i,                 // "no, proceed" / "no. proceed"
+  ];
+
+  const skipNextStage = skipPatterns.some(p => p.test(text));
+  return { skipNextStage };
+}
 
 // ============================================================================
 // AGENT ORCHESTRATOR
@@ -87,6 +150,8 @@ export class AgentOrchestrator {
   private readonly stageRunner: StageRunner;
   private readonly costTracker: CostTrackerPort;
   private readonly onStreamEvent?: (event: StreamEvent) => void;
+  private readonly onDebug?: (message: string) => void;
+  private readonly previousSessionId?: string;
 
   private constructor(
     options: OrchestratorOptions,
@@ -96,6 +161,8 @@ export class AgentOrchestrator {
     this.sessionId = options.sessionId;
     this.sessionPath = options.sessionPath;
     this.onStreamEvent = options.onStreamEvent;
+    this.onDebug = options.onDebug;
+    this.previousSessionId = options.previousSessionId;
     this.stageRunner = stageRunner;
     this.costTracker = costTracker;
   }
@@ -157,8 +224,22 @@ export class AgentOrchestrator {
     userMessage: string,
     agentConfig: AgentConfig,
   ): AsyncGenerator<OrchestratorEvent> {
-    const state = PipelineState.create(this.sessionId);
-    yield* this.executePipeline(state, userMessage, agentConfig, 0);
+    // Load follow-up context if previousSessionId is set (Section 18, F12)
+    let followUpContext: FollowUpContext | null = null;
+    if (this.previousSessionId) {
+      const sessionsDir = dirname(this.sessionPath);
+      followUpContext = loadFollowUpContext(sessionsDir, this.previousSessionId);
+      this.onDebug?.(
+        `[orchestrator] Follow-up context: ${
+          followUpContext
+            ? `loaded (followup #${followUpContext.followupNumber})`
+            : 'not found'
+        }`,
+      );
+    }
+
+    const state = PipelineState.create(this.sessionId, agentConfig.slug, this.previousSessionId);
+    yield* this.executePipeline(state, userMessage, agentConfig, 0, followUpContext);
   }
 
   /**
@@ -203,9 +284,35 @@ export class AgentOrchestrator {
       data: { userResponse },
     });
 
-    // Continue from the stage AFTER the paused one
+    // Parse skip intent (Section 20 — F2, F3, F6)
+    const intent = parseResumeIntent(userResponse, pausedStage);
     const resumeFromStage = pausedStage + 1;
-    yield* this.executePipeline(resumedState, userResponse, agentConfig, resumeFromStage);
+    const skipStages = intent.skipNextStage
+      ? new Set<number>([resumeFromStage])
+      : new Set<number>();
+
+    this.onDebug?.(
+      `[orchestrator] Resume from stage ${pausedStage}: skipNextStage=${intent.skipNextStage}`,
+    );
+
+    // Reload follow-up context from PipelineState.previousSessionId (Section 20 — F1, F4)
+    // Every resume() call reloads followUpContext so it survives across double-resume
+    // (Stage 0→1→2). The previousSessionId is persisted in the pipeline state.
+    let followUpContext: FollowUpContext | null = null;
+    if (resumedState.previousSessionId) {
+      const sessionsDir = dirname(this.sessionPath);
+      followUpContext = loadFollowUpContext(sessionsDir, resumedState.previousSessionId);
+      this.onDebug?.(
+        `[orchestrator] Resume follow-up context: ${
+          followUpContext
+            ? `loaded (followup #${followUpContext.followupNumber})`
+            : 'not found'
+        } (previousSessionId=${resumedState.previousSessionId})`,
+      );
+    }
+
+    // Continue from the stage AFTER the paused one
+    yield* this.executePipeline(resumedState, userResponse, agentConfig, resumeFromStage, followUpContext, skipStages);
   }
 
   // ──────────────────────────────────────────────────────────────────────────
@@ -224,20 +331,74 @@ export class AgentOrchestrator {
    * @param userMessage - User message (original query or resume response)
    * @param agentConfig - Agent configuration
    * @param startStageIndex - Index into agentConfig.controlFlow.stages to start from
+   * @param followUpContext - Follow-up context from previous session (optional)
+   * @param skipStages - Set of stage IDs to skip (Section 20 — skip intercept)
    */
   private async *executePipeline(
     initialState: PipelineState,
     userMessage: string,
     agentConfig: AgentConfig,
     startStageIndex: number,
+    followUpContext?: FollowUpContext | null,
+    skipStages?: ReadonlySet<number>,
   ): AsyncGenerator<OrchestratorEvent> {
     const stages = agentConfig.controlFlow.stages;
     const repairUnits = agentConfig.controlFlow.repairUnits ?? [];
+    const skips = skipStages ?? new Set<number>();
     let state = initialState;
 
     for (let i = startStageIndex; i < stages.length; i++) {
       const stage = stages[i];
       if (!stage) continue;
+
+      // ── 0. Skip intercept (Section 20 — F2) ─────────────────────────
+      // Placed BEFORE both pause-after and normal-run branches so that
+      // skipped stages never call runStage().
+      if (skips.has(stage.id)) {
+        this.onDebug?.(`[orchestrator] Stage ${stage.id} (${stage.name}) SKIPPED by resume intent`);
+
+        // Produce synthetic skipped result with pass-through Stage 0 queries
+        const stage0Output = state.getStageOutput(0);
+        const stage0Queries = stage0Output?.data?.['queries'] ?? [];
+        const skippedResult = {
+          text: 'Stage skipped by user request',
+          summary: `Skipped — user chose to skip ${stage.name}`,
+          usage: ZERO_USAGE,
+          data: {
+            websearch_calibration: { skipped: true },
+            queries: stage0Queries,
+            webResults: [],
+            webSearchExecution: {
+              mcpConnected: false,
+              querySource: 'none',
+              queriesPlanned: 0,
+              queriesAttempted: 0,
+              queriesSucceeded: 0,
+              resultsCount: 0,
+              warnings: [],
+              status: 'user_skipped',
+            },
+          } as Record<string, unknown>,
+        };
+
+        state = state.addEvent({ type: 'stage_started', stage: stage.id, data: { skipped: true } });
+        state = state.setStageOutput(stage.id, skippedResult);
+        state = state.addEvent({
+          type: 'stage_completed',
+          stage: stage.id,
+          data: { summary: skippedResult.summary, usage: skippedResult.usage, skipped: true },
+        });
+        state.saveTo(this.sessionPath);
+
+        yield { type: 'orchestrator_stage_start', stage: stage.id, name: stage.name };
+        yield {
+          type: 'orchestrator_stage_complete',
+          stage: stage.id,
+          name: stage.name,
+          stageOutput: skippedResult.data,
+        };
+        continue;
+      }
 
       // ── 1. Emit stage start event (UI shows progress) ────────────────
       state = state.addEvent({ type: 'stage_started', stage: stage.id, data: {} });
@@ -248,7 +409,7 @@ export class AgentOrchestrator {
         try {
           // Run the stage to generate the pause message
           const pauseResult = await this.stageRunner.runStage(
-            stage, state, userMessage, agentConfig,
+            stage, state, userMessage, agentConfig, followUpContext,
           );
           state = state.setStageOutput(stage.id, pauseResult);
           state = state.addEvent({
@@ -267,8 +428,41 @@ export class AgentOrchestrator {
           state = state.addEvent({ type: 'pause_requested', stage: stage.id, data: {} });
           state.saveTo(this.sessionPath);
 
-          // Yield pause event — UI shows message, waits for user
-          yield { type: 'orchestrator_pause', stage: stage.id, message: pauseResult.text };
+          // Format the pause message for human-readable display
+          const { message: formattedMessage, normalizationPath } = formatPauseMessage(
+            stage.id, stage.name, pauseResult.data, pauseResult.text,
+            {
+              onDebug: this.onDebug,
+              costInfo: {
+                inputTokens: pauseResult.usage.inputTokens,
+                outputTokens: pauseResult.usage.outputTokens,
+                costUsd: this.costTracker.totalCostUsd,
+              },
+            },
+          );
+
+          // Record which formatting path was used (gamma: all derived state from events)
+          const webSearchExecution = (pauseResult.data?.['webSearchExecution'] as Record<string, unknown> | undefined);
+          state = state.addEvent({
+            type: 'pause_formatted',
+            stage: stage.id,
+            data: {
+              normalizationPath,
+              formattedLength: formattedMessage.length,
+              ...(stage.id === 1 && webSearchExecution
+                ? {
+                  webSearchExecutionStatus: webSearchExecution['status'],
+                  webSearchResultsCount: webSearchExecution['resultsCount'],
+                  webSearchQueriesAttempted: webSearchExecution['queriesAttempted'],
+                  webSearchQueriesSucceeded: webSearchExecution['queriesSucceeded'],
+                }
+                : {}),
+            },
+          });
+          state.saveTo(this.sessionPath);
+
+          // Yield pause event — UI shows formatted message, waits for user
+          yield { type: 'orchestrator_pause', stage: stage.id, message: formattedMessage };
 
           // Exit generator — resumed via resume() call
           return;
@@ -281,7 +475,7 @@ export class AgentOrchestrator {
       // ── 3. Run the stage ─────────────────────────────────────────────
       try {
         const stageResult = await this.stageRunner.runStage(
-          stage, state, userMessage, agentConfig,
+          stage, state, userMessage, agentConfig, followUpContext,
         );
 
         // ── 4. Record output in state (TypeScript writes state — not LLM)
@@ -313,7 +507,7 @@ export class AgentOrchestrator {
 
         // ── 8. REPAIR LOOP (G15) ──────────────────────────────────────
         state = yield* this.executeRepairLoop(
-          stage.id, stages, repairUnits, state, userMessage, agentConfig,
+          stage.id, stages, repairUnits, state, userMessage, agentConfig, followUpContext,
         );
       } catch (error) {
         state = yield* this.handleStageError(stage.id, error, state);
@@ -355,6 +549,7 @@ export class AgentOrchestrator {
     currentState: PipelineState,
     userMessage: string,
     agentConfig: AgentConfig,
+    followUpContext?: FollowUpContext | null,
   ): AsyncGenerator<OrchestratorEvent, PipelineState> {
     let state = currentState;
 
@@ -394,7 +589,7 @@ export class AgentOrchestrator {
         yield { type: 'orchestrator_stage_start', stage: repairStageId, name: repairStage.name };
 
         const repairResult = await this.stageRunner.runStage(
-          repairStage, state, userMessage, agentConfig,
+          repairStage, state, userMessage, agentConfig, followUpContext,
         );
 
         state = state.setStageOutput(repairStageId, repairResult);

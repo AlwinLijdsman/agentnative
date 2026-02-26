@@ -107,6 +107,7 @@ import { AgentOrchestrator, CostTracker, McpLifecycleManager, OrchestratorMcpBri
 import type {
   AgentConfig as OrchestratorAgentConfig,
   McpBridge as OrchestratorMcpBridge_T,
+  OrchestratorExitReason,
 } from './orchestrator/types.ts';
 import { loadSourceConfig } from '../sources/storage.ts';
 import { loadAgent, loadWorkspaceAgents } from '../agents/storage.ts';
@@ -360,6 +361,23 @@ function buildWindowsSkillsDirError(errorText: string): { type: 'typed_error'; e
     },
   };
 }
+
+/**
+ * Detect whether an error message indicates a server-side session expiry.
+ * Used by both the event-loop recovery path (result errors) and the catch-block
+ * recovery path (thrown errors / stderr) to apply a single retry with fresh session.
+ *
+ * Case-insensitive match covers:
+ *   - "No conversation found with session ID: <uuid>" (API / stderr)
+ *   - "no conversation found with session id" (lowercased catch-path)
+ */
+function isSessionExpiredError(text: string | undefined | null): boolean {
+  if (!text) return false;
+  return text.toLowerCase().includes('no conversation found with session id');
+}
+
+// Re-export for unit testing — the function is also used internally by chat() recovery paths
+export { isSessionExpiredError };
 
 export class ClaudeAgent extends BaseAgent {
   // Note: ClaudeAgentConfig is compatible with BackendConfig, so we use the inherited this.config
@@ -1456,8 +1474,19 @@ export class ClaudeAgent extends BaseAgent {
             }
           }
 
-          // Capture session ID for conversation continuity (only when it changes)
-          if ('session_id' in message && message.session_id && message.session_id !== this.sessionId) {
+          // Capture session ID for conversation continuity.
+          // IMPORTANT: Only trust the canonical system:init message.
+          // Other SDK messages may carry session_id fields that are not safe to
+          // persist for resume, which can cause next-turn resume failures.
+          if (
+            'type' in message &&
+            message.type === 'system' &&
+            'subtype' in message &&
+            message.subtype === 'init' &&
+            'session_id' in message &&
+            message.session_id &&
+            message.session_id !== this.sessionId
+          ) {
             this.sessionId = message.session_id;
             // Notify caller of new SDK session ID (for immediate persistence)
             this.config.onSdkSessionIdUpdate?.(message.session_id);
@@ -1520,6 +1549,29 @@ export class ClaudeAgent extends BaseAgent {
                 this.onDebug?.(`Source "${sourceSlug}" activation error: ${error}`);
                 // Let original error through
               }
+            }
+
+            // ── Session-expiry recovery (result-error channel) ──────────────
+            // The SDK can deliver "No conversation found with session ID" as a
+            // result-error event rather than throwing.  Intercept BEFORE yielding
+            // so the user never sees the raw error.  One retry with a fresh
+            // session is attempted; if the retry also fails the catch block
+            // surfaces the error normally.
+            if (
+              event.type === 'error' &&
+              wasResuming &&
+              !_isRetry &&
+              isSessionExpiredError(event.message)
+            ) {
+              console.error('[ClaudeAgent] Session expired (result-error channel), clearing and retrying fresh');
+              debug('[SESSION_RECOVERY] result-error channel: detected session expiry, retrying fresh');
+              this.sessionId = null;
+              this.config.onSdkSessionIdCleared?.();
+              this.pinnedPreferencesPrompt = null;
+              this.preferencesDriftNotified = false;
+              yield { type: 'info', message: 'Session expired, restoring context...' };
+              yield* this.chat(userMessage, attachments, { isRetry: true });
+              return;
             }
 
             if (event.type === 'complete') {
@@ -1699,33 +1751,34 @@ export class ClaudeAgent extends BaseAgent {
         debug('[SESSION_DEBUG] lastStderrOutput length:', this.lastStderrOutput.length);
         debug('[SESSION_DEBUG] lastStderrOutput:', this.lastStderrOutput.join('\n'));
 
+        // ── Session-expiry recovery (catch-path) ─────────────────────────────
+        // Check both stderr and the main error message for session-expiry
+        // indicators.  This is hoisted ABOVE the isProcessError gate so that
+        // errors surfaced directly (not wrapped in "process exited with code")
+        // are also caught.  Only one retry is allowed (guarded by _isRetry).
+        const stderrContext = this.lastStderrOutput.length > 0
+          ? this.lastStderrOutput.join('\n')
+          : undefined;
+
+        const sessionExpiredInCatch =
+          isSessionExpiredError(stderrContext) ||
+          isSessionExpiredError(rawErrorMsg);
+
+        if (sessionExpiredInCatch && wasResuming && !_isRetry) {
+          debug('[SESSION_RECOVERY] catch-path: detected session expiry, retrying fresh');
+          console.error('[ClaudeAgent] SDK session expired (catch-path), clearing and retrying fresh');
+          this.sessionId = null;
+          this.config.onSdkSessionIdCleared?.();
+          this.pinnedPreferencesPrompt = null;
+          this.preferencesDriftNotified = false;
+          yield { type: 'info', message: 'Session expired, restoring context...' };
+          yield* this.chat(userMessage, attachments, { isRetry: true });
+          return;
+        }
+
         if (isProcessError) {
-          // Include captured stderr in diagnostics - this is often where the real error is
-          const stderrContext = this.lastStderrOutput.length > 0
-            ? this.lastStderrOutput.join('\n')
-            : undefined;
           if (stderrContext) {
             debug('[SDK process error] Captured stderr:', stderrContext);
-          }
-
-          // Check for expired session error - SDK session no longer exists server-side
-          // This happens when sessions expire (TTL) or are cleaned up by Anthropic
-          const isSessionExpired = stderrContext?.includes('No conversation found with session ID');
-          debug('[SESSION_DEBUG] isSessionExpired:', isSessionExpired);
-
-          if (isSessionExpired && wasResuming && !_isRetry) {
-            debug('[SESSION_DEBUG] >>> TAKING PATH: Session expired recovery');
-            console.error('[ClaudeAgent] SDK session expired server-side, clearing and retrying fresh');
-            debug('[ClaudeAgent] SDK session expired server-side, clearing and retrying fresh');
-            this.sessionId = null;
-            // Clear pinned state so retry captures fresh values
-            this.pinnedPreferencesPrompt = null;
-            this.preferencesDriftNotified = false;
-            // Use 'info' instead of 'status' to show message without spinner
-            yield { type: 'info', message: 'Session expired, restoring context...' };
-            // Recursively call with isRetry=true (yield* delegates all events)
-            yield* this.chat(userMessage, attachments, { isRetry: true });
-            return;
           }
 
           // Check for Windows SDK setup error (missing .claude/skills directory)
@@ -1800,8 +1853,9 @@ export class ClaudeAgent extends BaseAgent {
         // Session-related retry: only if we were resuming and haven't retried yet
         debug('[SESSION_DEBUG] isProcessError=false, checking wasResuming fallback');
         if (wasResuming && !_isRetry) {
-          debug('[SESSION_DEBUG] >>> TAKING PATH: wasResuming fallback retry');
+          debug('[SESSION_RECOVERY] wasResuming fallback retry');
           this.sessionId = null;
+          this.config.onSdkSessionIdCleared?.();
           // Clear pinned state so retry captures fresh values
           this.pinnedPreferencesPrompt = null;
           this.preferencesDriftNotified = false;
@@ -3019,7 +3073,16 @@ export class ClaudeAgent extends BaseAgent {
       const state = PipelineState.loadFrom(sessionPath);
       if (!state || !state.isPaused) return null;
 
-      // Find the agent slug by scanning bridge state files
+      // Section 16 (G2): Primary path — use agentSlug from pipeline-state.json directly
+      if (state.agentSlug) {
+        const agent = loadAgent(this.workspaceRootPath, state.agentSlug);
+        if (agent) {
+          this.onDebug?.(`[orchestrator] detectPausedOrchestrator: found via pipeline-state.json agentSlug=${state.agentSlug}`);
+          return { slug: state.agentSlug, agent };
+        }
+      }
+
+      // Fallback: scan bridge state files (backward compat for old pipeline-state.json without agentSlug)
       const agentsDir = join(sessionPath, 'data', 'agents');
       if (!existsSync(agentsDir)) return null;
 
@@ -3036,12 +3099,17 @@ export class ClaudeAgent extends BaseAgent {
           const bridgeState = JSON.parse(readFileSync(bridgePath, 'utf-8'));
           if (bridgeState.orchestratorMode && bridgeState.pausedAtStage !== undefined) {
             const agent = loadAgent(this.workspaceRootPath, slug);
-            if (agent) return { slug, agent };
+            if (agent) {
+              this.onDebug?.(`[orchestrator] detectPausedOrchestrator: found via bridge state slug=${slug}`);
+              return { slug, agent };
+            }
           }
         } catch {
           // Corrupted bridge state — skip
         }
       }
+
+      this.onDebug?.(`[orchestrator] detectPausedOrchestrator: pipeline isPaused but no agent found`);
     } catch {
       // Cannot read session state — not paused
     }
@@ -3071,6 +3139,7 @@ export class ClaudeAgent extends BaseAgent {
       startedAt: new Date().toISOString(),
       lastEventAt: new Date().toISOString(),
     }, null, 2), 'utf-8');
+    this.onDebug?.(`[orchestrator] writeOrchestratorBridgeState: agent=${agentSlug} stage=${stage} runId=${runId} path=${statePath}`);
   }
 
   /**
@@ -3080,10 +3149,39 @@ export class ClaudeAgent extends BaseAgent {
   private clearOrchestratorBridgeState(sessionPath: string, agentSlug: string): void {
     try {
       const statePath = join(sessionPath, 'data', 'agents', agentSlug, 'current-run-state.json');
-      if (existsSync(statePath)) unlinkSync(statePath);
+      const existed = existsSync(statePath);
+      if (existed) unlinkSync(statePath);
+      this.onDebug?.(`[orchestrator] clearOrchestratorBridgeState: agent=${agentSlug} existed=${existed}`);
     } catch {
       // Best-effort cleanup — non-fatal
     }
+  }
+
+  /**
+   * Detect if the current session has a completed prior orchestrator run.
+   * Returns the session ID to use as previousSessionId, or undefined.
+   *
+   * Strategy: Check if `{sessionPath}/data/answer.json` exists.
+   * If it does AND the agent has followUp.enabled, this is a follow-up.
+   * The previousSessionId is the CURRENT session ID (same-session follow-up).
+   *
+   * Only activates when the agent's config has `followUp.enabled: true`.
+   * Cross-session follow-ups are out of scope — future enhancement via explicit UI.
+   */
+  private resolveFollowUpSessionId(
+    sessionPath: string,
+    sessionId: string,
+    agentConfig: OrchestratorAgentConfig,
+  ): string | undefined {
+    if (!agentConfig.followUp?.enabled) return undefined;
+
+    const answerJsonPath = join(sessionPath, 'data', 'answer.json');
+    if (!existsSync(answerJsonPath)) return undefined;
+
+    this.onDebug?.(
+      `[orchestrator] Follow-up auto-detected: answer.json exists at ${answerJsonPath}`,
+    );
+    return sessionId;
   }
 
   /**
@@ -3136,6 +3234,11 @@ export class ClaudeAgent extends BaseAgent {
         : undefined,
       // Resolve per-stage prompt files from agent directory (Phase 7)
       promptsDir: agent.path ? join(agent.path, 'prompts') : undefined,
+      // Follow-up configuration for delta retrieval gating (Section 18)
+      followUp: cfg.followUp ? {
+        enabled: cfg.followUp.enabled,
+        deltaRetrieval: cfg.followUp.deltaRetrieval,
+      } : undefined,
     };
   }
 
@@ -3182,6 +3285,9 @@ export class ClaudeAgent extends BaseAgent {
 
     this.onDebug?.(`[orchestrator] Starting pipeline for agent=${agentSlug} runId=${runId}`);
 
+    // Section 16 (G3): Track exit reason to conditionally clear bridge state
+    let exitReason: OrchestratorExitReason = 'completed';
+
     // Create cost tracker with budget from agent config or default
     const budgetUsd = agentConfig.orchestrator?.budgetUsd ?? 50;
     const costTracker = new CostTracker({ budgetUsd });
@@ -3201,8 +3307,21 @@ export class ClaudeAgent extends BaseAgent {
         try {
           const sourceConfig = loadSourceConfig(this.workspaceRootPath, mcpSourceSlug);
           if (sourceConfig?.mcp) {
+            const hasWebsearchStage = agentConfig.controlFlow.stages.some(s => s.name === 'websearch_calibration');
+            if (hasWebsearchStage && !process.env['BRAVE_API_KEY']) {
+              this.onDebug?.(
+                '[orchestrator] Warning: BRAVE_API_KEY is not set. ' +
+                'Stage 1 web search may return zero results; calibration will be skipped deterministically.',
+              );
+            }
             const transportConfig = extractTransportConfig(
               sourceConfig.mcp as unknown as Record<string, unknown>,
+              this.workspaceRootPath,
+            );
+            this.onDebug?.(
+              `[orchestrator] MCP bridge connect attempt: source=${mcpSourceSlug} ` +
+              `transport=${transportConfig.transport} command=${transportConfig.command ?? '<none>'} ` +
+              `cwd=${transportConfig.cwd ?? '<none>'}`,
             );
             const mcpClient = await mcpLifecycle.connect(transportConfig);
             mcpBridge = new OrchestratorMcpBridge(mcpClient);
@@ -3217,6 +3336,16 @@ export class ClaudeAgent extends BaseAgent {
             `${mcpError instanceof Error ? mcpError.message : String(mcpError)}`,
           );
         }
+      }
+
+      // ── Follow-up auto-detection (Section 21) ─────────────────────
+      // Check if a prior completed orchestrator run exists in the same session.
+      // If so, pass its session ID so follow-up context is loaded at pipeline start.
+      const previousSessionId = this.resolveFollowUpSessionId(sessionPath, sessionId, agentConfig);
+      if (previousSessionId) {
+        this.onDebug?.(
+          `[orchestrator] Follow-up mode: previousSessionId=${previousSessionId} (same-session auto-detect)`,
+        );
       }
 
       // ── Create orchestrator instance ───────────────────────────────
@@ -3235,6 +3364,8 @@ export class ClaudeAgent extends BaseAgent {
               this.onDebug?.(`[orchestrator] stream: ${event.text.slice(0, 50)}...`);
             }
           },
+          onDebug: this.onDebug ? (msg: string) => this.onDebug?.(msg) : undefined,
+          previousSessionId, // Section 21: auto-detected from prior answer.json
         },
         mcpBridge,
         costTracker,
@@ -3242,7 +3373,7 @@ export class ClaudeAgent extends BaseAgent {
       );
 
       // ── Pipeline event loop ────────────────────────────────────────
-      yield* this.processOrchestratorEvents(
+      exitReason = yield* this.processOrchestratorEvents(
         orchestrator.run(userMessage, agentConfig),
         agentSlug, runId, sessionPath,
       );
@@ -3256,19 +3387,28 @@ export class ClaudeAgent extends BaseAgent {
         runId,
         data: { verificationStatus: 'error', error: errorMessage },
       });
+      exitReason = 'error';
     }
 
     // Always yield complete at the end (F7 fix — now reachable even if create() throws)
-    yield { type: 'complete' };
-
-    // Clean up bridge state on run completion
-    this.clearOrchestratorBridgeState(sessionPath, agentSlug);
-
-    // Ensure MCP client is closed — separate try to guarantee cleanup
+    // Section 16: Wrap in try/finally so MCP cleanup runs even when
+    // sessions.ts returns from the for-await loop on 'complete' (which
+    // calls generator.return(), making post-yield code unreachable).
+    // Bridge state is only cleared on 'completed' exit — preserved on 'paused' for resume detection.
     try {
-      await mcpLifecycle.close();
-    } catch {
-      // Best-effort MCP cleanup
+      yield { type: 'complete' };
+    } finally {
+      this.onDebug?.(`[orchestrator] Cleanup: exitReason=${exitReason}`);
+      // Only clear bridge state when pipeline is done — preserve on pause for resume detection (G4)
+      if (exitReason !== 'paused') {
+        this.clearOrchestratorBridgeState(sessionPath, agentSlug);
+      }
+      // Ensure MCP client is closed — guaranteed by finally block (all exit paths)
+      try {
+        await mcpLifecycle.close();
+      } catch {
+        // Best-effort MCP cleanup
+      }
     }
   }
 
@@ -3291,8 +3431,12 @@ export class ClaudeAgent extends BaseAgent {
 
     this.onDebug?.(`[orchestrator] Resuming pipeline for agent=${agentSlug} runId=${runId}`);
 
-    // Clear bridge state immediately — we're handling the resume now
-    this.clearOrchestratorBridgeState(sessionPath, agentSlug);
+    // Section 16 (G3): Track exit reason to conditionally clear bridge state
+    let exitReason: OrchestratorExitReason = 'completed';
+
+    // Section 16 (G7): Do NOT clear bridge state before pipeline starts.
+    // If MCP connect fails or resume throws, bridge state must survive for retry.
+    // Conditional clear in the finally block handles all exits.
 
     // Re-create cost tracker (costs from earlier stages are in pipeline-state.json, not tracked here)
     const budgetUsd = agentConfig.orchestrator?.budgetUsd ?? 50;
@@ -3310,8 +3454,21 @@ export class ClaudeAgent extends BaseAgent {
         try {
           const sourceConfig = loadSourceConfig(this.workspaceRootPath, mcpSourceSlug);
           if (sourceConfig?.mcp) {
+            const hasWebsearchStage = agentConfig.controlFlow.stages.some(s => s.name === 'websearch_calibration');
+            if (hasWebsearchStage && !process.env['BRAVE_API_KEY']) {
+              this.onDebug?.(
+                '[orchestrator] Warning: BRAVE_API_KEY is not set. ' +
+                'Stage 1 web search may return zero results; calibration will be skipped deterministically.',
+              );
+            }
             const transportConfig = extractTransportConfig(
               sourceConfig.mcp as unknown as Record<string, unknown>,
+              this.workspaceRootPath,
+            );
+            this.onDebug?.(
+              `[orchestrator] MCP bridge connect attempt (resume): source=${mcpSourceSlug} ` +
+              `transport=${transportConfig.transport} command=${transportConfig.command ?? '<none>'} ` +
+              `cwd=${transportConfig.cwd ?? '<none>'}`,
             );
             const mcpClient = await mcpLifecycle.connect(transportConfig);
             mcpBridge = new OrchestratorMcpBridge(mcpClient);
@@ -3336,6 +3493,7 @@ export class ClaudeAgent extends BaseAgent {
               this.onDebug?.(`[orchestrator] resume stream: ${event.text.slice(0, 50)}...`);
             }
           },
+          onDebug: this.onDebug ? (msg: string) => this.onDebug?.(msg) : undefined,
         },
         mcpBridge,
         costTracker,
@@ -3343,7 +3501,7 @@ export class ClaudeAgent extends BaseAgent {
       );
 
       // ── Resume pipeline from paused state ──────────────────────────
-      yield* this.processOrchestratorEvents(
+      exitReason = yield* this.processOrchestratorEvents(
         orchestrator.resume(userMessage, agentConfig),
         agentSlug, runId, sessionPath,
       );
@@ -3357,17 +3515,27 @@ export class ClaudeAgent extends BaseAgent {
         runId,
         data: { verificationStatus: 'error', error: errorMessage },
       });
+      exitReason = 'error';
     }
 
-    yield { type: 'complete' };
-
-    // Clean up bridge state on resume completion
-    this.clearOrchestratorBridgeState(sessionPath, agentSlug);
-
+    // Section 16: Wrap in try/finally so MCP cleanup runs even when
+    // sessions.ts returns from the for-await loop on 'complete' (which
+    // calls generator.return(), making post-yield code unreachable).
+    // Bridge state is only cleared on 'completed' exit — preserved on 'paused' for resume detection.
     try {
-      await mcpLifecycle.close();
-    } catch {
-      // Best-effort MCP cleanup
+      yield { type: 'complete' };
+    } finally {
+      this.onDebug?.(`[orchestrator] Resume cleanup: exitReason=${exitReason}`);
+      // Only clear bridge state when pipeline is done — preserve on pause for resume detection (G4)
+      if (exitReason !== 'paused') {
+        this.clearOrchestratorBridgeState(sessionPath, agentSlug);
+      }
+      // Ensure MCP client is closed — guaranteed by finally block (all exit paths)
+      try {
+        await mcpLifecycle.close();
+      } catch {
+        // Best-effort MCP cleanup
+      }
     }
   }
 
@@ -3383,7 +3551,10 @@ export class ClaudeAgent extends BaseAgent {
     agentSlug: string,
     runId: string,
     sessionPath: string,
-  ): AsyncGenerator<AgentEvent> {
+  ): AsyncGenerator<AgentEvent, OrchestratorExitReason> {
+    // Section 16 (G3): Track exit reason as generator return value
+    let exitReason: OrchestratorExitReason = 'completed';
+
     for await (const event of events) {
       switch (event.type) {
         case 'orchestrator_stage_start':
@@ -3430,11 +3601,11 @@ export class ClaudeAgent extends BaseAgent {
           break;
 
         case 'orchestrator_pause':
+          // Section 16 (G8): Write bridge state BEFORE yield to prevent generator.return() cancellation
+          this.writeOrchestratorBridgeState(sessionPath, agentSlug, event.stage, runId);
+
           // Yield pause message as assistant text so user sees the analysis
           yield { type: 'text_complete', text: event.message, isIntermediate: false };
-
-          // F2: Write bridge state so session layer detects the paused pipeline
-          this.writeOrchestratorBridgeState(sessionPath, agentSlug, event.stage, runId);
 
           // Emit stage gate pause for renderer's agentRunStateAtom
           this.onAgentStagePause?.({
@@ -3443,6 +3614,7 @@ export class ClaudeAgent extends BaseAgent {
             runId,
             data: { message: event.message, orchestratorMode: true },
           });
+          exitReason = 'paused';
           break;
 
         case 'orchestrator_complete':
@@ -3456,6 +3628,7 @@ export class ClaudeAgent extends BaseAgent {
               stageCount: event.stageCount,
             },
           });
+          exitReason = 'completed';
           break;
 
         case 'orchestrator_budget_exceeded':
@@ -3466,6 +3639,7 @@ export class ClaudeAgent extends BaseAgent {
             runId,
             data: { verificationStatus: 'budget_exceeded' },
           });
+          exitReason = 'error';
           break;
 
         case 'text':
@@ -3480,9 +3654,13 @@ export class ClaudeAgent extends BaseAgent {
             runId,
             data: { verificationStatus: 'error', error: event.error },
           });
+          exitReason = 'error';
           break;
       }
     }
+
+    this.onDebug?.(`[orchestrator] processOrchestratorEvents exiting: exitReason=${exitReason}`);
+    return exitReason;
   }
 
   // ============================================================

@@ -180,6 +180,10 @@ function getOAuthDefines(): Record<string, string> {
     const value = process.env[varName] || "";
     defines[`process.env.${varName}`] = JSON.stringify(value);
   }
+
+  // Embed build timestamp so stale builds are immediately visible (Section 21)
+  defines['process.env.BUILD_TIMESTAMP'] = JSON.stringify(new Date().toISOString());
+
   return defines;
 }
 
@@ -415,8 +419,9 @@ async function main(): Promise<void> {
         restartTimer = setTimeout(async () => {
           restartTimer = null;
           restartCount++;
-          const timestamp = new Date().toISOString();
-          console.log(`\n🔄 Restart #${restartCount} — main.cjs rebuilt [${timestamp}]`);
+          const buildTimestamp = new Date().toISOString();
+          console.log(`\n🔄 Restart #${restartCount} — main.cjs rebuilt [${buildTimestamp}]`);
+          console.log(`📌 BUILD_TIMESTAMP embedded: ${buildTimestamp}`);
           console.log(`⚠️  Active sessions will resume automatically after restart`);
 
           // Wait for main.cjs to stabilize on disk before restarting
@@ -424,6 +429,16 @@ async function main(): Promise<void> {
           if (!stable) {
             console.log("⏳ main.cjs did not stabilize — skipping restart");
             return;
+          }
+
+          // Post-build verification: confirm BUILD_TIMESTAMP is embedded (Section 21)
+          try {
+            const buildContent = readFileSync(mainCjsPath, "utf-8");
+            if (!buildContent.includes("BUILD_TIMESTAMP")) {
+              console.warn("⚠️  BUILD_TIMESTAMP not found in main.cjs — build may be stale");
+            }
+          } catch {
+            // Non-fatal — proceed with restart even if verification fails
           }
 
           // Kill the current Electron process

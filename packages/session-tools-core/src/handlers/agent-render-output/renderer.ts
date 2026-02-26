@@ -34,6 +34,8 @@ import {
   metadataHeader,
   separator,
   collapsible,
+  escapeMd,
+  formatSourceBlockSpacing,
 } from './markdown-formatters.ts';
 
 // ============================================================
@@ -75,9 +77,10 @@ export function renderDocument(
     parts.push(buildExternalReferences(finalAnswer.webReferences, config));
   }
 
-  // 9. Prior research references
+  // 9. Prior research references (filtered to only referenced sections — Section 18, F6)
   if (finalAnswer.priorSections?.length) {
-    parts.push(buildPriorResearchReferences(finalAnswer.priorSections, config));
+    const synthesisBody = buildSynthesisBody(finalAnswer, config, linker);
+    parts.push(buildPriorResearchReferences(finalAnswer.priorSections, config, synthesisBody));
   }
 
   // 10. Research decomposition appendix
@@ -140,8 +143,22 @@ function buildSynthesisBody(
 ): string {
   const { synthesis, sourceTexts } = finalAnswer;
 
+  // Pre-normalize: move orphaned WEB_REF/PRIOR_REF markers into Sources blocks (Section 19, Phase 5)
+  const normalized = normalizeOrphanedMarkers(synthesis);
+
+  // Process WEB_REF and PRIOR_REF markers before splitting into sections (Section 17, F4)
+  let processed = injectWebAndPriorMarkers(
+    normalized,
+    finalAnswer.webReferences ?? [],
+    finalAnswer.priorSections ?? [],
+    config,
+  );
+
+  // Apply source block spacing to prevent blockquote wall (Section 17, F9)
+  processed = formatSourceBlockSpacing(processed);
+
   // Split synthesis into sections by ## headings
-  const sections = splitIntoSections(synthesis);
+  const sections = splitIntoSections(processed);
 
   const processedSections = sections.map((section) => {
     // If the section already has a > **Sources** block, leave it as-is
@@ -151,7 +168,9 @@ function buildSynthesisBody(
 
     // Otherwise, inject source blocks for citations found in this section
     const injected = injectSourceBlocks(section, sourceTexts, config.citationRegex);
-    return linkifyCitations(injected, linker, config.citationRegex);
+    // Apply source block spacing after injection (Section 17, F9)
+    const spaced = formatSourceBlockSpacing(injected);
+    return linkifyCitations(spaced, linker, config.citationRegex);
   });
 
   return processedSections.join(separator());
@@ -208,9 +227,16 @@ function buildExternalReferences(
   refs: WebReference[],
   config: RenderConfig,
 ): string {
-  const items = refs.map((r) =>
-    `- [${r.title}](${r.url})${r.sourceType ? ` *(${r.sourceType})*` : ''}\n  ${r.insight}`,
-  );
+  const refFormat = config.webReference?.refFormat ?? '[W{num}]';
+  const linkToOriginal = config.webReference?.linkToOriginal ?? true;
+
+  const items = refs.map((r, i) => {
+    const label = refFormat.replace('{num}', String(i + 1));
+    const title = escapeMd(r.title);
+    const link = linkToOriginal ? `[${title}](${r.url})` : title;
+    const sourceTag = r.sourceType ? ` *(${r.sourceType})*` : '';
+    return `- **${label}** ${link}${sourceTag}\n  ${r.insight}`;
+  });
 
   return `## ${config.sections.externalReferencesTitle}\n\n${items.join('\n\n')}`;
 }
@@ -218,14 +244,26 @@ function buildExternalReferences(
 function buildPriorResearchReferences(
   sections: PriorSection[],
   config: RenderConfig,
+  answerBody: string,
 ): string {
   const refFormat = config.priorResearch?.refFormat ?? '[P{num}]';
   const excerptLen = config.priorResearch?.excerptLength ?? 200;
 
-  const items = sections.map((s) => {
+  // Filter to only sections referenced in the answer body via [P1], [P2] etc. (Section 18, F6)
+  const referencedNums = new Set(
+    [...answerBody.matchAll(/\[P(\d+)\]/g)].map(m => parseInt(m[1] ?? '0', 10)),
+  );
+  const filtered = referencedNums.size > 0
+    ? sections.filter(s => referencedNums.has(s.sectionNum))
+    : sections; // If no inline references found, show all (graceful fallback)
+
+  if (!filtered.length) return '';
+
+  const items = filtered.map((s) => {
     const label = refFormat.replace('{num}', String(s.sectionNum));
     const excerpt = truncate(s.excerpt, excerptLen);
-    return `- **${label}** ${s.heading}\n  > *${excerpt}*`;
+    const heading = escapeMd(s.heading);
+    return `- **${label}** ${heading}\n  > *${excerpt}*`;
   });
 
   return `## ${config.sections.priorResearchTitle}\n\n${items.join('\n\n')}`;
@@ -313,6 +351,285 @@ function linkifyCitations(
     // Preserve original parentheses style
     return hadOuterParens ? `(${linked})` : linked;
   });
+}
+
+// ============================================================
+// Web & Prior Reference Marker Processing (Section 18, F3/F4/F5)
+// ============================================================
+
+/**
+ * Process a single WEB_REF marker line into a formatted italic blockquote line.
+ *
+ * Input:  `WEB_REF|https://example.com|Key insight`
+ * Output: `*[W1] [Page Title](url): "Key insight"*`
+ *
+ * Mirrors gamma's italic blockquote style for web references.
+ *
+ * @returns Object with formatted text and updated nextIdx
+ */
+export function processWebRefLine(
+  line: string,
+  webReferences: WebReference[],
+  webLabelMap: Map<string, number>,
+  nextIdx: number,
+  config: RenderConfig,
+): { text: string; nextIdx: number } {
+  const refFormat = config.webReference?.refFormat ?? '[W{num}]';
+  const linkToOriginal = config.webReference?.linkToOriginal ?? true;
+
+  const parts = line.split('|');
+  if (parts.length < 3) {
+    return { text: line, nextIdx };
+  }
+  const url = (parts[1] ?? '').trim();
+  const insight = parts.slice(2).join('|').trim();
+
+  const ref = fuzzyUrlLookup(url, webReferences);
+
+  // Assign sequential label
+  let idx = webLabelMap.get(ref?.url ?? url);
+  if (idx === undefined) {
+    idx = nextIdx++;
+    webLabelMap.set(ref?.url ?? url, idx);
+  }
+
+  const label = refFormat.replace('{num}', String(idx));
+  const title = ref?.title ? escapeMd(ref.title) : extractDomain(url);
+
+  if (linkToOriginal && (ref?.url ?? url)) {
+    return {
+      text: `*${label} [${title}](${ref?.url ?? url}): "${escapeMd(insight)}"*`,
+      nextIdx,
+    };
+  }
+  return {
+    text: `*${label} ${title}: "${escapeMd(insight)}"*`,
+    nextIdx,
+  };
+}
+
+/**
+ * Process a single PRIOR_REF marker line into formatted blockquote lines.
+ *
+ * Input:  `PRIOR_REF|P1|Risk Assessment|The framework identifies...`
+ * Output: `*From prior research — Risk Assessment [P1]*`
+ *         `*The framework identifies...*`
+ *
+ * Mirrors gamma's blockquote excerpt style for prior references.
+ *
+ * @returns Object with array of formatted lines (each should be prefixed with `> ` by caller)
+ */
+export function processPriorRefLine(
+  line: string,
+  priorSections: PriorSection[],
+  config: RenderConfig,
+): { lines: string[] } {
+  const priorRefFormat = config.priorResearch?.refFormat ?? '[P{num}]';
+  const parts = line.split('|');
+
+  if (parts.length < 4) {
+    return { lines: [line] };
+  }
+
+  const sectionId = (parts[1] ?? '').trim();
+  const heading = (parts[2] ?? '').trim();
+  const excerpt = parts.slice(3).join('|').trim();
+
+  // Try to match section by sectionId string or sectionNum
+  const numMatch = sectionId.match(/\d+/);
+  const sectionNum = numMatch ? parseInt(numMatch[0], 10) : 0;
+  const section = priorSections.find(s =>
+    s.sectionId === sectionId || s.sectionNum === sectionNum,
+  );
+  const num = section?.sectionNum ?? sectionNum;
+  const label = priorRefFormat.replace('{num}', String(num));
+
+  const result: string[] = [
+    `*${label} From prior research — ${escapeMd(heading)}*`,
+  ];
+  if (excerpt) {
+    result.push(`*${escapeMd(excerpt)}*`);
+  }
+  return { lines: result };
+}
+
+/**
+ * Pre-normalization: Move orphaned WEB_REF and PRIOR_REF marker lines into the
+ * nearest preceding `> **Sources**` blockquote.
+ *
+ * Real pipeline data (bright-rose session) showed the LLM placing WEB_REF markers
+ * as standalone lines between sections, outside of any blockquote. This function
+ * detects such orphaned markers and relocates them to the closest preceding Sources
+ * blockquote. If no preceding Sources block exists, the marker is moved to the end
+ * of the nearest following Sources block, or wrapped into a new Sources blockquote
+ * appended to the preceding section.
+ *
+ * Section 19, Phase 5 — Blockquote normalization.
+ */
+export function normalizeOrphanedMarkers(body: string): string {
+  const lines = body.split('\n');
+  const output: string[] = [];
+  const orphaned: string[] = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const rawLine = lines[i] ?? '';
+    const trimmedLine = rawLine.trimStart();
+
+    // Check if this is an orphaned marker (not inside a blockquote)
+    const isOrphanedWebRef = trimmedLine.startsWith('WEB_REF|') && !rawLine.startsWith('>');
+    const isOrphanedPriorRef = trimmedLine.startsWith('PRIOR_REF|') && !rawLine.startsWith('>');
+
+    if (isOrphanedWebRef || isOrphanedPriorRef) {
+      orphaned.push(trimmedLine);
+      continue;
+    }
+
+    // If we have accumulated orphaned markers and hit a non-orphan line,
+    // try to flush them into the last Sources blockquote in output
+    if (orphaned.length > 0) {
+      flushOrphanedMarkers(output, orphaned);
+      orphaned.length = 0;
+    }
+
+    output.push(rawLine);
+  }
+
+  // Flush any remaining orphaned markers at end of text
+  if (orphaned.length > 0) {
+    flushOrphanedMarkers(output, orphaned);
+  }
+
+  return output.join('\n');
+}
+
+/**
+ * Flush accumulated orphaned markers into the last Sources blockquote in output,
+ * or create a new one if none exists.
+ */
+function flushOrphanedMarkers(output: string[], orphaned: string[]): void {
+  // Find the last Sources blockquote end position in output
+  let lastSourcesEnd = -1;
+  for (let i = output.length - 1; i >= 0; i--) {
+    const line = output[i] ?? '';
+    // A line that IS part of the last Sources blockquote
+    if (line.startsWith('> ') && lastSourcesEnd === -1) {
+      // Check if this is within a Sources block by scanning backward
+      for (let j = i; j >= 0; j--) {
+        if ((output[j] ?? '').includes('> **Sources**')) {
+          lastSourcesEnd = i;
+          break;
+        }
+        // If we hit a non-blockquote line before finding Sources header, not a Sources block
+        if (!(output[j] ?? '').startsWith('>') && (output[j] ?? '').trim() !== '') {
+          break;
+        }
+      }
+    }
+    if (lastSourcesEnd !== -1) break;
+  }
+
+  if (lastSourcesEnd !== -1) {
+    // Insert after the last line of the Sources blockquote
+    const insertLines = orphaned.map(m => `> ${m}`);
+    output.splice(lastSourcesEnd + 1, 0, ...insertLines);
+  } else {
+    // No Sources blockquote found — create one at current position
+    output.push('');
+    output.push('> **Sources**');
+    output.push('>');
+    for (const marker of orphaned) {
+      output.push(`> ${marker}`);
+    }
+  }
+}
+
+/**
+ * Process WEB_REF and PRIOR_REF markers in synthesis text using line-by-line processing.
+ *
+ * Uses line-by-line approach (not regex `.replace()`) to properly handle
+ * markers appearing inside `> ` blockquote prefixes. Strips the `> ` prefix
+ * before matching, then re-emits markers as formatted blockquote lines.
+ *
+ * Inline [W1], [P1] labels in body text are left untouched — they were placed
+ * by the LLM and should remain in prose.
+ *
+ * Mirrors gamma's `_inject_inline_excerpts()` pattern.
+ */
+export function injectWebAndPriorMarkers(
+  body: string,
+  webReferences: WebReference[],
+  priorSections: PriorSection[],
+  config: RenderConfig,
+): string {
+  const lines = body.split('\n');
+  const output: string[] = [];
+  const webLabelMap = new Map<string, number>();
+  let nextWebIdx = 1;
+
+  for (const rawLine of lines) {
+    // Strip blockquote prefix for matching
+    const inBlockquote = rawLine.startsWith('> ');
+    const line = inBlockquote ? rawLine.slice(2) : rawLine;
+
+    if (line.startsWith('WEB_REF|')) {
+      // Process WEB_REF marker → formatted italic blockquote line
+      const processed = processWebRefLine(
+        line, webReferences, webLabelMap, nextWebIdx, config,
+      );
+      nextWebIdx = processed.nextIdx;
+      output.push(`> ${processed.text}`);
+    } else if (line.startsWith('PRIOR_REF|')) {
+      // Process PRIOR_REF marker → blockquote with heading + excerpt
+      const processed = processPriorRefLine(line, priorSections, config);
+      output.push(...processed.lines.map(l => `> ${l}`));
+    } else {
+      // Leave non-marker lines unchanged (incl. inline [W1] labels in prose)
+      output.push(rawLine);
+    }
+  }
+
+  return output.join('\n');
+}
+
+/**
+ * Extract domain from a URL for display as fallback title.
+ */
+function extractDomain(url: string): string {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return url;
+  }
+}
+
+/**
+ * Look up a web reference by URL, with domain-based fuzzy fallback.
+ * Mirrors gamma's `_fuzzy_url_lookup` pattern.
+ *
+ * 1. Exact URL match
+ * 2. Domain-based fallback (matches if domain is the same)
+ */
+export function fuzzyUrlLookup(
+  url: string,
+  refs: WebReference[],
+): WebReference | undefined {
+  // 1. Exact match
+  const exact = refs.find(r => r.url === url);
+  if (exact) return exact;
+
+  // 2. Domain-based fallback
+  try {
+    const targetDomain = new URL(url).hostname;
+    return refs.find(r => {
+      try {
+        return new URL(r.url).hostname === targetDomain;
+      } catch {
+        return false;
+      }
+    });
+  } catch {
+    return undefined;
+  }
 }
 
 // ============================================================
