@@ -1,4 +1,4 @@
-﻿---
+---
 name: ISA Deep Research
 description: Multi-stage research agent for ISA standards with hybrid search, 4-axis verification, and progressive disclosure output
 sources:

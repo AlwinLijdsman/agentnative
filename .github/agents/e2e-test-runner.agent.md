@@ -84,7 +84,7 @@ scripts/
 
 1. Read `CLAUDE.md`
 2. Verify test infrastructure exists:
-   - Check `packages/session-tools-core/src/handlers/__tests__/e2e-utils.ts` exists
+  - Check `packages/agent-pipeline-core/src/handlers/__tests__/e2e-utils.ts` exists
    - Check `scripts/extract-oauth-token.ts` exists
    - Check `apps/electron/src/__tests__/e2e-sdk-live.test.ts` exists
 3. List `agents/` to identify available target agents

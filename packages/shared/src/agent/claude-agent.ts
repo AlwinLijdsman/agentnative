@@ -43,7 +43,9 @@ import {
 import { type PermissionsContext, permissionsConfigCache } from './permissions-config.ts';
 import { getSessionPlansPath, getSessionPath } from '../sessions/storage.ts';
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'fs';
+import { tmpdir } from 'node:os';
 import { join } from 'path';
+import { isResumableTranscript } from './sdk-transcript-validator.ts';
 import { expandPath } from '../utils/paths.ts';
 import { extractWorkspaceSlug } from '../utils/workspace.ts';
 import {
@@ -1359,7 +1361,23 @@ export class ClaudeAgent extends BaseAgent {
         })(),
         // Continue from previous session if we have one (enables conversation history & auto compaction)
         // Skip resume on retry (after session expiry) to start fresh
-        ...(!_isRetry && this.sessionId ? { resume: this.sessionId } : {}),
+        // Pre-resume validation: check transcript is actually resumable before attempting.
+        // Dequeue-only transcripts (≈139 bytes) from the first turn cause "No conversation found"
+        // errors and trigger unnecessary SESSION_RECOVERY with "Restoring conversation context...".
+        ...(() => {
+          if (_isRetry || !this.sessionId) return {};
+          const sdkCwd = this.config.session?.sdkCwd
+            ?? (sessionId ? getSessionPath(this.workspaceRootPath, sessionId) : this.workspaceRootPath);
+          if (isResumableTranscript(sdkCwd, this.sessionId)) {
+            return { resume: this.sessionId };
+          }
+          // Transcript is not resumable — clear the stale session ID and start fresh
+          debug('[SESSION_RECOVERY] Pre-resume: transcript not resumable for %s, clearing session ID', this.sessionId);
+          console.error(`[ClaudeAgent] Pre-resume: transcript not resumable for ${this.sessionId}, starting fresh`);
+          this.sessionId = null;
+          this.config.onSdkSessionIdCleared?.();
+          return {};
+        })(),
         mcpServers,
         // NOTE: This callback is NOT called by the SDK because we set `permissionMode: 'bypassPermissions'` above.
         // All permission logic is handled via the PreToolUse hook instead (see hooks.PreToolUse above).
@@ -2979,6 +2997,13 @@ export class ClaudeAgent extends BaseAgent {
    * Run a simple text completion using Claude SDK.
    * No tools, empty system prompt - just text in → text out.
    * Uses the same auth infrastructure as the main agent.
+   *
+   * IMPORTANT: Uses `cwd: tmpdir()` to isolate SDK transcript storage from the
+   * main chat's project directory. Without this, concurrent calls (e.g. title
+   * generation firing alongside the first chat response) write transcripts to
+   * the same `~/.claude/projects/<hash>/` directory, corrupting the main chat's
+   * session transcript and causing "No conversation found with session ID"
+   * errors on the next message resume.
    */
   async runMiniCompletion(prompt: string): Promise<string | null> {
     try {
@@ -2989,6 +3014,11 @@ export class ClaudeAgent extends BaseAgent {
         model,
         maxTurns: 1,
         systemPrompt: 'Reply with ONLY the requested text. No explanation.', // Minimal - no Claude Code preset
+        // Isolate from main chat's SDK project directory to prevent transcript
+        // collision when running concurrently (title gen, summarization, etc.)
+        cwd: tmpdir(),
+        // Don't persist ephemeral transcripts for one-shot completions
+        persistSession: false,
       };
 
       let result = '';

@@ -57,6 +57,7 @@
     "./agents": "./src/agents/index.ts"
   },
   "dependencies": {
+    "@craft-agent/agent-pipeline-core": "workspace:*",
     "@craft-agent/codex-types": "workspace:*",
     "@craft-agent/core": "workspace:*",
     "@craft-agent/session-tools-core": "workspace:*",

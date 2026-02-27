@@ -149,3 +149,11 @@ export * from './core/index.ts';
 
 // Export PowerShell validator root setter (for Electron startup on Windows)
 export { setPowerShellValidatorRoot } from './powershell-validator.ts';
+
+// Export SDK transcript validator - validates session transcripts before resume
+export {
+  getSdkConfigDir,
+  slugifyCwd,
+  getTranscriptPath,
+  isResumableTranscript,
+} from './sdk-transcript-validator.ts';

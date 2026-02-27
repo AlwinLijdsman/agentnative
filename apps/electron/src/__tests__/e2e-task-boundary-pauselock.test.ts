@@ -26,12 +26,12 @@ import { join } from 'node:path';
 import { readFileSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
 import {
   E2ESessionHarness,
-} from '../../../../packages/session-tools-core/src/handlers/__tests__/e2e-utils.ts';
+} from '../../../../packages/agent-pipeline-core/src/handlers/__tests__/e2e-utils.ts';
 import {
   validateAgentEventsLog,
   assertEventSequence,
   assertNoDuplicateCompletes,
-} from '../../../../packages/session-tools-core/src/handlers/__tests__/e2e-session-validators.ts';
+} from '../../../../packages/agent-pipeline-core/src/handlers/__tests__/e2e-session-validators.ts';
 
 // ============================================================
 // Load Real ISA Config

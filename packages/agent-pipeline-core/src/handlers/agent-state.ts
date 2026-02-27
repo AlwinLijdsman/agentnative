@@ -11,7 +11,6 @@
  */
 
 import { join } from 'node:path';
-import { mkdirSync, renameSync } from 'node:fs';
 import type { SessionToolContext } from '../context.ts';
 import type { ToolResult } from '../types.ts';
 import { successResponse, errorResponse } from '../response.ts';
@@ -53,7 +52,7 @@ export async function handleAgentState(
   switch (action) {
     case 'init': {
       // Create state.json with empty object (agent defines its own schema)
-      mkdirSync(dataDir, { recursive: true });
+      ctx.fs.mkdir(dataDir, { recursive: true });
       if (ctx.fs.exists(statePath)) {
         return errorResponse(
           `State already exists for agent '${agentSlug}'. Use action=read to inspect or action=update to modify.`,
@@ -82,7 +81,7 @@ export async function handleAgentState(
         return errorResponse('data is required for update action.');
       }
 
-      mkdirSync(dataDir, { recursive: true });
+      ctx.fs.mkdir(dataDir, { recursive: true });
 
       // Read current state (or start from empty)
       let currentState: Record<string, unknown> = {};
@@ -102,7 +101,7 @@ export async function handleAgentState(
       // Atomic write
       const tmpPath = statePath + '.tmp';
       ctx.fs.writeFile(tmpPath, JSON.stringify(updatedState, null, 2));
-      renameSync(tmpPath, statePath);
+      ctx.fs.rename(tmpPath, statePath);
 
       return successResponse(JSON.stringify({ initialized: true, state: updatedState }, null, 2));
     }

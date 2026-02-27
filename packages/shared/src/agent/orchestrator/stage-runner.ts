@@ -38,10 +38,10 @@ import { buildPriorContextHint } from './follow-up-context.ts';
 import { callBamlStage0, callBamlStage1, callBamlStage3 } from './baml-adapter.ts';
 
 // Renderer imports for deterministic output stage (Phase 8)
-import { renderDocument } from '@craft-agent/session-tools-core/renderer';
-import type { FinalAnswer, RenderConfig, Citation, VerificationScores, SubQuery, WebReference } from '@craft-agent/session-tools-core/renderer-types';
-import { mergeRenderConfig, extractOutputConfig } from '@craft-agent/session-tools-core/renderer-config';
-import { createSourceLinker } from '@craft-agent/session-tools-core/renderer-linker';
+import { renderDocument } from '@craft-agent/agent-pipeline-core/renderer';
+import type { FinalAnswer, RenderConfig, Citation, VerificationScores, SubQuery, WebReference } from '@craft-agent/agent-pipeline-core/renderer-types';
+import { mergeRenderConfig, extractOutputConfig } from '@craft-agent/agent-pipeline-core/renderer-config';
+import { createSourceLinker } from '@craft-agent/agent-pipeline-core/renderer-linker';
 
 // Synthesis post-processor — deterministic label injection safety net (Section 19)
 import { postProcessSynthesis } from './synthesis-post-processor.ts';

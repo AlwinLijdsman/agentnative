@@ -244,7 +244,7 @@ async function main() {
 
   try {
     for await (const event of orchestrator.resume(
-      'Yes, proceed with the current query plan. No web search needed.',
+      'A. Yes — proceed with web search calibration using the planned queries.',
       agentConfig,
     )) {
       const record = event as OrchestratorEventRecord;

@@ -20,6 +20,7 @@ const COPILOT_INTERCEPTOR_OUTPUT = join(DIST_DIR, "copilot-interceptor.cjs");
 const BRIDGE_SERVER_DIR = join(ROOT_DIR, "packages/bridge-mcp-server");
 const BRIDGE_SERVER_OUTPUT = join(BRIDGE_SERVER_DIR, "dist/index.js");
 const SESSION_TOOLS_CORE_DIR = join(ROOT_DIR, "packages/session-tools-core");
+const AGENT_PIPELINE_CORE_DIR = join(ROOT_DIR, "packages/agent-pipeline-core");
 const SESSION_SERVER_DIR = join(ROOT_DIR, "packages/session-mcp-server");
 const SESSION_SERVER_OUTPUT = join(SESSION_SERVER_DIR, "dist/index.js");
 const MERMAID_DIR = join(ROOT_DIR, "packages/mermaid");
@@ -139,6 +140,12 @@ function verifySessionToolsCore(): void {
     process.exit(1);
   }
 
+  const agentPipelineSourceFile = join(AGENT_PIPELINE_CORE_DIR, "src/index.ts");
+  if (!existsSync(agentPipelineSourceFile)) {
+    console.error("Agent pipeline core source not found at", agentPipelineSourceFile);
+    process.exit(1);
+  }
+
   console.log("Session tools core verified");
 }
 
@@ -213,6 +220,10 @@ async function buildSessionServer(): Promise<void> {
     "--format=cjs",
     `--outfile=${SESSION_SERVER_OUTPUT}`,
     `--alias:@craft-agent/session-tools-core=${join(SESSION_TOOLS_CORE_DIR, "src/index.ts")}`,
+    `--alias:@craft-agent/agent-pipeline-core=${join(AGENT_PIPELINE_CORE_DIR, "src/index.ts")}`,
+    `--alias:@craft-agent/agent-pipeline-core/types=${join(AGENT_PIPELINE_CORE_DIR, "src/types.ts")}`,
+    `--alias:@craft-agent/agent-pipeline-core/response=${join(AGENT_PIPELINE_CORE_DIR, "src/response.ts")}`,
+    `--alias:@craft-agent/agent-pipeline-core/context=${join(AGENT_PIPELINE_CORE_DIR, "src/context.ts")}`,
     `--alias:@craft-agent/mermaid=${join(MERMAID_DIR, "src/index.ts")}`,
   ]);
 

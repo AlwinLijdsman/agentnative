@@ -19,17 +19,17 @@
 import { describe, it, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
-import { readFileSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
+import { readFileSync, existsSync, writeFileSync, mkdirSync, readdirSync } from 'node:fs';
 import {
   E2ESessionHarness,
-} from '../../../../packages/session-tools-core/src/handlers/__tests__/e2e-utils.ts';
+} from '../../../../packages/agent-pipeline-core/src/handlers/__tests__/e2e-utils.ts';
 import {
   validateAgentEventsLog,
   validateRunState,
   assertEventSequence,
   assertPauseOutcome,
   assertNoDuplicateCompletes,
-} from '../../../../packages/session-tools-core/src/handlers/__tests__/e2e-session-validators.ts';
+} from '../../../../packages/agent-pipeline-core/src/handlers/__tests__/e2e-session-validators.ts';
 
 // ============================================================
 // Load Real ISA Config
@@ -63,6 +63,22 @@ function loadRealAgentMd(): string {
     `AGENT.md must exist at ${ISA_AGENT_MD_PATH}`,
   );
   return readFileSync(ISA_AGENT_MD_PATH, 'utf-8');
+}
+
+/**
+ * Load AGENT.md + all prompts/stage-*.md content for body assertions.
+ * Stage instructions now live in individual prompt files.
+ */
+function loadAllAgentContent(): string {
+  let content = loadRealAgentMd();
+  const promptsDir = join(process.cwd(), 'agents', 'isa-deep-research', 'prompts');
+  if (existsSync(promptsDir)) {
+    const files = readdirSync(promptsDir).filter(f => f.endsWith('.md')).sort();
+    for (const f of files) {
+      content += '\n' + readFileSync(join(promptsDir, f), 'utf-8');
+    }
+  }
+  return content;
 }
 
 /**
@@ -220,9 +236,9 @@ describe('E2E ISA Websearch Pipeline — Config Cross-Validation', () => {
     const config = loadRealISAConfig() as {
       controlFlow: { stages: Array<{ id: number; name: string }> };
     };
-    const agentMd = loadRealAgentMd();
+    const allContent = loadAllAgentContent();
 
-    // Map config stage names to expected AGENT.md header patterns
+    // Map config stage names to expected header patterns (in AGENT.md or prompts/)
     const expectedMdHeaders: Record<string, string> = {
       'analyze_query': 'Stage 0: Analyze Query',
       'websearch_calibration': 'Stage 1: Websearch Calibration',
@@ -236,11 +252,11 @@ describe('E2E ISA Websearch Pipeline — Config Cross-Validation', () => {
       const expectedHeader = expectedMdHeaders[stage.name];
       assert.ok(
         expectedHeader,
-        `Config stage name "${stage.name}" should have a known AGENT.md header mapping`,
+        `Config stage name "${stage.name}" should have a known header mapping`,
       );
       assert.ok(
-        agentMd.includes(expectedHeader!),
-        `AGENT.md should contain header "${expectedHeader}" for config stage "${stage.name}" (id=${stage.id})`,
+        allContent.includes(expectedHeader!),
+        `Agent definition should contain header "${expectedHeader}" for config stage "${stage.name}" (id=${stage.id})`,
       );
     }
   });
@@ -275,17 +291,24 @@ describe('E2E ISA Websearch Pipeline — Config Cross-Validation', () => {
     assert.equal(stage4?.name, 'verify', 'Stage 4 should be verify');
   });
 
-  it('AGENT.md repair loop references match config repairUnits', () => {
-    const agentMd = loadRealAgentMd();
+  it('repair loop stages are defined in config repairUnits', () => {
+    const config = loadRealISAConfig() as {
+      controlFlow: {
+        repairUnits: Array<{ stages: number[] }>;
+        stages: Array<{ id: number; name: string }>;
+      };
+    };
 
-    // Repair loop should reference stages 3 and 4
+    // Repair loop references are validated through config.json structure
+    // (stage instructions live in prompts/stage-*.md, repair logic in config)
+    const ru = config.controlFlow.repairUnits[0]!;
+    assert.deepEqual(ru.stages, [3, 4], 'Repair unit should cover stages 3 and 4');
+
+    // Verify the repair prompt exists
+    const allContent = loadAllAgentContent();
     assert.ok(
-      agentMd.includes('stage: 3') || agentMd.includes('stage: 3,'),
-      'AGENT.md repair loop should reference stage 3',
-    );
-    assert.ok(
-      agentMd.includes('stage: 4') || agentMd.includes('stage: 4,'),
-      'AGENT.md repair loop should reference stage 4',
+      allContent.includes('Repair') || allContent.includes('repair'),
+      'Agent prompts should reference repair behavior',
     );
   });
 

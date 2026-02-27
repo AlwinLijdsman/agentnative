@@ -1,12 +1,15 @@
 {
-  "name": "@craft-agent/session-tools-core",
+  "name": "@craft-agent/agent-pipeline-core",
   "version": "0.4.5",
-  "description": "Shared utilities for session-scoped tools (Claude and Codex)",
+  "description": "Deterministic agent pipeline handlers (stage gate, state, validation, rendering)",
   "type": "module",
   "main": "src/index.ts",
   "types": "src/index.ts",
   "exports": {
     ".": "./src/index.ts",
+    "./types": "./src/types.ts",
+    "./response": "./src/response.ts",
+    "./context": "./src/context.ts",
     "./renderer": "./src/handlers/agent-render-output/renderer.ts",
     "./renderer-types": "./src/handlers/agent-render-output/types.ts",
     "./renderer-config": "./src/handlers/agent-render-output/config-loader.ts",
@@ -14,12 +17,9 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "npx tsx --test src/handlers/__tests__/*.test.ts"
+    "test": "npx tsx --test src/handlers/__tests__/*.test.ts src/handlers/agent-render-output/__tests__/*.test.ts"
   },
   "dependencies": {
-    "@craft-agent/agent-pipeline-core": "workspace:*",
-    "@craft-agent/mermaid": "workspace:*",
-    "zod": "^3.23.0",
     "gray-matter": "^4.0.3"
   },
   "devDependencies": {

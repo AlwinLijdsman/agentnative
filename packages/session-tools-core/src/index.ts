@@ -145,13 +145,10 @@ export {
   handleMicrosoftOAuthTrigger,
   // Credential Prompt
   handleCredentialPrompt,
-  // Agent Stage Gate
+  // Agent pipeline handlers (re-exported from @craft-agent/agent-pipeline-core via handlers/index.ts)
   handleAgentStageGate,
-  // Agent State
   handleAgentState,
-  // Agent Validate
   handleAgentValidate,
-  // Agent Render Output
   handleAgentRenderOutput,
 } from './handlers/index.ts';
 

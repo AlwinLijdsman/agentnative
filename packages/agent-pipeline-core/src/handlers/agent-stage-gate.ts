@@ -10,17 +10,11 @@
  * `ctx.callbacks.onAgentStagePause()` to lock pause state and notify UI,
  * while returning `allowed: false` so the model summarizes and stops.
  *
- * Types are defined inline because session-tools-core has no dependency
+ * Types are defined inline because agent-pipeline-core has no dependency
  * on @craft-agent/shared. The agent config is loaded directly from disk.
  */
 
 import { join } from 'node:path';
-import {
-  mkdirSync,
-  appendFileSync,
-  renameSync,
-  unlinkSync,
-} from 'node:fs';
 import type { SessionToolContext } from '../context.ts';
 import type { ToolResult } from '../types.ts';
 import { successResponse, errorResponse } from '../response.ts';
@@ -252,8 +246,8 @@ function getAgentDataDir(ctx: SessionToolContext, agentSlug: string): string {
   return join(ctx.workspacePath, 'sessions', ctx.sessionId, 'data', 'agents', agentSlug);
 }
 
-function ensureDir(dirPath: string): void {
-  mkdirSync(dirPath, { recursive: true });
+function ensureDir(ctx: SessionToolContext, dirPath: string): void {
+  ctx.fs.mkdir(dirPath, { recursive: true });
 }
 
 // ============================================================
@@ -278,18 +272,18 @@ function readRunState(ctx: SessionToolContext, agentSlug: string): RunState | nu
  */
 function writeRunState(ctx: SessionToolContext, agentSlug: string, state: RunState): void {
   const dataDir = getAgentDataDir(ctx, agentSlug);
-  ensureDir(dataDir);
+  ensureDir(ctx, dataDir);
   const stateFile = join(dataDir, 'current-run-state.json');
   const tmpFile = stateFile + '.tmp';
   ctx.fs.writeFile(tmpFile, JSON.stringify(state, null, 2));
-  renameSync(tmpFile, stateFile);
+  ctx.fs.rename(tmpFile, stateFile);
 }
 
 function appendEvent(ctx: SessionToolContext, agentSlug: string, event: AgentEvent): void {
   const dataDir = getAgentDataDir(ctx, agentSlug);
-  ensureDir(dataDir);
+  ensureDir(ctx, dataDir);
   const eventsFile = join(dataDir, 'agent-events.jsonl');
-  appendFileSync(eventsFile, JSON.stringify(event) + '\n', 'utf-8');
+  ctx.fs.appendFile(eventsFile, JSON.stringify(event) + '\n');
 }
 
 /**
@@ -297,7 +291,7 @@ function appendEvent(ctx: SessionToolContext, agentSlug: string, event: AgentEve
  */
 function nextRunId(ctx: SessionToolContext, agentSlug: string): string {
   const runsDir = join(getAgentDataDir(ctx, agentSlug), 'runs');
-  ensureDir(runsDir);
+  ensureDir(ctx, runsDir);
 
   let maxNum = 0;
   try {
@@ -387,7 +381,7 @@ function noRunResult(reason: string): AgentStageGateResult {
 // Inline Error Classification
 // ============================================================
 // Duplicated from @craft-agent/shared/agents/error-classifier.ts
-// because session-tools-core cannot depend on @craft-agent/shared.
+// because agent-pipeline-core cannot depend on @craft-agent/shared.
 
 const TRANSIENT_PATTERNS =
   /timeout|timed?\s*out|rate.?limit|too many requests|retry|503|overloaded|throttl/i;
@@ -485,7 +479,7 @@ function handleStart(
     // Create new run
     const runId = nextRunId(ctx, args.agentSlug);
     const runDir = join(getAgentDataDir(ctx, args.agentSlug), 'runs', runId);
-    ensureDir(runDir);
+    ensureDir(ctx, runDir);
 
     const now = nowISO();
     const state: RunState = {
@@ -816,7 +810,7 @@ function handleComplete(
   // Iteration-aware naming for repair loops: stage2_synthesize_iter0.json
   const runDir = join(getAgentDataDir(ctx, args.agentSlug), 'runs', state.runId);
   const intermediatesDir = join(runDir, 'evidence', 'intermediates');
-  ensureDir(intermediatesDir);
+  ensureDir(ctx, intermediatesDir);
   const stageDef = config.controlFlow.stages.find((s) => s.id === stage);
   // Sanitize stage name to prevent path traversal in filenames
   const safeStageName = (stageDef?.name ?? 'unknown').replace(/[^a-zA-Z0-9_-]/g, '_');
@@ -1282,7 +1276,7 @@ function handleReset(
   // Remove current run state file
   const stateFile = join(getAgentDataDir(ctx, args.agentSlug), 'current-run-state.json');
   if (ctx.fs.exists(stateFile)) {
-    unlinkSync(stateFile);
+    ctx.fs.unlink(stateFile);
   }
 
   return {
@@ -1349,7 +1343,7 @@ function handleResume(
     // Clear run state
     const stateFile = join(getAgentDataDir(ctx, args.agentSlug), 'current-run-state.json');
     if (ctx.fs.exists(stateFile)) {
-      unlinkSync(stateFile);
+      ctx.fs.unlink(stateFile);
     }
 
     return {

@@ -8,7 +8,7 @@
  * Claude's full feature set.
  */
 
-import { existsSync, readFileSync, writeFileSync, readdirSync, statSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, renameSync, unlinkSync, readdirSync, statSync } from 'fs';
 import { join, basename } from 'path';
 import type {
   SessionToolContext,
@@ -102,6 +102,10 @@ export function createClaudeContext(options: ClaudeContextOptions): SessionToolC
     readFile: (path: string) => readFileSync(path, 'utf-8'),
     readFileBuffer: (path: string) => readFileSync(path),
     writeFile: (path: string, content: string) => writeFileSync(path, content, 'utf-8'),
+    appendFile: (path: string, content: string) => appendFileSync(path, content, 'utf-8'),
+    mkdir: (path: string, options?: { recursive?: boolean }) => mkdirSync(path, options),
+    rename: (oldPath: string, newPath: string) => renameSync(oldPath, newPath),
+    unlink: (path: string) => unlinkSync(path),
     isDirectory: (path: string) => existsSync(path) && statSync(path).isDirectory(),
     readdir: (path: string) => readdirSync(path),
     stat: (path: string) => {

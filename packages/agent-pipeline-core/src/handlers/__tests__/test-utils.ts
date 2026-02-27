@@ -1,12 +1,12 @@
 /**
- * Test Utilities for Session Tools Core handlers.
+ * Test Utilities for Agent Pipeline Core handlers.
  *
- * Uses REAL temp directories because handlers call mkdirSync, renameSync,
- * appendFileSync directly from node:fs (outside ctx.fs abstraction).
+ * Uses REAL temp directories for integration testing.
+ * Handlers use ctx.fs abstraction; tests provide real FS implementations.
  */
 
 import { join } from 'node:path';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, readdirSync, statSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, readdirSync, statSync, appendFileSync, renameSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import type { SessionToolContext, FileSystemInterface, SessionToolCallbacks } from '../../context.ts';
 
@@ -46,6 +46,10 @@ function createRealFileSystem(): FileSystemInterface {
       mkdirSync(dir, { recursive: true });
       writeFileSync(path, content, 'utf-8');
     },
+    appendFile: (path: string, content: string) => appendFileSync(path, content, 'utf-8'),
+    mkdir: (path: string, options?: { recursive?: boolean }) => mkdirSync(path, options),
+    rename: (oldPath: string, newPath: string) => renameSync(oldPath, newPath),
+    unlink: (path: string) => unlinkSync(path),
     isDirectory: (path: string) => existsSync(path) && statSync(path).isDirectory(),
     readdir: (path: string) => existsSync(path) ? readdirSync(path) : [],
     stat: (path: string) => {

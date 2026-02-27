@@ -3,7 +3,7 @@ import * as Sentry from '@sentry/electron/main'
 import { basename, join } from 'path'
 import { existsSync, readFileSync, readdirSync } from 'fs'
 import { rm, readFile, mkdir, writeFile, rename, open } from 'fs/promises'
-import { CraftAgent, type AgentEvent, setPermissionMode, type PermissionMode, unregisterSessionScopedToolCallbacks, AbortReason, type AuthRequest, type AuthResult, type CredentialAuthRequest } from '@craft-agent/shared/agent'
+import { CraftAgent, type AgentEvent, setPermissionMode, type PermissionMode, unregisterSessionScopedToolCallbacks, AbortReason, type AuthRequest, type AuthResult, type CredentialAuthRequest, isResumableTranscript } from '@craft-agent/shared/agent'
 import {
   CodexBackend,
   CodexAgent,
@@ -4515,6 +4515,18 @@ export class SessionManager {
             sessionLog.warn(`Session ${sessionId} completed without assistant response - possible context overflow or API issue`)
           }
 
+          // Post-completion transcript validation: verify the captured SDK session ID
+          // points to a resumable transcript. If not, clear it now so the next turn
+          // won't attempt a doomed resume.
+          if (managed.sdkSessionId && managed.sdkCwd) {
+            if (!isResumableTranscript(managed.sdkCwd, managed.sdkSessionId)) {
+              sessionLog.warn(`Post-completion: transcript not resumable for ${managed.sdkSessionId}, clearing`)
+              managed.sdkSessionId = undefined
+              this.persistSession(managed)
+              sessionPersistenceQueue.flush(managed.id)
+            }
+          }
+
           sendSpan.mark('chat.complete')
           sendSpan.end()
           this.onProcessingStopped(sessionId, 'complete')
@@ -5250,6 +5262,10 @@ To view this task's output:
    * Generate an AI title for a session from the user's first message.
    * Uses the agent's generateTitle() method which handles provider-specific SDK calls.
    * If no agent exists, creates a temporary one using the session's connection.
+   *
+   * Note: Title generation uses `runMiniCompletion()` internally, which isolates
+   * SDK transcripts via `cwd: tmpdir()` and `persistSession: false`. This prevents
+   * any interference with the active chat session's transcript state.
    */
   private async generateTitle(managed: ManagedSession, userMessage: string): Promise<void> {
     sessionLog.info(`[generateTitle] Starting for session ${managed.id}`)

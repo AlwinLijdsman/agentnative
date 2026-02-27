@@ -20,7 +20,7 @@ import {
   keywordOverlapScore,
 } from '../synthesis-post-processor.ts';
 import type { PriorSectionInput } from '../synthesis-post-processor.ts';
-import type { WebReference } from '@craft-agent/session-tools-core/renderer-types';
+import type { WebReference } from '@craft-agent/agent-pipeline-core/renderer-types';
 
 // ============================================================================
 // Test Fixtures

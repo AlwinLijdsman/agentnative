@@ -15,8 +15,8 @@ pnpm run test:e2e
 # Stage 0 pause tests specifically
 npx tsx --test apps/electron/src/__tests__/e2e-stage0-pause.test.ts
 
-# Session validation tests (in session-tools-core)
-npx tsx --test packages/session-tools-core/src/handlers/__tests__/e2e-*.test.ts
+# Session validation tests (in agent-pipeline-core)
+npx tsx --test packages/agent-pipeline-core/src/handlers/__tests__/e2e-*.test.ts
 ```
 
 ### Live SDK Tests (Requires OAuth)

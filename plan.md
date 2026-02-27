@@ -103,12 +103,14 @@ agentnative/
 |   |       +-- types/                 #     Shared type definitions
 |   |       +-- ...                    #     labels, statuses, views, search, etc.
 |   +-- ui/                            #   @craft-agent/ui -- shared React components
-|   +-- session-tools-core/            #   @craft-agent/session-tools-core -- tool handlers
+|   +-- agent-pipeline-core/           #   @craft-agent/agent-pipeline-core -- pipeline handlers
 |   |   +-- src/handlers/
 |   |       +-- agent-stage-gate.ts    #     Pipeline stage lifecycle (~1550 lines)
 |   |       +-- agent-render-output/   #     Research output renderer (6 files, ~1300 lines)
 |   |       +-- agent-state.ts         #     Persistent key-value state (~116 lines)
 |   |       +-- agent-validate.ts      #     Agent validation (~308 lines)
+|   +-- session-tools-core/            #   @craft-agent/session-tools-core -- platform tool handlers
+|   |   +-- src/handlers/
 |   |       +-- source-test.ts         #     Source connectivity testing (~841 lines)
 |   |       +-- source-oauth.ts        #     OAuth flow handler (~353 lines)
 |   |       +-- ...                    #     config, credential, mermaid, skill, submit-plan
@@ -151,13 +153,19 @@ agentnative/
               |   shared   |  |    ui    |  (React components)
               | (all biz   |  |          |
               |  logic)    |  +----------+
-              +------------+       |
-                |  |   |           |
-   +------------+  |   +-----------+--------------+
-   |               |               |              |
-   |    +----------v----------+    |              |
+              +------+-----+       |
+                |  |  |            |
+   +------------+  |  +--+---------+--------------+
+   |               |     |         |              |
+   |  +------------v--+  |         |              |
+   |  | agent-pipeline |  |         |              |
+   |  | core (pipeline |  |         |              |
+   |  | handlers)      |  |         |              |
+   |  +-------^--------+  |         |              |
+   |          |            |         |              |
+   |    +-----+-------v---+    |              |
    |    | session-tools-core  |>---+              |
-   |    | (tool handlers)     |                   |
+   |    | (platform handlers) |                   |
    |    +---------------------+                   |
    |        |          |                          |
    |  +-----v------+ +-v--------------+          |
@@ -168,7 +176,8 @@ agentnative/
    v                                              v
 +--------------------------------------------------+
 |              apps/electron                        |
-|  (imports: core, shared, ui, session-tools-core)  |
+|  (imports: core, shared, ui, session-tools-core,  |
+|   agent-pipeline-core)                            |
 +--------------------------------------------------+
 
    mermaid  >--  session-tools-core  (mermaid validation handler)
@@ -641,4 +650,551 @@ Claude Code slash commands with YAML frontmatter:
 
 ---
 
+---
+
+# Implementation Plan: Extract `@craft-agent/agent-pipeline-core`
+
+## Goal
+
+Cleanly separate the **deterministic agent pipeline engine** (stage gate, agent state, agent validate, render output) from `@craft-agent/session-tools-core` into a new `@craft-agent/agent-pipeline-core` package. Session-tools-core keeps platform tools (source test, oauth, config validate, etc.). All functionality preserved, zero breakage.
+
+## Analysis
+
+### What MOVES to agent-pipeline-core
+
+| File | Lines | Role |
+|------|-------|------|
+| `handlers/agent-stage-gate.ts` | 1552 | Pipeline stage lifecycle |
+| `handlers/agent-state.ts` | 116 | Persistent key-value state |
+| `handlers/agent-validate.ts` | 308 | Agent config validation |
+| `handlers/agent-render-output/` (6 files) | ~1300 | Research output renderer |
+
+### What STAYS in session-tools-core
+
+| File | Role |
+|------|------|
+| `handlers/submit-plan.ts` | Plan submission |
+| `handlers/config-validate.ts` | Config validation |
+| `handlers/skill-validate.ts` | Skill validation |
+| `handlers/mermaid-validate.ts` | Mermaid diagram validation |
+| `handlers/source-test.ts` | Source connectivity testing |
+| `handlers/source-oauth.ts` | OAuth flow handler |
+| `handlers/credential-prompt.ts` | Credential input prompt |
+| `src/context.ts` | SessionToolContext interface |
+| `src/types.ts` | Shared types (ToolResult, etc.) |
+| `src/response.ts` | Response helpers |
+| `src/validation.ts` | Full validation (zod, gray-matter deps) |
+| `src/source-helpers.ts` | Source/skill path helpers |
+| `__tests__/auth-debug-integration.test.ts` | Auth test (stays) |
+
+### Shared infra: COPY-FIRST strategy
+
+Three files are imported by BOTH the moving handlers and the staying handlers. To avoid circular dependencies, we **copy** lightweight versions into `agent-pipeline-core`:
+
+| File | Size | Copy strategy |
+|------|------|---------------|
+| `context.ts` (406L) | Interface-only | Copy entire file |
+| `types.ts` | Type defs | Copy entire file |
+| `response.ts` | 4 functions | Copy entire file |
+
+### Special handling for validation.ts and source-helpers.ts
+
+- **`validation.ts`** (373L) — uses `zod`, `gray-matter`, `node:fs`. But `agent-validate.ts` only needs 5 pure functions: `validateSlug`, `formatValidationResult`, `validResult`, `invalidResult`, `mergeResults`. Create `validation-lite.ts` with just those 5 functions (zero external deps).
+- **`source-helpers.ts`** — `agent-validate.ts` calls `sourceExists(rootPath, slug)` which is a 1-liner: `existsSync(join(rootPath, 'sources', slug))`. Inline it in the moved `agent-validate.ts`.
+
+### Dependency graph (after refactor)
+
+```
+@craft-agent/agent-pipeline-core (NEW) — gray-matter only, no workspace deps
+      ↑
+@craft-agent/session-tools-core → depends on agent-pipeline-core (for re-exports)
+@craft-agent/session-mcp-server → depends on session-tools-core (UNCHANGED)
+@craft-agent/shared → depends on BOTH session-tools-core AND agent-pipeline-core (NEW dep)
+```
+
+### Consumer map (8 affected locations, all verified)
+
+| # | File | Current import | Change needed |
+|---|------|----------------|---------------|
+| 1 | `shared/.../session-scoped-tools.ts` L37-55 | 4 agent handlers from `session-tools-core` | Split: agent handlers from `agent-pipeline-core` |
+| 2 | `shared/.../stage-runner.ts` L41-44 | 4 renderer subpath imports (`/renderer`, `/renderer-types`, `/renderer-config`, `/renderer-linker`) | Change to `@craft-agent/agent-pipeline-core/*` |
+| 3 | `shared/.../synthesis-post-processor.ts` L26 | `WebReference, PriorSection` from `/renderer-types` | Change to `agent-pipeline-core/renderer-types` |
+| 4 | `shared/.../orchestrator/__tests__/synthesis-post-processor.test.ts` L23 | `WebReference` from `/renderer-types` | Change to `agent-pipeline-core/renderer-types` |
+| 5 | `shared/.../claude-context.ts` | `SessionToolContext`, callbacks | **No change** (shared infra stays in session-tools-core) |
+| 6 | `shared/.../codex-agent.ts` | `AuthRequest` | **No change** |
+| 7 | `session-mcp-server/.../index.ts` L52-58 | 3 agent handlers from `session-tools-core` | **No change** (uses re-exports from session-tools-core) |
+| 8 | `scripts/test-full-pipeline-e2e.ts` L28-46 | 4 relative paths to render-output | Update paths to new package |
+
+### Test file classification (13 files)
+
+**MOVE** (12 files): `agent-stage-gate.test.ts`, `agent-state.test.ts`, `agent-integration.test.ts`, `e2e-stage-gate.test.ts`, `e2e-session-validation.test.ts`, `e2e-session-validators.ts`, `e2e-web-ref-rendering.test.ts`, `e2e-follow-up-context.test.ts`, `blockquote-normalization.test.ts`, `test-utils.ts`, `e2e-utils.ts`, `renderer.test.ts` (from `agent-render-output/__tests__/`)
+
+**STAY** (1 file): `auth-debug-integration.test.ts`
+
+### Key files table
+
+| File | Path | Why involved |
+|------|------|--------------|
+| `session-tools-core/package.json` | `packages/session-tools-core/package.json` | Remove moved exports, add dep on new package |
+| `session-tools-core/src/index.ts` | `packages/session-tools-core/src/index.ts` | Re-export agent handlers from new package |
+| `session-tools-core/src/handlers/index.ts` | `packages/session-tools-core/src/handlers/index.ts` | Re-export agent handlers from new package |
+| `shared/package.json` | `packages/shared/package.json` | Add dep on `@craft-agent/agent-pipeline-core` |
+| `electron-build-main.ts` | `scripts/electron-build-main.ts` | Add new `--alias` for session server build |
+| `session-scoped-tools.ts` | `packages/shared/src/agent/session-scoped-tools.ts` | Split imports |
+| `stage-runner.ts` | `packages/shared/src/agent/orchestrator/stage-runner.ts` | Update 4 subpath imports |
+| `synthesis-post-processor.ts` | `packages/shared/src/agent/orchestrator/synthesis-post-processor.ts` | Update 1 import |
+| `test-full-pipeline-e2e.ts` | `scripts/test-full-pipeline-e2e.ts` | Update 4 relative paths |
+
+---
+
+## Phase 1: Scaffold new package `packages/agent-pipeline-core/`
+
+- [x] 1.1 Create `packages/agent-pipeline-core/package.json`:
+  ```json
+  {
+    "name": "@craft-agent/agent-pipeline-core",
+    "version": "0.4.5",
+    "type": "module",
+    "main": "src/index.ts",
+    "types": "src/index.ts",
+    "exports": {
+      ".": "./src/index.ts",
+      "./renderer": "./src/handlers/agent-render-output/renderer.ts",
+      "./renderer-types": "./src/handlers/agent-render-output/types.ts",
+      "./renderer-config": "./src/handlers/agent-render-output/config-loader.ts",
+      "./renderer-linker": "./src/handlers/agent-render-output/source-linker.ts"
+    },
+    "scripts": {
+      "typecheck": "tsc --noEmit",
+      "test": "npx tsx --test src/handlers/__tests__/*.test.ts"
+    },
+    "dependencies": {
+      "gray-matter": "^4.0.3"
+    },
+    "devDependencies": {
+      "typescript": "^5.8.2"
+    }
+  }
+  ```
+- [x] 1.2 Create `packages/agent-pipeline-core/tsconfig.json` (copy from session-tools-core, adjust paths)
+- [x] 1.3 Create directory structure:
+  ```
+  packages/agent-pipeline-core/
+    src/
+      handlers/
+        agent-render-output/
+          __tests__/
+        __tests__/
+  ```
+- [x] 1.4 Add `"@craft-agent/agent-pipeline-core": "workspace:*"` to root `pnpm-workspace.yaml` (auto-discovered via `packages/*` glob, no file change needed)
+- [x] 1.5 Run `pnpm install` to link the new package
+- [x] 1.6 Validate: package resolves in workspace (`pnpm m ls --depth -1` includes `@craft-agent/agent-pipeline-core`)
+
+## Phase 2: Copy shared infra into new package
+
+- [x] 2.1 Copy `session-tools-core/src/context.ts` → `agent-pipeline-core/src/context.ts`
+- [x] 2.2 Copy `session-tools-core/src/types.ts` → `agent-pipeline-core/src/types.ts`
+- [x] 2.3 Copy `session-tools-core/src/response.ts` → `agent-pipeline-core/src/response.ts`
+- [x] 2.4 Create `agent-pipeline-core/src/validation-lite.ts` with 5 functions extracted from `validation.ts`:
+  - `validResult()`, `invalidResult()`, `mergeResults()`, `formatValidationResult()`, `validateSlug()` + `SLUG_REGEX`
+  - Zero deps: no zod, no gray-matter, no node:fs
+  - Import `ValidationResult`, `ValidationIssue` from local `./types.ts`
+- [x] 2.5 Verify each copied file has correct relative imports (all reference local `./types.ts`, `./context.ts`, `./response.ts`; `validation-lite.ts` imports only `ValidationResult` and `ValidationIssue`)
+
+## Phase 3: Move handler files
+
+- [x] 3.1 Move `session-tools-core/src/handlers/agent-stage-gate.ts` → `agent-pipeline-core/src/handlers/agent-stage-gate.ts` (copied into new package; original retained temporarily until cleanup phase)
+  - Update import: `../context.ts`, `../types.ts`, `../response.ts` → same paths (structure preserved)
+  - Import of `./agent-render-output/renderer.ts` (`injectSourceBlocks`) — moves with it, no change
+- [x] 3.2 Move `session-tools-core/src/handlers/agent-state.ts` → `agent-pipeline-core/src/handlers/agent-state.ts` (copied into new package; original retained temporarily until cleanup phase)
+- [x] 3.3 Move `session-tools-core/src/handlers/agent-validate.ts` → `agent-pipeline-core/src/handlers/agent-validate.ts` (copied into new package; original retained temporarily until cleanup phase)
+  - Change import: `../validation.ts` → `../validation-lite.ts`
+  - Replace import of `sourceExists` from `../source-helpers.ts` with inline:
+    ```typescript
+    import { existsSync } from 'node:fs';
+    import { join } from 'node:path';
+    function sourceExists(workspaceRootPath: string, slug: string): boolean {
+      return existsSync(join(workspaceRootPath, 'sources', slug));
+    }
+    ```
+- [x] 3.4 Move entire `session-tools-core/src/handlers/agent-render-output/` directory → `agent-pipeline-core/src/handlers/agent-render-output/` (copied into new package; original retained temporarily until cleanup phase)
+  - All 6 files: `index.ts`, `renderer.ts`, `config-loader.ts`, `source-linker.ts`, `markdown-formatters.ts`, `types.ts`
+  - Plus `__tests__/renderer.test.ts`
+  - Internal imports are all siblings — no changes needed
+  - `index.ts` imports `../../context.ts`, `../../types.ts`, `../../response.ts` — points to copied files, no change
+
+## Phase 4: Move test files
+
+- [x] 4.1 Move 11 test files from `session-tools-core/src/handlers/__tests__/` → `agent-pipeline-core/src/handlers/__tests__/` (copied into new package; originals retained temporarily until cleanup phase):
+  - `agent-stage-gate.test.ts`
+  - `agent-state.test.ts`
+  - `agent-integration.test.ts`
+  - `e2e-stage-gate.test.ts`
+  - `e2e-session-validation.test.ts`
+  - `e2e-session-validators.ts`
+  - `e2e-web-ref-rendering.test.ts`
+  - `e2e-follow-up-context.test.ts`
+  - `blockquote-normalization.test.ts`
+  - `test-utils.ts`
+  - `e2e-utils.ts`
+- [x] 4.2 Move `agent-render-output/__tests__/renderer.test.ts` (already handled in 3.4 via directory move)
+- [x] 4.3 Verify `auth-debug-integration.test.ts` stays in session-tools-core
+- [x] 4.4 Update any test imports that reference moved files (no rewrites needed; copied tests resolve against new package-relative handler paths)
+
+## Phase 5: Create agent-pipeline-core index and session-tools-core re-exports
+
+- [x] 5.1 Create `agent-pipeline-core/src/handlers/index.ts`:
+  ```typescript
+  // Agent Stage Gate
+  export { handleAgentStageGate } from './agent-stage-gate.ts';
+  export type { AgentStageGateArgs } from './agent-stage-gate.ts';
+  // Agent State
+  export { handleAgentState } from './agent-state.ts';
+  export type { AgentStateArgs } from './agent-state.ts';
+  // Agent Validate
+  export { handleAgentValidate } from './agent-validate.ts';
+  export type { AgentValidateArgs } from './agent-validate.ts';
+  // Agent Render Output
+  export { handleAgentRenderOutput } from './agent-render-output/index.ts';
+  export type { AgentRenderOutputArgs } from './agent-render-output/index.ts';
+  ```
+- [x] 5.2 Create `agent-pipeline-core/src/index.ts`:
+  - Export all types from `./types.ts` (only the types also used by agent handlers)
+  - Export response helpers from `./response.ts`
+  - Export context types from `./context.ts`
+  - Export validation-lite functions from `./validation-lite.ts`
+  - Export all 4 handlers + their arg types from `./handlers/index.ts`
+- [x] 5.3 Update `session-tools-core/src/handlers/index.ts`:
+  - Remove direct exports of `handleAgentStageGate`, `handleAgentState`, `handleAgentValidate`, `handleAgentRenderOutput` and their arg types
+  - Add re-exports from `@craft-agent/agent-pipeline-core`:
+    ```typescript
+    // Re-export agent pipeline handlers for backward compatibility
+    export {
+      handleAgentStageGate,
+      type AgentStageGateArgs,
+      handleAgentState,
+      type AgentStateArgs,
+      handleAgentValidate,
+      type AgentValidateArgs,
+      handleAgentRenderOutput,
+      type AgentRenderOutputArgs,
+    } from '@craft-agent/agent-pipeline-core';
+    ```
+- [x] 5.4 Update `session-tools-core/package.json`:
+  - Add dependency: `"@craft-agent/agent-pipeline-core": "workspace:*"`
+  - Keep subpath exports (`./renderer`, `./renderer-types`, `./renderer-config`, `./renderer-linker`) temporarily for compatibility; migrate consumers in Phase 6, then remove legacy exports in cleanup
+- [x] 5.5 Update `session-tools-core/src/index.ts`:
+  - Replace direct handler exports with re-exports from `@craft-agent/agent-pipeline-core`
+  - Keep all other exports (types, response helpers, source-helpers, validation, context) as-is
+- [x] 5.6 Run `pnpm run typecheck:all` — pass
+
+## Phase 6: Update consumers
+
+- [x] 6.1 Update `shared/package.json`:
+  - Add: `"@craft-agent/agent-pipeline-core": "workspace:*"`
+- [x] 6.2 Update `session-scoped-tools.ts`:
+  - Split agent handler imports from `@craft-agent/session-tools-core` to `@craft-agent/agent-pipeline-core`:
+    ```typescript
+    // Agent pipeline handlers (from agent-pipeline-core)
+    import {
+      handleAgentStageGate,
+      handleAgentState,
+      handleAgentValidate,
+      handleAgentRenderOutput,
+    } from '@craft-agent/agent-pipeline-core';
+    ```
+  - Keep other imports (ToolResult, AuthRequest) from `@craft-agent/session-tools-core`
+- [x] 6.3 Update `stage-runner.ts` (4 imports):
+  ```typescript
+  import { renderDocument } from '@craft-agent/agent-pipeline-core/renderer';
+  import type { FinalAnswer, RenderConfig, Citation, VerificationScores, SubQuery, WebReference } from '@craft-agent/agent-pipeline-core/renderer-types';
+  import { mergeRenderConfig, extractOutputConfig } from '@craft-agent/agent-pipeline-core/renderer-config';
+  import { createSourceLinker } from '@craft-agent/agent-pipeline-core/renderer-linker';
+  ```
+- [x] 6.4 Update `synthesis-post-processor.ts` (1 import):
+  ```typescript
+  import type { WebReference, PriorSection } from '@craft-agent/agent-pipeline-core/renderer-types';
+  ```
+- [x] 6.5 Update `orchestrator/__tests__/synthesis-post-processor.test.ts` (1 import):
+  ```typescript
+  import type { WebReference } from '@craft-agent/agent-pipeline-core/renderer-types';
+  ```
+- [x] 6.6 Update `scripts/test-full-pipeline-e2e.ts` (4 relative imports):
+  - Change `../packages/session-tools-core/src/handlers/agent-render-output/renderer.ts` → `../packages/agent-pipeline-core/src/handlers/agent-render-output/renderer.ts`
+  - Change `../packages/session-tools-core/src/handlers/agent-render-output/source-linker.ts` → `../packages/agent-pipeline-core/src/handlers/agent-render-output/source-linker.ts`
+  - Change `../packages/session-tools-core/src/handlers/agent-render-output/types.ts` → `../packages/agent-pipeline-core/src/handlers/agent-render-output/types.ts`
+  - Change `../packages/session-tools-core/src/handlers/agent-render-output/config-loader.ts` → `../packages/agent-pipeline-core/src/handlers/agent-render-output/config-loader.ts`
+- [x] 6.7 **session-mcp-server**: No changes needed (imports from `@craft-agent/session-tools-core` which re-exports from `agent-pipeline-core`)
+- [x] 6.8 Run `pnpm run typecheck:all` — pass
+- [x] 6.9 Run `pnpm run lint` — baseline fail (existing unrelated Electron lint errors)
+
+## Phase 7: Update build scripts
+
+- [x] 7.1 Update `scripts/electron-build-main.ts`:
+  - Add constant: `const AGENT_PIPELINE_CORE_DIR = join(ROOT_DIR, "packages/agent-pipeline-core");`
+  - In `buildSessionServer()`, add alias for the new package:
+    ```typescript
+    `--alias:@craft-agent/agent-pipeline-core=${join(AGENT_PIPELINE_CORE_DIR, "src/index.ts")}`,
+    ```
+  - Add verification in `verifySessionToolsCore()` for the new package's `src/index.ts`
+- [x] 7.2 Update root `package.json` test scripts if needed:
+  - Check `test:e2e` glob pattern — if it uses `packages/session-tools-core/**/__tests__/*.test.ts`, add `packages/agent-pipeline-core/**/__tests__/*.test.ts`
+- [x] 7.3 Update `agent-pipeline-core/package.json` test script glob to also cover `src/handlers/agent-render-output/__tests__/*.test.ts`
+- [x] 7.4 Run full build: `pnpm run electron:build` — pass
+- [x] 7.5 Run `pnpm run typecheck:all` — pass
+
+## Phase 8: Clean up and verify
+
+- [x] 8.1 Verify all 4 handler files are DELETED from `session-tools-core/src/handlers/`
+- [x] 8.2 Verify `agent-render-output/` directory is DELETED from `session-tools-core/src/handlers/`
+- [x] 8.3 Verify the 11 test files are DELETED from `session-tools-core/src/handlers/__tests__/` (only `auth-debug-integration.test.ts` remains)
+- [x] 8.4 Verify `session-tools-core/src/handlers/index.ts` only has re-exports for agent handlers + direct exports for platform handlers
+- [-] 8.5 Run full test suite: `pnpm run test` (fails due pre-existing test environment issues, including `bun:` URL scheme imports and long-running live orchestrator segment)
+- [x] 8.6 Run E2E tests: `pnpm run test:e2e` — pass (all 232 tests)
+  - Fixed BOM (U+FEFF) in `agents/isa-deep-research/AGENT.md` breaking frontmatter regex
+  - Updated `e2e-isa-guide-pipeline.test.ts` and `e2e-isa-websearch-pipeline.test.ts` to read `prompts/stage-*.md` files (stage content moved from AGENT.md to individual prompt files)
+- [x] 8.7 Run `pnpm run typecheck:all` — final check (pass)
+- [-] 8.8 Run `pnpm run lint` — final check (fails with existing unrelated Electron lint violations)
+- [x] 8.9 Verify `pnpm run electron:build` succeeds end-to-end (pass)
+
+## Phase 9: Post-extraction hardening
+
+- [x] 9.1 Deduplicate shared infra files — `types.ts`, `response.ts`, `context.ts` in session-tools-core replaced with thin re-export shims pointing to `@craft-agent/agent-pipeline-core`
+- [x] 9.2 Add esbuild aliases for subpath exports (`types`, `response`, `context`) in `scripts/electron-build-main.ts`
+- [x] 9.3 Deduplicate `validation.ts` — re-export `validResult`, `invalidResult`, `SLUG_REGEX`, etc. from `agent-pipeline-core` instead of redefining
+- [x] 9.4 Expand `FileSystemInterface` with `mkdir`, `appendFile`, `rename`, `unlink` methods
+  - Updated all implementations: `createNodeFileSystem()`, `createClaudeContext()`, test-utils `createRealFileSystem()`
+- [x] 9.5 Remove `node:fs` imports from pipeline handlers — `agent-stage-gate.ts`, `agent-state.ts`, `agent-validate.ts` now exclusively use `ctx.fs` abstraction
+- [x] 9.6 Fix stale comments — update all "Session Tools Core" references in `agent-pipeline-core/src/` to "Agent Pipeline Core"
+- [x] 9.7 Run `pnpm run typecheck:all` — pass
+- [x] 9.8 Run `pnpm run electron:build` — pass
+
+## Risks & Considerations
+
+| Risk | Mitigation |
+|------|------------|
+| Circular dependency session-tools-core ↔ agent-pipeline-core | One-way only: session-tools-core → agent-pipeline-core. Never reverse. |
+| esbuild alias for session server misses new package | Phase 7.1 adds alias explicitly; Phase 9.2 adds subpath aliases |
+| Shared infra diverges over time | Eliminated: session-tools-core files replaced with re-export shims from agent-pipeline-core |
+| gray-matter dependency required by agent-validate.ts | Added to agent-pipeline-core/package.json dependencies |
+| validation.ts has zod/gray-matter deps but agent-validate only needs 5 pure functions | validation-lite.ts extracts just those 5 with zero deps |
+| sourceExists import breaks in moved agent-validate.ts | Uses `ctx.fs.exists()` through context abstraction |
+| Direct `node:fs` imports break environment portability | Phase 9.4-9.5: expanded `FileSystemInterface`, all handlers use `ctx.fs` |
+| session-mcp-server uses `bun build` in package.json scripts | Not changed — actual build uses electron-build-main.ts esbuild |
+| Test glob paths may not match new location | Phase 7.2-7.3 explicitly verifies and updates all globs |
+| E2E tests break when AGENT.md content is refactored | Tests updated to scan `prompts/stage-*.md` alongside AGENT.md |
+
+## Testing Strategy
+
+Each phase ends with relevant validation:
+- **Phase 1**: `pnpm install`, `pnpm ls` verify package resolution
+- **Phase 2-4**: No independent validation needed (files copied/moved but not yet wired)
+- **Phase 5**: `pnpm run typecheck:all` (first full compile check)
+- **Phase 6**: `pnpm run typecheck:all` + `pnpm run lint`
+- **Phase 7**: `pnpm run electron:build` (full build test)
+- **Phase 8**: `pnpm run test`, `pnpm run test:e2e`, `pnpm run typecheck:all`, `pnpm run lint`, `pnpm run electron:build`
+
+---
+
 _Last updated: 2026-02-26_
+
+---
+
+# Implementation Plan: Fix Session Resume Failure — `runMiniCompletion` cwd Isolation
+
+## Goal
+
+Fix the ~43% session resume failure rate caused by `runMiniCompletion()` launching SDK subprocesses that share the same project-directory hash as the main `chat()`, corrupting transcripts when running concurrently.
+
+## Root Cause
+
+`runMiniCompletion()` in `claude-agent.ts` calls `query({ prompt, options })` **without a `cwd` option**. The SDK uses `cwd` to derive a project-directory hash for transcript storage at `~/.claude/projects/<hash>/`. When `generateTitle()` fires concurrently (fire-and-forget), both subprocesses write to the same hash directory, corrupting the main chat's transcript. On the next message, resume fails with "No conversation found with session ID".
+
+**Note**: `git diff main` confirms zero changes to `claude-agent.ts` / `base-agent.ts` / `sessions.ts` on any branch. The bug is latent everywhere — "main works" is timing luck, not a fix.
+
+## Collision Vectors (all share `runMiniCompletion`)
+
+| Caller | Risk |
+|--------|------|
+| `generateTitle()` — fire-and-forget at session creation | **HIGH** |
+| `regenerateTitle()` — user-initiated, can overlap ongoing chat | **MEDIUM** |
+| `handleLargeToolResult()` / `getSummarizeCallback()` — during tool results | **MEDIUM** |
+
+## Phases
+
+### Phase 1: Fix `runMiniCompletion()` cwd isolation
+
+- [x] Add `import { tmpdir } from 'node:os'` to `claude-agent.ts`
+- [x] Add `cwd: tmpdir()` to options in `runMiniCompletion()` to isolate SDK transcript storage
+- [x] Add `persistSession: false` to prevent transcript accumulation for ephemeral completions
+- [x] Add JSDoc comment documenting the race condition and why cwd isolation is required
+
+### Phase 2: Add regression test
+
+- [x] Create `packages/shared/src/agent/__tests__/mini-completion-isolation.test.ts`
+- [x] Test: verify `import { tmpdir } from 'node:os'` exists in source
+- [x] Test: verify `cwd: tmpdir()` appears in runMiniCompletion options
+- [x] Test: verify `persistSession: false` appears in options
+- [x] Test: verify `cwd` appears AFTER `...getDefaultOptions()` spread (not overridden)
+- [x] Test: verify JSDoc documents the race condition
+- [x] Test: verify `tmpdir()` resolves to valid string on this platform
+
+### Phase 3: Validate
+
+- [x] `pnpm run typecheck:all` — passes (0 errors)
+- [x] `pnpm run lint` — passes (0 new errors; 5 pre-existing errors in unrelated files)
+- [x] New test — 6/6 pass via `npx tsx --test`
+- [x] `pnpm run test:e2e` — 177 pass, 0 fail, 1 skip (unchanged from baseline)
+- [ ] Manual test: two-message session without resume failure
+- [ ] Manual test: title regeneration during active chat
+
+## Files Changed
+
+| File | Change |
+|------|--------|
+| `packages/shared/src/agent/claude-agent.ts` | Added `import { tmpdir } from 'node:os'`; added `cwd: tmpdir()` and `persistSession: false` to `runMiniCompletion()` options; expanded JSDoc |
+| `packages/shared/src/agent/__tests__/mini-completion-isolation.test.ts` | New test file — 6 assertions verifying cwd isolation fix |
+
+---
+
+_Last updated: 2026-02-27_
+
+---
+
+# Implementation Plan: Fix Session Resume Failure — Transcript Validation Before Resume (Option A)
+
+## Goal
+
+Eliminate "Restoring conversation context..." on the second turn of new chat sessions by validating SDK transcript files before attempting `{ resume: sessionId }`. If the transcript is empty or contains only dequeue records, skip resume and start a fresh session — avoiding the SESSION_RECOVERY path entirely.
+
+## Root Cause (Detailed)
+
+The SDK `query()` API spawns a new subprocess per turn. On the first turn:
+
+1. SDK emits a `system:init` message containing a `session_id`
+2. `claude-agent.ts` L1483–1493 captures this ID and persists it via `onSdkSessionIdUpdate`
+3. The subprocess exits, leaving a transcript file at `~/.claude/projects/{cwd-slug}/{sessionId}.jsonl`
+4. **The transcript file is only ~139 bytes**, containing just a `queue-operation: dequeue` record — no conversation data
+
+On the second turn:
+
+5. `claude-agent.ts` L1363 builds `{ resume: this.sessionId }` using the persisted ID
+6. The new subprocess tries to resume this session but finds "No conversation found"
+7. SESSION_RECOVERY fires (L1565–1575 or L1588–1608), clearing the session and retrying with injected context
+8. The user sees "Restoring conversation context..." — an unnecessary degradation
+
+**Why the `runMiniCompletion` fix (above) is necessary but not sufficient**: The cwd isolation fix prevents `generateTitle()` from corrupting the main chat's transcript. But the dequeue-only transcript is produced by the main chat path's own first-turn lifecycle — not by any race condition. Both fixes are needed.
+
+## Analysis
+
+### SDK Transcript Layout
+
+- **Config dir**: `~/.claude/` (or `CLAUDE_CONFIG_DIR`)
+- **Project dir**: `~/.claude/projects/{cwd-slug}/` where slug = CWD path with `[:\\/]` replaced by `-`
+- **Transcript file**: `{project-dir}/{sessionId}.jsonl`
+- A transcript is "resumable" if it exists, is >500 bytes, and contains at least one `assistant` message type
+
+### Validation Strategy
+
+Read the transcript file and check:
+1. File exists at expected path
+2. File size >500 bytes (dequeue-only files are ~139 bytes)
+3. Contains at least one line with `"type":"assistant"` (proves actual conversation happened)
+
+If any check fails → clear the session ID, skip resume, start fresh. No "Restoring conversation context..." message needed.
+
+### Key Code Points
+
+| Location | Line(s) | Role |
+|----------|---------|------|
+| `claude-agent.ts` | L499 | Session ID initialization from persisted config |
+| `claude-agent.ts` | L828–829 | `cwd` option (sdkCwd) passed to SDK — determines transcript path |
+| `claude-agent.ts` | L1363 | Resume decision: `...(!_isRetry && this.sessionId ? { resume: ... } : {})` |
+| `claude-agent.ts` | L1483–1493 | Session ID capture from `system:init` |
+| `claude-agent.ts` | L1565–1575 | SESSION_RECOVERY: result-error channel (session expired) |
+| `claude-agent.ts` | L1588–1608 | SESSION_RECOVERY: empty response detection |
+| `claude-agent.ts` | L1857–1870 | SESSION_RECOVERY: wasResuming fallback retry |
+| `sessions.ts` | L2524–2536 | `onSdkSessionIdUpdate` / `onSdkSessionIdCleared` callbacks |
+
+## Key Files
+
+| File | Path | Why involved |
+|------|------|--------------|
+| `claude-agent.ts` | `packages/shared/src/agent/claude-agent.ts` | Resume logic, session ID lifecycle |
+| `sdk-transcript-validator.ts` | `packages/shared/src/agent/sdk-transcript-validator.ts` | **NEW** — transcript validation utility |
+| `sessions.ts` | `apps/electron/src/main/sessions.ts` | Post-completion validation, title-gen cleanup |
+| `sdk-transcript-validator.test.ts` | `packages/shared/src/agent/__tests__/sdk-transcript-validator.test.ts` | **NEW** — unit tests |
+
+---
+
+## Phase 1: Create transcript validation utility
+
+Create `packages/shared/src/agent/sdk-transcript-validator.ts`:
+
+- [x] 1.1 Implement `getSdkConfigDir()`: returns `process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude')`
+- [x] 1.2 Implement `slugifyCwd(cwd: string)`: replaces `[:\\/]` with `-` to match SDK slug computation
+- [x] 1.3 Implement `getTranscriptPath(sdkCwd: string, sessionId: string)`: returns full path `{configDir}/projects/{slug}/{sessionId}.jsonl`
+- [x] 1.4 Implement `isResumableTranscript(sdkCwd: string, sessionId: string)`: returns `boolean`
+  - Check file exists via `existsSync`
+  - Check file size >500 bytes via `statSync`
+  - Read first 8KB and check for `"type":"assistant"` substring
+  - Return `false` on any error (file missing, permission denied, etc.)
+- [x] 1.5 Export all 4 functions (+ added to agent index.ts)
+- [x] 1.6 Add JSDoc documenting why each check is needed and the 139-byte dequeue-only failure mode
+
+## Phase 2: Pre-resume validation in `claude-agent.ts`
+
+- [x] 2.1 Import `isResumableTranscript` from `./sdk-transcript-validator.ts`
+- [x] 2.2 Replaced static resume spread with IIFE that validates transcript before building `{ resume }` option
+- [x] 2.3 The resume option naturally skips resume when transcript is not resumable (session ID cleared inline)
+- [x] 2.4 Added debug + console.error logging for invalid transcript cases
+
+## Phase 3: Post-completion validation
+
+- [x] 3.1 Added post-completion transcript validation in `complete` event handler — clears invalid `sdkSessionId` and persists
+- [x] 3.2 Added `isResumableTranscript` to import from `@craft-agent/shared/agent`
+- [x] 3.3 Added session log warning for cleared IDs
+
+## Phase 4: Revert sessions.ts title-gen isolation
+
+The `generateTitle()` in `sessions.ts` was modified to create a temporary agent with an isolated `sdkCwd` (L5254–5335). This is now **redundant** because `runMiniCompletion()` in `claude-agent.ts` already uses `cwd: tmpdir()` and `persistSession: false`.
+
+- [x] 4.1 Reverted `generateTitle()` to original: uses `managed.agent` first, waits for it, creates temporary agent only as fallback
+- [x] 4.2 Removed `import { tmpdir } from 'os'` from sessions.ts (no longer used)
+- [x] 4.3 Verified: `runMiniCompletion` uses `cwd: tmpdir()` + `persistSession: false` — temporary-agent approach is unnecessary
+
+## Phase 5: Testing & Validation
+
+- [x] 5.1 Created `sdk-transcript-validator.test.ts` — 15 tests (6 slugifyCwd, 2 getSdkConfigDir, 2 getTranscriptPath, 5 isResumableTranscript)
+- [x] 5.2 `pnpm run typecheck:all` — pass (0 errors)
+- [x] 5.3 `pnpm run lint` — pass (0 new violations; 5 pre-existing errors in unrelated files)
+- [x] 5.4 `pnpm run test:e2e` — 177 pass, 0 fail, 1 skip (unchanged from baseline)
+- [x] 5.5 `pnpm run electron:build` — pass
+- [ ] 5.6 Manual test: two-message session should NOT show "Restoring conversation context..."
+- [ ] 5.7 Manual test: existing session with valid transcript should resume normally
+
+## Risks & Considerations
+
+| Risk | Mitigation |
+|------|------------|
+| SDK changes transcript path format in future | `slugifyCwd` mirrors documented SDK behavior; add a debug log if path doesn't exist |
+| Transcript file is valid but not yet flushed when checked | Check happens before `query()` call — by then the previous turn's subprocess has exited and flushed |
+| `isResumableTranscript` reads disk on every turn | File is local, <4KB read, negligible latency (~1ms) |
+| Reverting title-gen isolation breaks concurrent title gen | `runMiniCompletion` already isolates via `cwd: tmpdir()` and `persistSession: false` |
+| False negative: valid transcript rejected | 500-byte threshold is conservative; dequeue-only is ~139 bytes, real transcripts are >2KB |
+| `CLAUDE_CONFIG_DIR` env override not handled | Phase 1.1 checks `process.env.CLAUDE_CONFIG_DIR` first |
+
+## Relationship to Previous Fix
+
+This plan works **alongside** the `runMiniCompletion` cwd isolation fix (above):
+
+| Fix | What it prevents |
+|-----|-----------------|
+| `runMiniCompletion` cwd isolation | Title gen / summarization corrupting the main chat transcript |
+| Transcript validation (this plan) | Attempting to resume a dequeue-only transcript that has no conversation data |
+
+Both are required. The cwd isolation prevents future transcript corruption; the transcript validation handles the case where the first turn's transcript is inherently non-resumable.
+
+---
+
+_Last updated: 2026-02-27_

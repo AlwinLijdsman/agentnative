@@ -27,8 +27,8 @@ import { tmpdir } from 'node:os';
 // ── Import pipeline modules ─────────────────────────────────────────────────
 import {
   renderDocument,
-} from '../packages/session-tools-core/src/handlers/agent-render-output/renderer.ts';
-import { createSourceLinker } from '../packages/session-tools-core/src/handlers/agent-render-output/source-linker.ts';
+} from '../packages/agent-pipeline-core/src/handlers/agent-render-output/renderer.ts';
+import { createSourceLinker } from '../packages/agent-pipeline-core/src/handlers/agent-render-output/source-linker.ts';
 import type {
   FinalAnswer,
   RenderConfig,
@@ -37,13 +37,13 @@ import type {
   Citation,
   VerificationScores,
   SubQuery,
-} from '../packages/session-tools-core/src/handlers/agent-render-output/types.ts';
+} from '../packages/agent-pipeline-core/src/handlers/agent-render-output/types.ts';
 import {
   loadFollowUpContext,
   parseAnswerSections,
   buildPriorContextHint,
 } from '../packages/shared/src/agent/orchestrator/follow-up-context.ts';
-import { mergeRenderConfig, extractOutputConfig } from '../packages/session-tools-core/src/handlers/agent-render-output/config-loader.ts';
+import { mergeRenderConfig, extractOutputConfig } from '../packages/agent-pipeline-core/src/handlers/agent-render-output/config-loader.ts';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Test Setup

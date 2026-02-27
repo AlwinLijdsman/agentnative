@@ -23,7 +23,7 @@
  * Section 19 — Reliable inline web & prior reference labels.
  */
 
-import type { WebReference, PriorSection } from '@craft-agent/session-tools-core/renderer-types';
+import type { WebReference, PriorSection } from '@craft-agent/agent-pipeline-core/renderer-types';
 
 // Re-export types for convenience
 export type { WebReference, PriorSection };

@@ -43,18 +43,17 @@ export type {
 export { handleCredentialPrompt } from './credential-prompt.ts';
 export type { CredentialPromptArgs } from './credential-prompt.ts';
 
-// Agent Stage Gate
-export { handleAgentStageGate } from './agent-stage-gate.ts';
-export type { AgentStageGateArgs } from './agent-stage-gate.ts';
+// Agent Pipeline handlers (re-exported for backward compatibility)
+export {
+  handleAgentStageGate,
+  handleAgentState,
+  handleAgentValidate,
+  handleAgentRenderOutput,
+} from '@craft-agent/agent-pipeline-core';
 
-// Agent State
-export { handleAgentState } from './agent-state.ts';
-export type { AgentStateArgs } from './agent-state.ts';
-
-// Agent Validate
-export { handleAgentValidate } from './agent-validate.ts';
-export type { AgentValidateArgs } from './agent-validate.ts';
-
-// Agent Render Output
-export { handleAgentRenderOutput } from './agent-render-output/index.ts';
-export type { AgentRenderOutputArgs } from './agent-render-output/index.ts';
+export type {
+  AgentStageGateArgs,
+  AgentStateArgs,
+  AgentValidateArgs,
+  AgentRenderOutputArgs,
+} from '@craft-agent/agent-pipeline-core';

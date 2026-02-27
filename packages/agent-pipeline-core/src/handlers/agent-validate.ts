@@ -17,8 +17,11 @@ import {
   validResult,
   invalidResult,
   mergeResults,
-} from '../validation.ts';
-import { sourceExists } from '../source-helpers.ts';
+} from '../validation-lite.ts';
+
+function sourceExists(ctx: SessionToolContext, workspaceRootPath: string, sourceSlug: string): boolean {
+  return ctx.fs.exists(join(workspaceRootPath, 'sources', sourceSlug));
+}
 
 // ============================================================
 // Types
@@ -288,7 +291,7 @@ function validateSourceBindings(
   const warnings: ValidationIssue[] = [];
 
   for (const source of sources) {
-    const exists = sourceExists(ctx.workspacePath, source.slug);
+    const exists = sourceExists(ctx, ctx.workspacePath, source.slug);
     if (!exists && source.required) {
       errors.push({
         path: `sources/${source.slug}`,

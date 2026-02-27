@@ -15,7 +15,7 @@ import { join } from 'node:path';
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import {
   E2ESessionHarness,
-} from '../../../../packages/session-tools-core/src/handlers/__tests__/e2e-utils.ts';
+} from '../../../../packages/agent-pipeline-core/src/handlers/__tests__/e2e-utils.ts';
 
 // Use real ISA agent config from the project
 const ISA_AGENT_CONFIG_PATH = join(

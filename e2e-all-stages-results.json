@@ -1,65 +1,74 @@
 {
-  "timestamp": "2026-02-25T15:50:18.631Z",
+  "timestamp": "2026-02-27T07:57:10.175Z",
   "query": "What should I consider when testing insurance reserves under ISA 540?",
-  "totalDurationSec": 0.291,
-  "totalCostUsd": 0,
-  "pipelineCompleted": false,
+  "totalDurationSec": 303.965,
+  "totalCostUsd": 0.46255500000000005,
+  "pipelineCompleted": true,
   "allOrchestrator": true,
   "stageReports": [
     {
       "stageId": 0,
       "stageName": "analyze_query",
-      "verdict": "FAIL",
+      "verdict": "PASS",
       "method": "LLM",
-      "duration": 0.29,
-      "notes": "FAILED — did not pause at stage 0"
+      "duration": 27.695,
+      "notes": "Paused correctly. 402 stream chunks. Output: **Query Analysis Complete** — Clarity: 85% (above 70% threshold)\n\n**Assumptions*..."
     },
     {
       "stageId": 1,
       "stageName": "websearch_calibration",
-      "verdict": "FAIL",
+      "verdict": "PASS",
       "method": "LLM",
-      "duration": 0,
-      "notes": "Events: orchestrator_error"
+      "duration": 0.002,
+      "notes": "Paused correctly. 0 stream chunks. Output: **Web Search Calibration — UNAVAILABLE**\n\nWeb search could not run because MCP b..."
     },
     {
       "stageId": 2,
       "stageName": "retrieve",
-      "verdict": "FAIL",
+      "verdict": "PASS",
       "method": "MCP",
-      "duration": 0,
-      "notes": "Stage never started — pipeline may have stopped early"
+      "duration": 0.001,
+      "notes": "Gracefully skipped (no MCP bridge) — returned empty result"
     },
     {
       "stageId": 3,
       "stageName": "synthesize",
-      "verdict": "FAIL",
+      "verdict": "PASS",
       "method": "LLM",
-      "duration": 0,
-      "notes": "Stage never started — pipeline may have stopped early"
+      "duration": 276.26,
+      "notes": "LLM call completed. Streaming OK"
     },
     {
       "stageId": 4,
       "stageName": "verify",
-      "verdict": "FAIL",
+      "verdict": "PASS",
       "method": "MCP",
-      "duration": 0,
-      "notes": "Stage never started — pipeline may have stopped early"
+      "duration": 0.001,
+      "notes": "Gracefully skipped (no MCP bridge) — returned empty result"
     },
     {
       "stageId": 5,
       "stageName": "output",
-      "verdict": "FAIL",
+      "verdict": "PASS",
       "method": "Render",
-      "duration": 0,
-      "notes": "Stage never started — pipeline may have stopped early"
+      "duration": 0.006,
+      "notes": "Deterministic render completed"
     }
   ],
   "eventSequence": [
     "start(0)",
-    "err(0)",
-    "err(-1)",
-    "err(-1)"
+    "pause(0)",
+    "start(1)",
+    "pause(1)",
+    "start(2)",
+    "done(2)",
+    "start(3)",
+    "done(3)",
+    "start(4)",
+    "done(4)",
+    "start(5)",
+    "done(5)",
+    "COMPLETE"
   ],
-  "allStagesPass": false
+  "allStagesPass": true
 }

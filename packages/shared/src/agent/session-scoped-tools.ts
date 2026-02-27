@@ -45,14 +45,17 @@ import {
   handleSlackOAuthTrigger,
   handleMicrosoftOAuthTrigger,
   handleCredentialPrompt,
-  handleAgentStageGate,
-  handleAgentState,
-  handleAgentValidate,
-  handleAgentRenderOutput,
   // Types
   type ToolResult,
   type AuthRequest,
 } from '@craft-agent/session-tools-core';
+
+import {
+  handleAgentStageGate,
+  handleAgentState,
+  handleAgentValidate,
+  handleAgentRenderOutput,
+} from '@craft-agent/agent-pipeline-core';
 
 // Re-export types for backward compatibility
 export type {

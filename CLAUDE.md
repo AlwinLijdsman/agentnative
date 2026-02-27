@@ -109,13 +109,14 @@ Available for PDF operations when configured. Key capabilities:
 
 ## Session-Scoped Agent Tools
 
-Tools registered in `packages/shared/src/agent/session-scoped-tools.ts`, implemented in `packages/session-tools-core/src/handlers/`.
+Tools registered in `packages/shared/src/agent/session-scoped-tools.ts`. Agent pipeline handlers implemented in `packages/agent-pipeline-core/src/handlers/`; platform handlers in `packages/session-tools-core/src/handlers/`.
 
-| Tool | Handler Module | Purpose |
-|------|---------------|---------|
-| `agent_stage_gate` | `agent-stage-gate/` | Pipeline stage lifecycle (start, complete, resume, repair) |
-| `agent_state` | `agent-state/` | Persistent key-value state across conversation turns |
-| `agent_render_research_output` | `agent-render-output/` | Assemble structured research documents from `FinalAnswer` data |
+| Tool | Handler Module | Package | Purpose |
+|------|---------------|---------|--------|
+| `agent_stage_gate` | `agent-stage-gate.ts` | `agent-pipeline-core` | Pipeline stage lifecycle (start, complete, resume, repair) |
+| `agent_state` | `agent-state.ts` | `agent-pipeline-core` | Persistent key-value state across conversation turns |
+| `agent_render_research_output` | `agent-render-output/` | `agent-pipeline-core` | Assemble structured research documents from `FinalAnswer` data |
+| `agent_validate` | `agent-validate.ts` | `agent-pipeline-core` | Agent configuration validation |
 
 ### `agent_render_research_output`
 
