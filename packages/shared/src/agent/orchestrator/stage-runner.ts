@@ -621,9 +621,12 @@ export class StageRunner {
 
     const useBAML = orchestratorConfig?.useBAML === true;
 
+    this.emitProgress({ type: 'status', message: `Building synthesis context from ${retrievalParagraphs.length} retrieved paragraphs` });
+
     // ── BAML path (Phase 10) ──────────────────────────────────────────────
     if (useBAML && this.getAuthToken) {
       try {
+        this.emitProgress({ type: 'status', message: 'Synthesizing answer via BAML pipeline' });
         const authToken = await this.getAuthToken();
         const retrievalContextStr = buildStageContext({
           stageName: 'synthesize',
@@ -652,6 +655,7 @@ export class StageRunner {
         );
         if (bamlResult) {
           // Run deterministic post-processing to ensure inline labels exist (Section 19)
+          this.emitProgress({ type: 'status', message: `Post-processing synthesis — ${bamlResult.citations.length} citations found` });
           const priorInputs = (followUpContext?.priorSections ?? []).map(ps => ({
             sectionId: ps.sectionId, heading: ps.heading, excerpt: ps.excerpt, sectionNum: ps.sectionNum,
           }));
@@ -718,12 +722,14 @@ export class StageRunner {
 
     this.emitProgress({ type: 'llm_complete', text: 'Synthesis complete', toolUseId: synthLlmToolId, isIntermediate: true });
 
+    this.emitProgress({ type: 'status', message: 'Extracting structured data from LLM response' });
     const parsed = extractRawJson(result.text);
     const data = (parsed != null && typeof parsed === 'object')
       ? parsed as Record<string, unknown>
       : { rawText: result.text };
 
     // Run deterministic post-processing to ensure inline labels exist (Section 19)
+    this.emitProgress({ type: 'status', message: 'Post-processing synthesis — injecting source labels' });
     const synthesisText = (typeof data['synthesis'] === 'string')
       ? data['synthesis']
       : result.text;
@@ -738,9 +744,12 @@ export class StageRunner {
       data['synthesis'] = ppResult.synthesis;
     }
 
+    const citationCount = Array.isArray(data['citations_used']) ? (data['citations_used'] as unknown[]).length : 0;
+    const summaryMsg = citationCount > 0 ? `Synthesis complete — ${citationCount} citations` : 'Synthesis complete';
+
     return {
       text: result.text,
-      summary: 'Synthesis complete',
+      summary: summaryMsg,
       usage: result.usage,
       data,
     };
