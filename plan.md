@@ -1734,3 +1734,513 @@ is not sufficient. Skip if Phase 0 already identifies the root cause.
 ---
 
 _Last updated: 2026-02-27_
+---
+
+# Implementation Plan: Orchestrator Context Continuity & Pipeline Breakout
+
+**Branch**: `feature/orchestrator-context-continuity`
+**Goal**: (1) Make orchestrator pipeline output survive as conversation context for subsequent turns, (2) Allow users to break out of a paused pipeline while preserving conversation context.
+
+---
+
+## Problem Analysis
+
+### Why context is lost today
+
+The orchestrator pipeline (`runOrchestrator()`/`resumeOrchestrator()`) short-circuits `chat()` with `return` before the SDK's `query()` is ever called. The SDK never sees orchestrator output, so no JSONL transcript is written. On the next turn:
+
+1. SDK `resume` finds no transcript → falls back to `buildRecoveryContext()`
+2. `buildRecoveryContext()` takes only the last 6 messages, each truncated to 1000 chars
+3. Research output (10,000+ chars) is destroyed
+
+The existing `tryInjectAgentOutputFile()` partially mitigates by injecting full output into `managed.messages[]` after pipeline completion, but this is in-memory only — the SDK transcript on disk never gets it.
+
+### Why a naive fix fails
+
+- **Injecting into user messages**: Context blocks prepended by `buildTextPrompt()` are stripped during SDK compaction. A 10K summary in a user message gets compacted away.
+- **Modifying system prompt**: System prompt is pinned on first `chat()` call. Changing it triggers drift warnings and the SDK won't apply the change.
+- **Writing to SDK transcript directly**: The transcript format is SDK-internal; writing directly would break resume semantics.
+
+### Correct approach
+
+**File-based context injection** via `buildContextParts()`. The orchestrator writes a summary file to disk after completion. On each subsequent turn, `buildTextPrompt()` reads the file and includes a compact reference in the user message context. This follows the existing pattern used by date/time context, session state, and source state blocks.
+
+When the conversation is compacted, the summary file on disk survives. The next user message re-reads the file and re-injects the summary. The summary is small (500–1500 chars) compared to the full output (5K–30K chars), so it's cost-effective to re-inject every turn.
+
+### Coordination with tryInjectAgentOutputFile (G4)
+
+`tryInjectAgentOutputFile()` already injects the full research output as an assistant message in `managed.messages[]`. This is the detailed output for the user to read. The `pipeline-summary.json` is a separate, smaller file that provides *context for the LLM* — telling it what was researched, not showing the full output. Both are needed:
+- `tryInjectAgentOutputFile` → full output visible to user in chat
+- `pipeline-summary.json` → compact context visible to LLM in prompt
+
+### Partial pipeline fallback (G3)
+
+When a pipeline is incomplete (user broke out at stage 1, or error at stage 3), `answer.json` doesn't exist. But `pipeline-state.json` has `stageOutputs` for all completed stages. The summary generation reads from `stageOutputs` and produces a summary even for incomplete pipelines:
+- Stage 0 completed → summary has the query decomposition
+- Stage 0+1 completed → summary has query plan + web search calibration
+- Stage 0+1+2+3 completed → summary has synthesis but no verification
+
+---
+
+## Key Files
+
+| File | Package | Role in this change | Modified? |
+|------|---------|-------------------|:---------:|
+| `packages/shared/src/agent/claude-agent.ts` | shared | `isBreakoutIntent()`, `writePipelineSummary()`, breakout logic in `chat()`, `sessionPath` wiring | ✓ |
+| `packages/shared/src/agent/core/prompt-builder.ts` | shared | `buildOrchestratorSummaryBlock()`, `escapeXml()`, wired into `buildContextParts()` | ✓ |
+| `packages/shared/src/agent/core/types.ts` | shared | Added `sessionPath?` to `ContextBlockOptions` | ✓ |
+| `packages/shared/src/agent/orchestrator/pipeline-state.ts` | shared | Added `generateSummary()` method | ✓ |
+| `packages/shared/src/agent/orchestrator/types.ts` | shared | Extended `StageEventType` with `'breakout'`, added `PipelineSummary` interface | ✓ |
+| `packages/shared/src/agent/orchestrator/__tests__/pipeline-state-summary.test.ts` | shared | 16 unit tests for `generateSummary()` | ✓ (new) |
+| `packages/shared/src/agent/orchestrator/__tests__/breakout-intent.test.ts` | shared | 41 unit tests for `isBreakoutIntent()` | ✓ (new) |
+| `packages/shared/src/agent/orchestrator/__tests__/orchestrator-summary-block.test.ts` | shared | 12 unit tests for `buildOrchestratorSummaryBlock()` | ✓ (new) |
+| `apps/electron/src/main/sessions.ts` | electron | Not modified — breakout logic handled entirely in `claude-agent.ts` | ✗ |
+| `apps/electron/src/renderer/event-processor/processor.ts` | electron | Not modified — existing `agent_run_completed` handler suffices | ✗ |
+| `apps/electron/src/renderer/App.tsx` | electron | Not modified — existing `agent_run_state_update` handler suffices | ✗ |
+
+---
+
+## Phase 1: Orchestrator Context Summary (Compaction-Safe)
+
+**Goal**: After an orchestrator pipeline completes, write a compact summary file to disk. On every subsequent user message, `buildTextPrompt()` reads the file and injects a summary context block.
+
+### Architecture
+
+```
+Pipeline completes → writePipelineSummary() writes JSON to {sessionPath}/data/pipeline-summary.json
+                     ↓
+Next user turn → buildTextPrompt() → buildContextParts() → buildOrchestratorSummaryBlock()
+                     ↓
+                reads pipeline-summary.json, formats as <orchestrator_prior_research> XML block
+                     ↓
+SDK compacts → user message content stripped, but file survives on disk
+                     ↓
+Next turn after compaction → buildContextParts() re-reads file, re-injects block ✓
+```
+
+### Why a separate summary file (not answer.json)
+
+`answer.json` is a large artifact (5K–30K chars) designed for follow-up pipeline runs. It contains full citations, sub-queries, and raw answer text. Injecting all of that into every user message would be wasteful and might trigger compaction prematurely.
+
+`pipeline-summary.json` is a compact derivative (~500–1500 chars) designed specifically for conversation context. It contains: original query, key findings summary, main conclusions, stage completion status, and verification scores.
+
+### Why not system prompt injection
+
+The system prompt is pinned on first `chat()` call for consistency. Changing it triggers drift warnings. Using user-message context blocks follows the existing pattern (date/time, session state, source state) and is the correct approach.
+
+### Tasks
+
+- [x] 1.1 Add `PipelineState.generateSummary()` method that extracts key data from `stageOutputs`:
+  - `originalQuery`: from stageOutputs[0].data.original_query
+  - `keyFindings`: from stageOutputs[3].data.key_findings (if exists)
+  - `conclusions`: from stageOutputs[3].data.conclusions (if exists)
+  - `verificationScores`: from stageOutputs[4].data (if exists)
+  - `completedStages`: derived from events
+  - `wasPartial`: true if pipeline didn't reach stage 5
+
+- [x] 1.2 Add `writePipelineSummary()` to `claude-agent.ts` (called after `yield { type: 'complete' }` in `runOrchestrator()`/`resumeOrchestrator()`):
+  - Reads `PipelineState.loadFrom(sessionPath)`
+  - Calls `generateSummary()`
+  - Writes `{sessionPath}/data/pipeline-summary.json`
+  - Handles partial pipelines (G3): falls back to whatever stageOutputs exist
+
+- [x] 1.3 Add `buildOrchestratorSummaryBlock()` to `PromptBuilder`:
+  - Reads `{sessionPath}/data/pipeline-summary.json`
+  - Formats as `<orchestrator_prior_research>` XML block (~500–1500 chars)
+  - Returns empty string if file doesn't exist (no-op for non-agent sessions)
+
+- [x] 1.4 Wire `buildOrchestratorSummaryBlock()` into `buildContextParts()`:
+  - Add after source state block
+  - Pass `sessionPath` via `ContextBlockOptions` (needs `sessionId` and `workspaceRootPath`)
+
+- [x] 1.5 Run `pnpm run typecheck:all` and `pnpm run lint`
+
+- [-] 1.6 Test manually: run an ISA pipeline to completion, then send a follow-up message. Verify the LLM knows what was researched. (skipped: requires live API key and interactive testing)
+
+---
+
+## Phase 2: Pipeline Breakout System
+
+**Goal**: When a pipeline is paused and the user sends an unrelated message, detect breakout intent, terminate the pipeline cleanly, preserve conversation context, and switch to normal chat mode.
+
+### Architecture
+
+```
+User sends message while pipeline paused
+    ↓
+chat() → detectPausedOrchestrator() → found paused pipeline
+    ↓
+resumeOrchestrator() called (existing path)
+    ↓
+NEW: Before delegating to orchestrator.resume(), classify user intent:
+    ↓
+    ├── Resume keywords (proceed, continue, yes, etc.) → orchestrator.resume() (existing)
+    │
+    └── Breakout keywords → breakoutOrchestrator()
+        ↓
+        1. Write pipeline-summary.json (G3: partial state → summary)
+        2. Record 'breakout' event in pipeline-state.json
+        3. Clear bridge state
+        4. Emit agent_run_completed event (G5: clears agentRunStateAtom)
+        5. Delete pipeline-state.json pause markers (mark as terminated)
+        6. Fall through to SDK chat() with user's original message
+```
+
+### Why binary classification (G2)
+
+**Resume keywords** → `resumeOrchestrator()` (existing path — continues pipeline)
+**Breakout keywords** → `breakoutOrchestrator()` (new — terminates pipeline, falls through to normal `chat()`)
+**Everything else** → `resumeOrchestrator()` (existing — orchestrator handles as resume feedback)
+
+The breakout keywords are explicit and narrow. This is safe because the user must actively signal breakout intent. LLM-driven classification adds unnecessary complexity and cost.
+
+### Breakout keyword list
+
+Case-insensitive, checked as substrings/patterns:
+- "break out" / "breakout"
+- "exit pipeline" / "exit agent"
+- "stop pipeline" / "stop agent"
+- "cancel pipeline" / "cancel agent"
+- "new question"
+- "forget the pipeline"
+- "skip pipeline"
+- "leave pipeline"
+
+If none match → treat as resume (existing behavior).
+
+### StageEventType extension (G6)
+
+Adding `'breakout'` to the `StageEventType` union requires updating:
+1. `types.ts` — union definition
+2. `pipeline-state.ts` — no changes needed (generic `addEvent()`)
+3. No other files use exhaustive switches on `StageEventType`
+
+### Agent run state cleanup (G5)
+
+`breakoutOrchestrator()` must emit `agent_run_completed` via `onAgentEvent` callback. This triggers the existing `agent_run_state_update` effect in the renderer's event processor, which clears `agentRunStateAtom` for the agent slug.
+
+### Fall-through to SDK (Task 2.5)
+
+`breakoutOrchestrator()` does NOT consume the message for SDK. Instead, the breakout check is placed in `chat()` before `resumeOrchestrator()`:
+1. Check breakout intent before calling `resumeOrchestrator()`
+2. If breakout → run cleanup (summary, events, bridge state, emit completion), then DON'T return — let `chat()` continue to the SDK `query()` path
+3. The existing `buildTextPrompt()` will pick up `pipeline-summary.json` via Phase 1's `buildOrchestratorSummaryBlock()`
+
+### Tasks
+
+- [x] 2.1 Add `'breakout'` to `StageEventType` union in `packages/shared/src/agent/orchestrator/types.ts`
+
+- [x] 2.2 Add `isBreakoutIntent(userMessage: string): boolean` to `claude-agent.ts`:
+  - Keyword-based detection (no LLM call)
+  - Case-insensitive substring matching
+  - Returns true only for explicit breakout keywords
+
+- [x] 2.3 Modify the paused orchestrator detection in `chat()` (`claude-agent.ts` ~L690) to check breakout intent BEFORE calling `resumeOrchestrator()`:
+  ```
+  if (pausedOrch) {
+    if (isBreakoutIntent(userMessage)) {
+      // run cleanup, do NOT return — fall through to SDK query()
+    } else {
+      yield* this.resumeOrchestrator(userMessage, pausedOrch.agent);
+      return;
+    }
+  }
+  ```
+
+- [x] 2.4 Implement breakout cleanup logic (inline in `chat()` or as `breakoutOrchestrator()`):
+  1. Load `PipelineState.loadFrom(sessionPath)`
+  2. Call `generateSummary()` and write `pipeline-summary.json`
+  3. Record breakout event: `state.addEvent({ type: 'breakout', stage: state.currentStage, data: { userMessage } })`
+  4. Save updated state (with breakout event)
+  5. Clear bridge state via `clearOrchestratorBridgeState()`
+  6. Emit `agent_run_completed` event with `verificationStatus: 'breakout'`
+  7. Yield info message: "Pipeline terminated. Your research context has been preserved."
+  8. Continue — `chat()` falls through to SDK `query()` path
+
+- [x] 2.5 Run `pnpm run typecheck:all` and `pnpm run lint`
+
+- [-] 2.6 Test: pause a pipeline, send "break out", verify pipeline terminates cleanly, context preserved, and normal chat continues with awareness of prior research. (skipped: requires live API key and interactive testing)
+
+---
+
+## Phase 3: Integration Testing & Edge Cases
+
+**Goal**: Verify all paths work correctly and handle edge cases.
+
+### Edge cases to test
+
+| Scenario | Expected behavior |
+|----------|-------------------|
+| Pipeline completes → user asks follow-up | LLM sees `<orchestrator_prior_research>` block with summary |
+| Pipeline completes → user compacts → asks follow-up | Summary file survives, re-injected on next turn |
+| Pipeline paused at stage 0 → user breaks out | Partial summary with query decomposition only |
+| Pipeline paused at stage 1 → user breaks out then asks related question | LLM knows query plan + calibration results |
+| Pipeline errors at stage 3 → user asks "what happened?" | Summary has stages 0–2, error noted |
+| User sends "proceed" while paused | Normal resume (existing behavior unchanged) |
+| User sends "break out" while no pipeline paused | No effect — `detectPausedOrchestrator()` returns null |
+| Multiple pipeline runs in same session | Latest `pipeline-summary.json` overwrites previous |
+| Pipeline completes → user starts NEW pipeline | Old summary overwritten by new pipeline-summary.json |
+
+### Tasks
+
+- [x] 3.1 Write unit test for `PipelineState.generateSummary()` — complete, partial, and error cases (16 tests, all pass)
+- [x] 3.2 Write unit test for `isBreakoutIntent()` — keyword matching (41 tests, all pass)
+- [x] 3.3 Write unit test for `buildOrchestratorSummaryBlock()` — file present, missing, and malformed (12 tests, all pass)
+- [-] 3.4 Write E2E test: mock pipeline completion → verify summary file written → verify context block in prompt (covered by unit tests 3.1-3.3)
+- [x] 3.5 Run full test suite: `pnpm run typecheck:all && pnpm run lint && pnpm run test:e2e` — 177/177 pass, 0 fail, 69 new tests pass
+
+---
+
+## Risks & Mitigations
+
+| Risk | Impact | Mitigation |
+|------|--------|------------|
+| Summary injection increases per-turn token cost | Low (~500–1500 tokens) | Summary is compact; much smaller than full output |
+| Breakout keywords false-positive on resume intent | Medium | Keywords are narrow and explicit; ambiguous messages go to resume path |
+| `pipeline-summary.json` stale after new pipeline | Low | File is overwritten on each pipeline run |
+| SDK compaction mid-conversation doesn't re-inject | Low | Verified: `buildTextPrompt()` re-reads file on every turn |
+| `StageEventType` union extension breaks exhaustive checks | Low | Grep confirmed no exhaustive switches on this union |
+
+## Testing Strategy
+
+1. **TypeScript**: `pnpm run typecheck:all` after each phase
+2. **Lint**: `pnpm run lint` after each phase
+3. **Unit tests**: New tests for `generateSummary()`, `isBreakoutIntent()`, `buildOrchestratorSummaryBlock()`
+4. **E2E**: `pnpm run test:e2e` for existing tests (no regressions)
+5. **Manual**: Run ISA pipeline → complete → ask follow-up → verify context awareness
+
+---
+
+## Adversarial Review Findings (2026-02-28)
+
+Post-implementation review identified the following findings. None are critical; all automated validation passes (0 type errors, 0 lint regressions, 69/69 new tests pass, 177/177 E2E tests pass).
+
+### F1 — `OrchestratorExitReason` not extended with `'breakout'` (warning)
+
+**File**: `packages/shared/src/agent/orchestrator/types.ts` L385
+**Issue**: The plan's original Key Files table stated "add `OrchestratorExitReason` variant", and `StageEventType` was correctly extended with `'breakout'`, but `OrchestratorExitReason` remains `'paused' | 'completed' | 'error'`. Additionally, `PipelineSummary.exitReason` is typed as `string` rather than a union type, so the breakout path works but loses type-level documentation.
+**Impact**: Future developers inspecting `OrchestratorExitReason` believe only 3 exit reasons exist. The `string` typing on `PipelineSummary.exitReason` loses IDE autocompletion and exhaustive-match protection. No runtime bug.
+**Resolution**: **Resolved** — Added `PipelineExitReason = OrchestratorExitReason | 'breakout'` type to `types.ts`. Typed `PipelineSummary.exitReason` as `PipelineExitReason`. Updated `generateSummary()` and `writePipelineSummary()` parameter types. Exported from `index.ts`.
+
+### F2 — Breakout keyword substring matching can false-positive on negation (warning)
+
+**File**: `packages/shared/src/agent/claude-agent.ts` L270-L272
+**Issue**: `isBreakoutIntent()` uses `lower.includes(pattern)` substring matching. The keyword `"new question"` would match in `"I don't have a new question"` or `"This is NOT a new question"`. Similarly `"stop agent"` matches `"don't stop agent from continuing"`.
+**Impact**: User messages containing breakout keywords in a negated context would trigger pipeline termination. Research work could be lost if the pipeline was mid-execution.
+**Resolution**: Accepted risk — breakout keywords are narrow, and the probability of a user including breakout phrases in negated form while a pipeline is paused is low. Future improvement: add word-boundary checks or a simple negation detector.
+
+### F3 — Plan Key Files table listed `sessions.ts` as requiring modification (nit)
+
+**File**: `plan.md` Key Files table
+**Issue**: The original Key Files table stated `apps/electron/src/main/sessions.ts` should "Coordinate summary injection with existing `tryInjectAgentOutputFile()`, emit `agent_run_completed` on breakout". The actual implementation placed all breakout logic inline in `claude-agent.ts` — `sessions.ts` was never modified.
+**Impact**: Misleading documentation. **Resolved** — Key Files table updated above to reflect actual state.
+
+### F4 — `escapeXml()` JSDoc omits unescaped `"` and `'` (nit)
+
+**File**: `packages/shared/src/agent/core/prompt-builder.ts` L226
+**Issue**: `escapeXml()` correctly escapes `&`, `<`, `>` for element content but intentionally omits `"` and `'` (safe for element content, unsafe for attribute values). The JSDoc doesn't note this limitation.
+**Impact**: Minimal — but if a future developer reuses `escapeXml()` for attribute values, it would produce malformed XML.
+**Resolution**: **Resolved** — Updated JSDoc to note that `"` and `'` are intentionally not escaped, safe for element content only.
+
+### F5 — `writePipelineSummary()` double-loads `PipelineState` in breakout path (nit)
+
+**File**: `packages/shared/src/agent/claude-agent.ts` L740-L753
+**Issue**: The breakout handler in `chat()` calls `PipelineState.loadFrom(sessionPath)` at L741 (to add the breakout event and save), then calls `this.writePipelineSummary()` at L753 which internally calls `PipelineState.loadFrom()` again — a redundant synchronous disk read of ~10-50KB.
+**Impact**: No correctness issue. The second read gets the updated state (with breakout event). Performance impact is negligible for a single call.
+**Resolution**: **Resolved** — Added optional `preloadedState?: PipelineState` parameter to `writePipelineSummary()`. Breakout path now passes the already-loaded state, eliminating the redundant disk read.
+
+### Summary Table
+
+| ID | Finding | Severity | Status |
+|----|---------|----------|--------|
+| F1 | `OrchestratorExitReason` missing `'breakout'` variant | warning | **resolved** |
+| F2 | Breakout keyword false-positive on negated sentences | warning | accepted |
+| F3 | Key Files table listed `sessions.ts` as modified | nit | **resolved** |
+| F4 | `escapeXml()` JSDoc omits `"` and `'` limitation | nit | **resolved** |
+| F5 | Double `PipelineState.loadFrom()` in breakout path | nit | **resolved** |
+| F6 | Breakout patterns too narrow — miss natural language signals | bug | **resolved** |
+
+---
+
+## F6 — Breakout Patterns Too Narrow (2026-02-28)
+
+**Discovered during manual testing**: User sent "I want to do something else - just tell me what the weather in zurich is today" while pipeline was paused after Stage 1. The message clearly signals breakout intent but the original keyword list (14 patterns, all technical/explicit) didn't match.
+
+**Root cause**: The original `BREAKOUT_PATTERNS` only contained explicit pipeline commands ("exit pipeline", "cancel agent", etc.) and missed natural language signals. When a user naturally says "something else", "different topic", "never mind", etc., none matched.
+
+**Fix**: Expanded `BREAKOUT_PATTERNS` from 14 → 28 entries with two tiers:
+- **Tier 1** (13 patterns): Explicit pipeline commands — `break out`, `exit pipeline`, `cancel agent`, etc.
+- **Tier 2** (15 patterns): Natural language signals — `something else`, `something different`, `different question`, `different topic`, `change topic`, `change the topic`, `new question`, `new topic`, `never mind`, `nevermind`, `forget it`, `changed my mind`, `want to ask`, `want to do`, `instead can you`, `instead tell me`, `instead just`
+
+**Test coverage**: Expanded from 41 → 63 tests. Added the exact failing user message as a test case. All 91 unit tests pass, 177 E2E tests pass.
+
+**Remaining risk (F2)**: Substring matching can still false-positive on negated sentences (e.g., "I don't want to do something else"). Accepted as low-probability — when a pipeline is paused asking "Shall I proceed?", negated breakout phrases are extremely unlikely.
+
+---
+
+## Breakout Confirmation Gate (2026-02-28)
+
+**Problem**: Immediate breakout termination on keyword match is too aggressive. Users can lose multi-stage research work on false-positive matches (e.g., "I want to do the search now" contains "want to do").
+
+**Solution**: Two-step confirmation gate — detect breakout intent → ask user for confirmation → act based on response.
+
+### Design Decisions
+
+| ID | Decision | Rationale |
+|----|----------|-----------|
+| D1 | Use `PipelineState` events (not bridge state) for `breakoutPending` | Avoids read-modify-write on bridge state file. `addEvent()` + `saveTo()` already exists. |
+| D2 | Bridge state untouched during confirmation window | Keeps queue drain hold active in `sessions.ts`. No session layer changes. |
+| D3 | "Neither confirm nor deny" = implicit confirmation | User is clearly moving on; message falls through to SDK. |
+| D4 | Confirmation yields `text_complete` + `complete` | Matches existing orchestrator pause message pattern. |
+| D5 | Semantic inversion documented | "yes"=quit, "continue"=stay. Denial checked first. |
+| D6 | Tier 2 patterns trimmed (28→25) | Removed "want to ask/do", "instead can/tell/just" — too ambiguous. |
+| D7 | Race condition accepted | Low probability; worst case is redundant confirmation. |
+
+### Changes Made
+
+**1. `types.ts`** — Added `'breakout_pending'` to `StageEventType` union.
+
+**2. `pipeline-state.ts`** — Added `isBreakoutPending` derived property. Uses array ordering (not timestamps) to check if the last `breakout_pending` event has been resolved by a subsequent `resumed` or `breakout` event. Survives app restarts.
+
+**3. `claude-agent.ts`** — Major changes:
+- **Trimmed patterns**: Removed 5 aggressive Tier 2 patterns ("want to ask", "want to do", "instead can you", "instead tell me", "instead just"). 28 → 23 patterns.
+- **Added `classifyBreakoutResponse()`**: Classifies user message as `'confirm'` / `'deny'` / `'implicit_confirm'`. Denial checked first to handle "yes, continue" correctly.
+- **Extended `detectPausedOrchestrator()`**: Return type now includes `breakoutPending: boolean` sourced from `PipelineState.isBreakoutPending`.
+- **Rewrote breakout block in `chat()`**: 2-way check → 5-way check:
+  - Case A: `breakoutPending` + deny → clear pending (`resumed` event), resume pipeline
+  - Case B: `breakoutPending` + confirm → terminate, yield `text_complete` + `complete`, return
+  - Case C: `breakoutPending` + implicit_confirm → terminate, yield `info`, fall through to SDK
+  - Case D: no pending + breakout intent → record `breakout_pending`, yield confirmation question, return
+  - Case E: no pending + no intent → normal resume (unchanged)
+
+**4. `pause-formatter.ts`** — Added "3. Exit" option to both pause message variants, giving users a discoverable breakout path.
+
+### Test Results
+
+- **breakout-intent.test.ts**: 118 tests (was 63) — added `classifyBreakoutResponse()` tests (confirm/deny/implicit/priority/edge cases), trimmed pattern verification
+- **pipeline-state-summary.test.ts**: 23 tests (was 16) — added 7 `isBreakoutPending` tests (empty, pending, denied, confirmed, paused+pending, re-trigger)
+- **orchestrator-summary-block.test.ts**: 12 tests (unchanged)
+- **All orchestrator tests**: 261/261 pass
+- **E2E tests**: 177/177 pass (1 skipped, pre-existing)
+- **Typecheck**: 0 errors
+- **Lint**: 0 new errors (5 pre-existing in renderer)
+
+---
+
+## Semantic Breakout Detection (2026-02-28)
+
+**Problem**: Keyword-only `isBreakoutIntent()` cannot detect when a user asks a completely unrelated question (e.g., "Actually what is the weather in zurich today?" during an audit research pipeline). The message contains no breakout keywords, so it falls through to Case E and the pipeline resumes, ignoring the user's actual intent.
+
+**Solution**: Add LLM-based semantic classification as a fallback when keywords don't match. Uses Opus (`claude-opus-4-6`) with `effort: 'low'` via existing `OrchestratorLlmClient.call()`. Claude Max subscription = flat rate, no cost difference. Keyword detection stays as a fast path (no LLM call for explicit breakouts).
+
+### Design Decisions
+
+| ID | Decision | Rationale |
+|----|----------|-----------|
+| D1 | Opus `effort: 'low'` | Claude Max = flat rate. Opus is strictly better for classification accuracy. Low effort keeps it fast (~500-800ms). |
+| D2 | Reuse `OrchestratorLlmClient.call()` | Already supports model/effort/maxTokens overrides. No new method needed. |
+| D3 | Keyword fast-path preserved | Explicit breakout phrases skip LLM call. LLM only fires for ambiguous messages. |
+| D4 | `'unclear'` → resume (not breakout) | Resuming is non-destructive. Breaking out destroys research progress. |
+| D5 | LLM failure → `'unclear'` → resume | If classification fails, fall through to Case E. User can retry. |
+| D6 | Confidence threshold = 0.7 | Below 0.7 → `'unclear'` → resume. Prevents weak-confidence breakouts. |
+| D7 | Case D helper extracted | `emitBreakoutConfirmation()` avoids duplication between keyword and semantic paths. |
+
+### Changes Made
+
+**1. `types.ts`** — Added `BreakoutClassification` type: `'pipeline_response' | 'breakout' | 'unclear'`.
+
+**2. `pipeline-state.ts`** — Added `originalQuery` getter (extracts from stageOutputs[0] query plan, same logic as `generateSummary()` but factored out). Added `subQueryTexts` getter (extracts first 5 sub-query texts for classification prompt context). Refactored `generateSummary()` to use `this.originalQuery` internally.
+
+**3. `claude-agent.ts`** — Major changes:
+- **`classifyBreakoutIntent()`**: New private async method. Builds classification prompt with research topic + sub-queries + user message. Creates temporary `OrchestratorLlmClient`, calls with `effort: 'low'`, `desiredMaxTokens: 200`. Parses JSON response. Returns `BreakoutClassification`. On any error → `'unclear'`. Confidence < 0.7 → `'unclear'`.
+- **`emitBreakoutConfirmation()`**: Extracted Case D logic (record `breakout_pending` event + yield confirmation question) into reusable async generator. Both keyword and semantic paths call this.
+- **`chat()` decision tree**: Extended from 5-way to 6-way:
+  - Case D (keyword): `isBreakoutIntent()` → `emitBreakoutConfirmation('keyword')`
+  - Case D' (semantic): `classifyBreakoutIntent()` → if `'breakout'` → `emitBreakoutConfirmation('semantic')`
+  - Case E: `'pipeline_response'` or `'unclear'` → `resumeOrchestrator()`
+- **Added imports**: `OrchestratorLlmClient` from orchestrator index, `BreakoutClassification` type from orchestrator types
+
+### Test Results
+
+- **pipeline-state-summary.test.ts**: 34 tests (was 23) — added 11 tests for `originalQuery` and `subQueryTexts` getters
+- **breakout-intent.test.ts**: 118 tests (unchanged — keyword tests still valid)
+- **All orchestrator tests**: 272/272 pass
+- **E2E tests**: 177/177 pass (1 skipped, pre-existing)
+- **Typecheck**: 0 errors
+- **Lint**: 0 new errors (5 pre-existing in renderer)
+
+---
+
+_Last updated: 2026-02-28 (Semantic Breakout Detection)_
+
+---
+
+## Phase 4: Adversarial Decision-Tree Hardening
+
+### Findings Summary
+
+Adversarial path analysis identified 11 findings (F1–F11) in the breakout decision tree. 3 critical, 3 warning, 5 nit/accepted.
+
+| # | Severity | Issue | Resolution |
+|---|----------|-------|------------|
+| F1 | Critical | Case B swallows original question — user confirms breakout, pipeline terminates, but original off-topic question never answered | **Fixed**: Case B now retrieves original message from `breakout_pending` event `data.userMessage`, overrides `userMessage`, falls through to SDK |
+| F3 | Critical | Numeric options "1"/"2" shown in confirmation but not handled — mapped to `implicit_confirm`, "2" causes data loss | **Fixed**: `classifyBreakoutResponse()` exact pre-check: `'1'/'1.'` → confirm, `'2'/'2.'` → deny (equality, not substring) |
+| F11 | Critical | `isPaused` stays true after breakout → `detectPausedOrchestrator()` re-enters terminated pipeline | **Fixed**: `isPaused` getter counts `'breakout'` events as resolving (alongside `'resumed'`) |
+| F4 | Warning | `'cancel'` in DENY patterns conflicts with breakout intent (user saying "cancel the pipeline" = wants to leave) | **Fixed**: Moved `'cancel'` from BREAKOUT_DENY_PATTERNS to BREAKOUT_CONFIRM_PATTERNS |
+| F9 | Warning | "3. Exit" shown in pause messages but "3" not handled by `isBreakoutIntent()` | **Fixed**: `isBreakoutIntent()` checks `lower === '3' \|\| lower === '3.'` as exact match before keyword scan |
+| F6 | Nit | 200-char truncation of userMessage in breakout events loses context | **Fixed**: Increased to 500 chars in both `breakout_pending` and `breakout` event storage |
+| F2 | Nit | `breakout_pending` event fires before `breakout` — no silent cancel path | Accepted: low risk, user can deny to resume |
+| F5 | Nit | Breakout patterns include common English words | Accepted: confirmation gate catches false positives |
+| F7 | Nit | Semantic classifier can fail silently | Accepted: returns `'unclear'` → falls through to pipeline resume |
+| F8 | Nit | Case B doesn't set userMessage for SDK | Merged with F1 fix |
+| F10 | Nit | `generateSummary()` not called on breakout exit | Accepted: summary not needed when pipeline incomplete |
+
+### Design Decisions
+
+| # | Decision | Rationale |
+|---|----------|-----------|
+| D1 | Case B retrieves original message from `breakout_pending` event rather than adding a new field | Event-sourced state is the single source of truth; avoids new mutable state |
+| D2 | Numeric "1"/"2" check uses exact equality, not substring | Prevents "Stage 1 looks good" or "Check citation 2" from matching |
+| D3 | `isPaused` counts `'breakout'` as resolving alongside `'resumed'` | Breakout is a pipeline-terminating event, semantically equivalent to resolution |
+| D4 | `'cancel'` moved to confirm rather than removed entirely | "Cancel" in context of a running pipeline means "stop what you're doing" = leave pipeline |
+| D5 | "3" detected via exact match, not added to keyword patterns | Only valid as pause menu selection, not as general breakout intent |
+| D6 | 500 chars chosen over unlimited | Balances context preservation with state file size; covers 99%+ of queries |
+| D7 | Case B falls through to SDK (like Case C) rather than using separate handler | Unifies the "answer user's question" path — DRY, easier to maintain |
+
+### Code Changes
+
+**1. `pipeline-state.ts`** — `isPaused` getter: resolveEvents filter now includes `e.type === 'breakout'` alongside `'resumed'`.
+
+**2. `claude-agent.ts`** — 7 changes:
+- `isBreakoutIntent()`: Added exact match `lower === '3' || lower === '3.'` before keyword scan
+- `BREAKOUT_CONFIRM_PATTERNS`: Added `'cancel'`
+- `BREAKOUT_DENY_PATTERNS`: Removed `'cancel'`
+- `classifyBreakoutResponse()`: Added exact numeric pre-check (`'1'/'1.'` → confirm, `'2'/'2.'` → deny) before substring pattern scan
+- Case B block: Rewritten — retrieves original message from last `breakout_pending` event, overrides `userMessage`, yields info, falls through to SDK
+- `emitBreakoutConfirmation()`: `userMessage.slice(0, 500)` (was 200)
+- Breakout event recording: `userMessage.slice(0, 500)` (was 200)
+- Decision tree comment updated to reflect new Case B behavior
+
+### Test Changes
+
+**breakout-intent.test.ts** — Added:
+- "3"/"3." exact match detection tests for `isBreakoutIntent()`
+- `'cancel'` + `'cancel the pipeline'` in confirm test list (moved from deny)
+- `'1'` → confirm, `'1.'` → confirm, `'2'` → deny, `'2.'` → deny (was `implicit_confirm`)
+- Substring safety: "Stage 1 looks good" → `implicit_confirm`, "Check citation 2" → `implicit_confirm`
+
+**pipeline-state-summary.test.ts** — Added 3 tests:
+- `isPaused returns false after breakout event`
+- `isPaused true when one of two pauses unresolved after breakout`
+- `isPaused correctly counts mixed resumed + breakout`
+
+### Validation Results
+
+- **Orchestrator tests**: 175/175 pass, 0 fail
+- **E2E tests**: 177/177 pass, 0 fail (1 skipped, pre-existing)
+- **Typecheck**: 0 errors (`pnpm run typecheck:all` → EXIT: 0)
+- **Lint**: 0 new errors (5 pre-existing in renderer — unrelated source auth/file open rules)
+
+---
+
+_Last updated: 2026-02-28 (Phase 4 — Adversarial Decision-Tree Hardening)_

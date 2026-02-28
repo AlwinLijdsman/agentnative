@@ -4150,10 +4150,36 @@ export class SessionManager {
       const pipelineStatePath = join(sessionPath, 'data', 'pipeline-state.json')
       if (existsSync(pipelineStatePath)) {
         const raw = JSON.parse(readFileSync(pipelineStatePath, 'utf8'))
-        const pauseCount = (raw.events as Array<{ type: string }>)?.filter(e => e.type === 'pause_requested').length ?? 0
-        const resumeCount = (raw.events as Array<{ type: string }>)?.filter(e => e.type === 'resumed').length ?? 0
-        if (pauseCount > resumeCount && raw.agentSlug) {
-          const lastPause = [...(raw.events as Array<{ type: string; stage?: number }>)].reverse().find(e => e.type === 'pause_requested')
+        const events = raw.events as Array<{ type: string; stage?: number }> ?? []
+
+        // G3 fix: Check for breakout_resume_pending state.
+        // When a breakout-resume confirmation is pending, we need to hold
+        // the queue drain so the user's response goes through chat() path
+        // instead of being consumed by the SDK.
+        const breakoutResumePendingCount = events.filter(e => e.type === 'breakout_resume_pending').length
+        const resumeFromBreakoutCount = events.filter(e => e.type === 'resume_from_breakout').length
+        const stageStartedAfterPendingCount = events.filter(e => e.type === 'stage_started').length
+        if (breakoutResumePendingCount > resumeFromBreakoutCount) {
+          // Check that no stage_started happened after the last breakout_resume_pending
+          const lastPendingIdx = events.map((e, i) => e.type === 'breakout_resume_pending' ? i : -1).filter(i => i >= 0).pop() ?? -1
+          const hasStartAfterPending = events.slice(lastPendingIdx + 1).some(e => e.type === 'stage_started')
+          if (!hasStartAfterPending && raw.agentSlug) {
+            sessionLog.debug('[orchestrator] getPausedAgentResumeContext: breakout_resume_pending detected', {
+              agentSlug: raw.agentSlug,
+            })
+            return `<orchestrator_pipeline_breakout_resume_pending agentSlug="${raw.agentSlug}" />`
+          }
+        }
+
+        const pauseCount = events.filter(e => e.type === 'pause_requested').length
+        // Fix: resumeCount should include 'resumed' + 'resume_from_breakout' events
+        // (breakout events end a pause implicitly via pipeline termination)
+        const resumeCount = events.filter(e =>
+          e.type === 'resumed' || e.type === 'resume_from_breakout',
+        ).length
+        const breakoutCount = events.filter(e => e.type === 'breakout').length
+        if (pauseCount > (resumeCount + breakoutCount) && raw.agentSlug) {
+          const lastPause = [...events].reverse().find(e => e.type === 'pause_requested')
           const pausedStage = lastPause?.stage ?? -1
           sessionLog.debug('[orchestrator] getPausedAgentResumeContext: found via pipeline-state.json fallback', {
             agentSlug: raw.agentSlug,

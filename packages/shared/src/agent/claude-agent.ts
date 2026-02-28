@@ -105,11 +105,13 @@ import { AbortReason, type RecoveryMessage } from './core/index.ts';
 export { AbortReason, type RecoveryMessage };
 
 // Orchestrator — deterministic stage pipeline (Phase 6 integration)
-import { AgentOrchestrator, CostTracker, McpLifecycleManager, OrchestratorMcpBridge, PipelineState, extractTransportConfig } from './orchestrator/index.ts';
+import { AgentOrchestrator, CostTracker, McpLifecycleManager, OrchestratorLlmClient, OrchestratorMcpBridge, PipelineState, extractTransportConfig } from './orchestrator/index.ts';
 import type {
   AgentConfig as OrchestratorAgentConfig,
+  BreakoutClassification,
   McpBridge as OrchestratorMcpBridge_T,
   OrchestratorExitReason,
+  PipelineExitReason,
 } from './orchestrator/types.ts';
 import { loadSourceConfig } from '../sources/storage.ts';
 import { loadAgent, loadWorkspaceAgents } from '../agents/storage.ts';
@@ -229,6 +231,203 @@ export function resolveGlobalPermission(requestId: string, allowed: boolean): vo
  */
 export function clearGlobalPermissions(): void {
   globalPendingPermissions.clear();
+}
+
+// ============================================================
+// Orchestrator Breakout Detection
+// ============================================================
+
+/**
+ * Breakout keyword patterns — case-insensitive substrings that signal
+ * the user wants to exit a paused orchestrator pipeline.
+ *
+ * Two tiers:
+ * 1. Explicit pipeline commands: "exit pipeline", "cancel agent", etc.
+ * 2. Natural language intent signals: "something else", "never mind", etc.
+ *
+ * Messages not matching any pattern fall through to the existing resume
+ * path where the orchestrator handles them as feedback.
+ */
+const BREAKOUT_PATTERNS: readonly string[] = [
+  // Tier 1: Explicit pipeline commands
+  'break out',
+  'breakout',
+  'exit pipeline',
+  'exit agent',
+  'stop pipeline',
+  'stop agent',
+  'cancel pipeline',
+  'cancel agent',
+  'forget the pipeline',
+  'skip pipeline',
+  'leave pipeline',
+  'abandon pipeline',
+  'quit pipeline',
+  // Tier 2: Natural language breakout signals
+  // NOTE: Aggressive patterns removed ("want to ask", "want to do",
+  // "instead can you", "instead tell me", "instead just") — these match
+  // too many resume-intent messages. The confirmation gate reduces the
+  // cost of remaining false positives to an extra prompt.
+  'something else',
+  'something different',
+  'different question',
+  'different topic',
+  'change topic',
+  'change the topic',
+  'new question',
+  'new topic',
+  'never mind',
+  'nevermind',
+  'forget it',
+  'changed my mind',
+];
+
+/**
+ * Detect whether a user message signals intent to break out of a paused
+ * orchestrator pipeline. Uses keyword-based detection (no LLM call).
+ *
+ * @param userMessage - The user's message text
+ * @returns true if breakout intent detected
+ */
+export function isBreakoutIntent(userMessage: string): boolean {
+  const lower = userMessage.toLowerCase().trim();
+  // Exact match for pause message option "3. Exit" (F9)
+  if (lower === '3' || lower === '3.') return true;
+  return BREAKOUT_PATTERNS.some(pattern => lower.includes(pattern));
+}
+
+/** Words that confirm breakout intent ("yes, quit the pipeline"). */
+const BREAKOUT_CONFIRM_PATTERNS: readonly string[] = [
+  'yes', 'yeah', 'yep', 'yup', 'sure', 'confirm', 'quit', 'leave', 'exit',
+  'terminate', 'stop', 'abort', 'end it', 'kill it', 'close it',
+  'cancel',  // "cancel the pipeline" = confirm exit (F4)
+];
+
+/** Words that deny breakout intent ("no, continue the pipeline"). */
+const BREAKOUT_DENY_PATTERNS: readonly string[] = [
+  'no', 'nah', 'nope', 'stay', 'keep going', 'continue',
+  'proceed', 'resume', 'go back', 'go on', 'carry on', 'never mind',
+  'forget i said that', 'back to',
+];
+
+/**
+ * Classify a user's response to a breakout confirmation question.
+ *
+ * IMPORTANT — Semantic inversion vs. pipeline resume vocabulary:
+ * During confirmation, "yes" means "quit pipeline" and "continue" means
+ * "stay in pipeline". This is inverted relative to normal pause-resume
+ * where "yes/continue" means "proceed with next stage". The inversion
+ * is correct because the question is "Do you want to EXIT?", not
+ * "Do you want to CONTINUE?".
+ *
+ * Denial is checked first — if a user says "no, continue", we want
+ * to match denial rather than letting "continue" slip into ambiguity.
+ *
+ * @returns 'confirm' (quit), 'deny' (stay), or 'implicit_confirm' (neither — user moved on)
+ */
+export function classifyBreakoutResponse(
+  userMessage: string,
+): 'confirm' | 'deny' | 'implicit_confirm' {
+  const lower = userMessage.toLowerCase().trim();
+
+  // Exact numeric option match — confirmation question shows "1. Yes" / "2. No" (F3)
+  // Must be checked before substring scan to avoid "1" matching inside longer text.
+  if (lower === '1' || lower === '1.') return 'confirm';
+  if (lower === '2' || lower === '2.') return 'deny';
+
+  // Check denial first — "no" / "continue" / "proceed" means keep the pipeline
+  if (BREAKOUT_DENY_PATTERNS.some(p => lower.includes(p))) return 'deny';
+
+  // Check confirmation — "yes" / "quit" / "exit" means terminate
+  if (BREAKOUT_CONFIRM_PATTERNS.some(p => lower.includes(p))) return 'confirm';
+
+  // Neither — implicit confirmation (user is clearly moving on to something else)
+  return 'implicit_confirm';
+}
+
+// ============================================================================
+// BREAKOUT RESUME CLASSIFICATION — Resume-from-breakout intent detection
+// ============================================================================
+
+/** Patterns that signal intent to resume a broken-out pipeline. */
+const BREAKOUT_RESUME_PATTERNS: readonly string[] = [
+  'resume', 'continue', 'pick up', 'carry on', 'go ahead',
+  'proceed', 'go back', 'where we left off', 'where i left off',
+  'yes', 'yeah', 'yep', 'yup', 'sure',
+];
+
+/** Patterns that signal intent to start a fresh pipeline instead of resuming. */
+const BREAKOUT_FRESH_PATTERNS: readonly string[] = [
+  'start fresh', 'start over', 'start new', 'from scratch',
+  'new pipeline', 'new research', 'fresh start', 'brand new',
+  'no', 'nah', 'nope',
+];
+
+/** Regex patterns for resume intent in free-form agent re-invocation messages. */
+const RESUME_INTENT_REGEXPS: readonly RegExp[] = [
+  /\b(continue|resume|pick up|carry on|proceed|go back)\b/i,
+  /\bwhere\b.+\bleft off\b/i,
+  /\bstage\s+\d+/i,
+];
+
+/** Regex patterns for fresh-start intent in agent re-invocation messages. */
+const FRESH_INTENT_REGEXPS: readonly RegExp[] = [
+  /\bstart\s+(fresh|over|new)\b/i,
+  /\bfrom\s+scratch\b/i,
+  /\bnew\s+(pipeline|research|query)\b/i,
+  /\bforget\b.+\bprevious\b/i,
+  /\bbrand\s+new\b/i,
+];
+
+/**
+ * Classify a user's response to the breakout-resume confirmation prompt.
+ *
+ * IMPORTANT — Distinct from classifyBreakoutResponse():
+ * The breakout confirmation asks "Do you want to EXIT?" (1=exit, 2=stay).
+ * The resume confirmation asks "Do you want to RESUME?" (1=resume, 2=fresh).
+ * Semantics are inverted: "yes" here means resume, not exit.
+ *
+ * @returns 'resume' (continue pipeline), 'fresh_start' (start over), or 'unclear'
+ */
+export function classifyBreakoutResumeResponse(
+  userMessage: string,
+): 'resume' | 'fresh_start' | 'unclear' {
+  const lower = userMessage.toLowerCase().trim();
+
+  // Exact numeric match — prompt shows "1. Resume" / "2. Start fresh"
+  if (lower === '1' || lower === '1.') return 'resume';
+  if (lower === '2' || lower === '2.') return 'fresh_start';
+
+  // Check fresh-start first — "no" / "start fresh" means new pipeline
+  if (BREAKOUT_FRESH_PATTERNS.some(p => lower.includes(p))) return 'fresh_start';
+
+  // Check resume — "yes" / "resume" / "continue" means continue pipeline
+  if (BREAKOUT_RESUME_PATTERNS.some(p => lower.includes(p))) return 'resume';
+
+  return 'unclear';
+}
+
+/**
+ * Classify resume intent from a free-form agent re-invocation message.
+ *
+ * Used when the user sends "[agent:slug] - continue with stage 2" without
+ * a prior confirmation prompt. Detects whether the message signals
+ * resume intent, fresh-start intent, or is ambiguous.
+ *
+ * @returns 'resume', 'fresh_start', or 'unclear' (triggers confirmation prompt)
+ */
+export function classifyResumeIntent(
+  userMessage: string,
+): 'resume' | 'fresh_start' | 'unclear' {
+  const text = userMessage.trim();
+
+  // Check fresh-start patterns first (more specific)
+  if (FRESH_INTENT_REGEXPS.some(p => p.test(text))) return 'fresh_start';
+
+  // Check resume patterns
+  if (RESUME_INTENT_REGEXPS.some(p => p.test(text))) return 'resume';
+
+  return 'unclear';
 }
 
 // Handle preferences update (extracted for use in MCP tool)
@@ -405,6 +604,10 @@ export class ClaudeAgent extends BaseAgent {
   private pinnedPreferencesPrompt: string | null = null;
   // Track if preference drift notification has been shown this session
   private preferencesDriftNotified: boolean = false;
+  // Track if context compaction notification has been shown this session
+  private contextCompactionNotified: boolean = false;
+  // Last context compaction state — set by buildTextPrompt/buildSDKUserMessage, read by chat()
+  private _lastContextWasCompacted: boolean = false;
   // Captured stderr from SDK subprocess (for error diagnostics when process exits with code 1)
   private lastStderrOutput: string[] = [];
   // Last assistant message usage (for accurate context window display)
@@ -681,26 +884,214 @@ export class ClaudeAgent extends BaseAgent {
         return;
       }
 
-      // ── ORCHESTRATOR RESUME DETECTION ─────────────────────────────
-      // Check if a paused orchestrator pipeline exists for this session.
-      // If so, route to resume() instead of run() — no [agent:] mention needed.
+      // ── BREAKOUT RESUME PENDING DETECTION ──────────────────────────
+      // G1/G2 fix: Check if a breakout_resume_pending confirmation is awaiting
+      // a response. This runs BEFORE detectPausedOrchestrator because the
+      // pipeline is NOT paused after breakout (isPaused=false), so the
+      // existing paused-orchestrator path would miss it entirely.
+      //
+      // Flow: User broke out → later re-invoked [agent:] → we asked
+      //   "1. Resume / 2. Start fresh" → recorded breakout_resume_pending →
+      //   now user responds with "1" or "2" (or free text).
       if (!_isRetry) {
-        const pausedOrch = this.detectPausedOrchestrator(sessionId);
-        if (pausedOrch) {
-          debug(`[chat] Detected paused orchestrator for agent=${pausedOrch.slug} — resuming`);
-          yield* this.resumeOrchestrator(userMessage, pausedOrch.agent);
-          return;
+        const breakoutResumePending = this.detectBreakoutResumePending(sessionId);
+        if (breakoutResumePending) {
+          const decision = classifyBreakoutResumeResponse(userMessage);
+          debug(`[chat] Breakout-resume confirmation response: decision=${decision} agent=${breakoutResumePending.slug}`);
+
+          if (decision === 'resume') {
+            // Resume pipeline from the stage after the last completed one
+            debug(`[chat] Resuming from breakout: agent=${breakoutResumePending.slug} fromStage=${breakoutResumePending.resumeFromStage}`);
+            yield* this.resumeFromBreakoutOrchestrator(userMessage, breakoutResumePending);
+            return;
+          } else if (decision === 'fresh_start') {
+            // G4 fix: Clean up stale pipeline artifacts before fresh start
+            const sessionPath = getSessionPath(this.workspaceRootPath, sessionId);
+            this.cleanupStaleBreakoutArtifacts(sessionPath);
+            debug(`[chat] Fresh start after breakout: agent=${breakoutResumePending.slug} — cleaned artifacts, falling through`);
+            yield {
+              type: 'info',
+              message: 'Starting a fresh pipeline. Previous research context has been cleared.',
+            };
+            // Fall through to normal detectOrchestratableAgent / SDK path
+          } else {
+            // unclear → default to resume (non-destructive, like breakout classification defaults)
+            debug(`[chat] Breakout-resume unclear response, defaulting to resume: agent=${breakoutResumePending.slug}`);
+            yield* this.resumeFromBreakoutOrchestrator(userMessage, breakoutResumePending);
+            return;
+          }
         }
       }
 
-      // ── ORCHESTRATOR DETECTION ──────────────────────────────────────
-      // Check if the message mentions an agent with orchestratable stages.
-      // If so, delegate to the deterministic orchestrator pipeline instead
-      // of the SDK's tool-calling loop. This ensures TypeScript controls
-      // stage execution, not the LLM.
+      // ── ORCHESTRATOR RESUME / BREAKOUT DETECTION ──────────────────
+      // Check if a paused orchestrator pipeline exists for this session.
+      // If so, route through a decision tree:
+      //   A. breakoutPending + deny       → clear pending, resume pipeline
+      //   B. breakoutPending + confirm    → terminate, retrieve original msg, fall through to SDK
+      //   C. breakoutPending + implicit   → terminate, fall through to SDK (current msg)
+      //   D. no pending + keyword match   → set pending, ask confirmation (fast path)
+      //   D'. no pending + LLM breakout   → set pending, ask confirmation (semantic path)
+      //   E. no pending + no intent       → normal resume
+      if (!_isRetry) {
+        const pausedOrch = this.detectPausedOrchestrator(sessionId);
+        if (pausedOrch) {
+          const sessionPath = getSessionPath(this.workspaceRootPath, sessionId);
+
+          if (pausedOrch.breakoutPending) {
+            // ── CONFIRMATION TURN — user previously expressed breakout intent ──
+            const decision = classifyBreakoutResponse(userMessage);
+            debug(`[chat] Breakout confirmation for agent=${pausedOrch.slug}: decision=${decision}`);
+
+            if (decision === 'deny') {
+              // ── Case A: User wants to STAY — clear pending, resume pipeline ──
+              try {
+                const pipelineState = PipelineState.loadFrom(sessionPath);
+                if (pipelineState) {
+                  // Record 'resumed' event to cancel the breakout_pending
+                  const updatedState = pipelineState.addEvent({
+                    type: 'resumed',
+                    stage: pipelineState.currentStage,
+                    data: { breakoutDenied: true },
+                  });
+                  updatedState.saveTo(sessionPath);
+                }
+              } catch (denyError) {
+                debug(`[chat] Breakout denial cleanup error: ${denyError instanceof Error ? denyError.message : String(denyError)}`);
+              }
+              yield { type: 'info', message: 'Continuing with the research pipeline.' };
+              yield* this.resumeOrchestrator(userMessage, pausedOrch.agent);
+              return;
+            } else {
+              // ── Case B/C: confirm or implicit_confirm — TERMINATE pipeline ──
+              try {
+                const pipelineState = PipelineState.loadFrom(sessionPath);
+                if (pipelineState) {
+                  const updatedState = pipelineState.addEvent({
+                    type: 'breakout',
+                    stage: pipelineState.currentStage,
+                    data: { userMessage: userMessage.slice(0, 500), decision },
+                  });
+                  updatedState.saveTo(sessionPath);
+
+                  const agentConfig = this.toOrchestratorAgentConfig(pausedOrch.agent);
+                  const totalStages = agentConfig.controlFlow.stages.length;
+                  this.writePipelineSummary(sessionPath, totalStages, 'breakout', updatedState);
+                }
+
+                this.clearOrchestratorBridgeState(sessionPath, pausedOrch.slug);
+
+                this.onAgentEvent?.({
+                  type: 'agent_run_completed',
+                  agentSlug: pausedOrch.slug,
+                  runId: `breakout-${Date.now()}`,
+                  data: { verificationStatus: 'breakout' },
+                });
+              } catch (breakoutError) {
+                debug(`[chat] Breakout cleanup error: ${breakoutError instanceof Error ? breakoutError.message : String(breakoutError)}`);
+              }
+
+              if (decision === 'confirm') {
+                // ── Case B: Explicit confirm — retrieve original question, fall through to SDK ──
+                // The original breakout message is stored in the breakout_pending event.
+                // Retrieve it so the SDK can answer the user's original question (F1/F8).
+                try {
+                  const confirmState = PipelineState.loadFrom(sessionPath);
+                  if (confirmState) {
+                    const pendingEvents = confirmState.events.filter(
+                      (e) => e.type === 'breakout_pending',
+                    );
+                    const lastPending = pendingEvents[pendingEvents.length - 1];
+                    const storedMessage = lastPending?.data?.['userMessage'] as string | undefined;
+                    if (storedMessage && storedMessage.length > 0) {
+                      userMessage = storedMessage;
+                    }
+                  }
+                } catch (retrieveError) {
+                  debug(`[chat] Original message retrieval error: ${retrieveError instanceof Error ? retrieveError.message : String(retrieveError)}`);
+                }
+              }
+
+              // ── Case B/C unified: both yield info + fall through to SDK ──
+              yield {
+                type: 'info',
+                message: 'Pipeline terminated. Your research context has been preserved.',
+              };
+              // DO NOT return — fall through to normal SDK chat() path
+            }
+          } else if (isBreakoutIntent(userMessage)) {
+            // ── Case D (keyword fast path): Explicit breakout signal — ask for confirmation ──
+            debug(`[chat] Breakout intent detected (keyword) for agent=${pausedOrch.slug} — asking confirmation`);
+            yield* this.emitBreakoutConfirmation(userMessage, sessionPath, 'keyword');
+            return;
+          } else {
+            // ── Semantic classification: is this a pipeline response or unrelated? ──
+            // Keyword detection missed — use LLM to classify semantic intent.
+            // This catches cases like "what's the weather in zurich?" which are
+            // clearly unrelated to an audit research pipeline but contain no keywords.
+            const pipelineState = PipelineState.loadFrom(sessionPath);
+            if (pipelineState && pipelineState.originalQuery !== 'Unknown query') {
+              const classification = await this.classifyBreakoutIntent(
+                userMessage, pipelineState, pipelineState.pausedAtStage ?? -1,
+              );
+              debug(`[chat] Semantic breakout classification for agent=${pausedOrch.slug}: ${classification}`);
+
+              if (classification === 'breakout') {
+                // ── Case D (semantic path): LLM detected off-topic — ask for confirmation ──
+                debug(`[chat] Semantic breakout detected for agent=${pausedOrch.slug} — asking confirmation`);
+                yield* this.emitBreakoutConfirmation(userMessage, sessionPath, 'semantic');
+                return;
+              }
+              // classification === 'pipeline_response' or 'unclear' → fall through to Case E
+            }
+
+            // ── Case E: Normal resume path — orchestrator handles the message ──
+            debug(`[chat] Detected paused orchestrator for agent=${pausedOrch.slug} — resuming`);
+            yield* this.resumeOrchestrator(userMessage, pausedOrch.agent);
+            return;
+          }
+        }
+      }
+
+      // ── ORCHESTRATOR DETECTION (with breakout resume check) ─────────
+      // FIRST: Check if the mentioned agent has a resumable broken-out pipeline.
+      // If so, offer to resume instead of blindly starting fresh.
+      // SECOND: If not resumable, start a fresh orchestrator pipeline.
       if (!_isRetry) {
         const orchestratableAgent = this.detectOrchestratableAgent(userMessage);
         if (orchestratableAgent) {
+          // Check for resumable breakout state before starting fresh
+          const resumable = this.detectResumableBreakout(sessionId, orchestratableAgent.slug);
+          if (resumable) {
+            // Classify resume intent from the free-form message
+            const intent = classifyResumeIntent(userMessage);
+            debug(`[chat] Resumable breakout detected for agent=${orchestratableAgent.slug}: intent=${intent} lastCompleted=${resumable.lastCompletedStage}`);
+
+            if (intent === 'resume') {
+              // Explicit resume intent — skip confirmation, resume directly
+              yield* this.resumeFromBreakoutOrchestrator(userMessage, {
+                slug: orchestratableAgent.slug,
+                agent: orchestratableAgent,
+                resumeFromStage: resumable.lastCompletedStage + 1,
+              });
+              return;
+            } else if (intent === 'fresh_start') {
+              // Explicit fresh start — clean artifacts and start fresh
+              const sessionPath = getSessionPath(this.workspaceRootPath, sessionId);
+              this.cleanupStaleBreakoutArtifacts(sessionPath);
+              debug(`[chat] Fresh start (explicit): agent=${orchestratableAgent.slug}`);
+              // Fall through to runOrchestrator below
+            } else {
+              // Ambiguous — ask confirmation (emit breakout_resume_pending)
+              debug(`[chat] Ambiguous resume intent for agent=${orchestratableAgent.slug} — asking confirmation`);
+              yield* this.emitBreakoutResumeConfirmation({
+                slug: orchestratableAgent.slug,
+                agent: orchestratableAgent,
+                resumeFromStage: resumable.lastCompletedStage + 1,
+              });
+              return;
+            }
+          }
+
           debug(`[chat] Detected orchestratable agent: ${orchestratableAgent.slug} — delegating to orchestrator`);
           yield* this.runOrchestrator(userMessage, orchestratableAgent);
           return;
@@ -1442,6 +1833,16 @@ export class ClaudeAgent extends BaseAgent {
         this.currentQuery = query({ prompt, options: optionsWithAbort });
       }
 
+      // ── Pipeline context compaction notification (one-time per session) ──
+      if (this._lastContextWasCompacted && !this.contextCompactionNotified) {
+        yield {
+          type: 'info',
+          message: `Note: Prior research pipeline data was compacted to fit the context budget. Some stage details were summarized.`,
+        };
+        this.contextCompactionNotified = true;
+        debug('[chat] Pipeline context was compacted — notified user');
+      }
+
       // ═══════════════════════════════════════════════════════════════════════════
       // STATELESS TOOL MATCHING (see tool-matching.ts for details)
       // ═══════════════════════════════════════════════════════════════════════════
@@ -1587,6 +1988,7 @@ export class ClaudeAgent extends BaseAgent {
               this.config.onSdkSessionIdCleared?.();
               this.pinnedPreferencesPrompt = null;
               this.preferencesDriftNotified = false;
+              this.contextCompactionNotified = false;
               yield { type: 'info', message: 'Session expired, restoring context...' };
               yield* this.chat(userMessage, attachments, { isRetry: true });
               return;
@@ -1611,6 +2013,7 @@ export class ClaudeAgent extends BaseAgent {
           // Clear pinned state for fresh start
           this.pinnedPreferencesPrompt = null;
           this.preferencesDriftNotified = false;
+          this.contextCompactionNotified = false;
 
           // Build recovery context from previous messages to inject into retry
           const recoveryContext = this.buildRecoveryContext();
@@ -1789,6 +2192,7 @@ export class ClaudeAgent extends BaseAgent {
           this.config.onSdkSessionIdCleared?.();
           this.pinnedPreferencesPrompt = null;
           this.preferencesDriftNotified = false;
+          this.contextCompactionNotified = false;
           yield { type: 'info', message: 'Session expired, restoring context...' };
           yield* this.chat(userMessage, attachments, { isRetry: true });
           return;
@@ -1877,6 +2281,7 @@ export class ClaudeAgent extends BaseAgent {
           // Clear pinned state so retry captures fresh values
           this.pinnedPreferencesPrompt = null;
           this.preferencesDriftNotified = false;
+          this.contextCompactionNotified = false;
 
           // Provide context-aware message (conservative: only match explicit session/resume terms)
           const isSessionError =
@@ -1959,11 +2364,19 @@ export class ClaudeAgent extends BaseAgent {
 
     // Add context parts using centralized PromptBuilder
     // This includes: date/time, session state (with plansFolderPath),
-    // workspace capabilities, and working directory context
-    const contextParts = this.promptBuilder.buildContextParts(
-      { plansFolderPath: getSessionPlansPath(this.workspaceRootPath, this.modeSessionId) },
+    // orchestrator summary (if available), workspace capabilities, and working directory context
+    const sessionId = this.config.session?.id ?? `temp-${Date.now()}`;
+    const sessionPath = getSessionPath(this.workspaceRootPath, sessionId);
+    const { parts: contextParts, contextWasCompacted } = this.promptBuilder.buildContextParts(
+      {
+        plansFolderPath: getSessionPlansPath(this.workspaceRootPath, this.modeSessionId),
+        sessionPath,
+      },
       this.sourceManager.formatSourceState()
     );
+
+    // Track compaction state for downstream notification in chat()
+    this._lastContextWasCompacted = contextWasCompacted;
 
     parts.push(...contextParts);
 
@@ -2000,11 +2413,19 @@ export class ClaudeAgent extends BaseAgent {
 
     // Add context parts using centralized PromptBuilder
     // This includes: date/time, session state (with plansFolderPath),
-    // workspace capabilities, and working directory context
-    const contextParts = this.promptBuilder.buildContextParts(
-      { plansFolderPath: getSessionPlansPath(this.workspaceRootPath, this.modeSessionId) },
+    // orchestrator summary (if available), workspace capabilities, and working directory context
+    const sdkSessionId = this.config.session?.id ?? `temp-${Date.now()}`;
+    const sdkSessionPath = getSessionPath(this.workspaceRootPath, sdkSessionId);
+    const { parts: contextParts, contextWasCompacted } = this.promptBuilder.buildContextParts(
+      {
+        plansFolderPath: getSessionPlansPath(this.workspaceRootPath, this.modeSessionId),
+        sessionPath: sdkSessionPath,
+      },
       this.sourceManager.formatSourceState()
     );
+
+    // Track compaction state for downstream notification in chat()
+    this._lastContextWasCompacted = contextWasCompacted;
 
     for (const part of contextParts) {
       contentBlocks.push({ type: 'text', text: part });
@@ -2723,6 +3144,7 @@ export class ClaudeAgent extends BaseAgent {
     // Clear pinned state so next chat() will capture fresh values
     this.pinnedPreferencesPrompt = null;
     this.preferencesDriftNotified = false;
+    this.contextCompactionNotified = false;
   }
 
   /**
@@ -2937,6 +3359,7 @@ export class ClaudeAgent extends BaseAgent {
     // Clear pinned system prompt state
     this.pinnedPreferencesPrompt = null;
     this.preferencesDriftNotified = false;
+    this.contextCompactionNotified = false;
 
     // Clear Claude-specific callbacks (not handled by BaseAgent)
     this.onSourcesListChange = null;
@@ -3087,6 +3510,165 @@ export class ClaudeAgent extends BaseAgent {
   }
 
   /**
+   * Handle breakout pending — record breakout_pending event and yield
+   * confirmation question to the user.
+   *
+   * Extracted as a helper to share between keyword-based (fast path)
+   * and semantic-based (LLM path) breakout detection in chat().
+   *
+   * @param userMessage - The user's message that triggered breakout detection
+   * @param sessionPath - Session directory path
+   * @param source - 'keyword' or 'semantic' for debug logging
+   */
+  private async *emitBreakoutConfirmation(
+    userMessage: string,
+    sessionPath: string,
+    source: 'keyword' | 'semantic',
+  ): AsyncGenerator<AgentEvent> {
+    try {
+      const pipelineState = PipelineState.loadFrom(sessionPath);
+      if (pipelineState) {
+        const updatedState = pipelineState.addEvent({
+          type: 'breakout_pending',
+          stage: pipelineState.currentStage,
+          data: { userMessage: userMessage.slice(0, 500), detectionSource: source },
+        });
+        updatedState.saveTo(sessionPath);
+      }
+    } catch (pendingError) {
+      this.onDebug?.(
+        `[chat] Breakout pending error: ${pendingError instanceof Error ? pendingError.message : String(pendingError)}`,
+      );
+    }
+
+    // Bridge state is NOT modified — keeps queue drain hold active (F1).
+    // Yield confirmation question as a text_complete (like orchestrator pause messages)
+    const pausedStage = PipelineState.loadFrom(sessionPath)?.pausedAtStage ?? -1;
+    const confirmationMessage =
+      `It looks like you want to exit the current research pipeline (paused at stage ${pausedStage}).\n\n` +
+      `If I proceed, the pipeline will be terminated and your research progress so far will be saved as context.\n\n` +
+      `Do you want to exit the pipeline?\n` +
+      `1. Yes — exit and switch to normal chat\n` +
+      `2. No — continue with the research pipeline`;
+
+    yield {
+      type: 'text_complete',
+      text: confirmationMessage,
+      isIntermediate: false,
+      turnId: `breakout-confirm-ask-${Date.now()}`,
+    };
+    yield { type: 'complete' };
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // SEMANTIC BREAKOUT CLASSIFICATION
+  // ──────────────────────────────────────────────────────────────────────────
+
+  /** System prompt for semantic breakout classification. */
+  private static readonly BREAKOUT_CLASSIFICATION_SYSTEM_PROMPT =
+    `You are a message classifier for a research assistant application.\n\n` +
+    `A multi-stage research pipeline is currently paused and waiting for the user's response. ` +
+    `The pipeline asked the user questions or presented options about the research topic.\n\n` +
+    `Given the research topic and the user's new message, determine if the user is:\n` +
+    `(a) "pipeline_response" — responding to the research pipeline: answering its questions, ` +
+    `choosing an option (A/B), providing clarification, or giving feedback about the research, OR\n` +
+    `(b) "breakout" — asking about something completely unrelated to the research topic, ` +
+    `changing the subject, or requesting to do something different.\n\n` +
+    `Respond ONLY with a JSON object, no other text:\n` +
+    `{"classification": "pipeline_response" | "breakout", "confidence": <0.0 to 1.0>}`;
+
+  /**
+   * Classify whether a user message is a response to the paused pipeline
+   * or a breakout (unrelated request) using a lightweight Opus LLM call.
+   *
+   * Called when keyword-based `isBreakoutIntent()` doesn't match but we
+   * need to check for semantic breakout (e.g., "what's the weather in zurich?"
+   * is clearly unrelated to an audit research pipeline).
+   *
+   * Uses Opus with `effort: 'low'` and `desiredMaxTokens: 200` for fast
+   * classification (~500-800ms). On any error, returns 'unclear' which
+   * defaults to resuming the pipeline (non-destructive fallback).
+   *
+   * @param userMessage - The user's new message
+   * @param pipelineState - Current pipeline state (for original query + sub-queries)
+   * @param pausedAtStage - Stage number where the pipeline is paused
+   * @returns BreakoutClassification: 'pipeline_response' | 'breakout' | 'unclear'
+   */
+  private async classifyBreakoutIntent(
+    userMessage: string,
+    pipelineState: PipelineState,
+    pausedAtStage: number,
+  ): Promise<BreakoutClassification> {
+    const startTime = Date.now();
+    try {
+      // Build user prompt with research context
+      const originalQuery = pipelineState.originalQuery;
+      const subQueries = pipelineState.subQueryTexts;
+      const subQuerySection = subQueries.length > 0
+        ? `\nResearch sub-queries:\n${subQueries.map((sq, i) => `  ${i + 1}. ${sq}`).join('\n')}`
+        : '';
+
+      const classificationPrompt =
+        `Research topic: "${originalQuery}"${subQuerySection}\n` +
+        `Pipeline paused at stage: ${pausedAtStage}\n\n` +
+        `User's message: "${userMessage}"\n\n` +
+        `Classify this message.`;
+
+      // Create temporary LLM client — short-lived, GC'd after call
+      const llmClient = new OrchestratorLlmClient(
+        () => this.getOrchestratorAuthToken(),
+      );
+
+      const result = await llmClient.call({
+        systemPrompt: ClaudeAgent.BREAKOUT_CLASSIFICATION_SYSTEM_PROMPT,
+        userMessage: classificationPrompt,
+        effort: 'low',
+        desiredMaxTokens: 200,
+      });
+
+      const elapsed = Date.now() - startTime;
+      this.onDebug?.(
+        `[chat] Semantic breakout classification completed in ${elapsed}ms, ` +
+        `tokens: ${result.usage.inputTokens}in/${result.usage.outputTokens}out`,
+      );
+
+      // Parse JSON response
+      const jsonMatch = result.text.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) {
+        this.onDebug?.('[chat] Semantic breakout: failed to extract JSON from response');
+        return 'unclear';
+      }
+
+      const parsed = JSON.parse(jsonMatch[0]) as { classification?: string; confidence?: number };
+      const classification = parsed.classification;
+      const confidence = typeof parsed.confidence === 'number' ? parsed.confidence : 0;
+
+      this.onDebug?.(`[chat] Semantic breakout result: classification=${classification}, confidence=${confidence}`);
+
+      // Confidence threshold — below 0.7, treat as unclear (resume is safer)
+      if (confidence < 0.7) {
+        this.onDebug?.(`[chat] Semantic breakout: confidence ${confidence} below threshold 0.7 — treating as unclear`);
+        return 'unclear';
+      }
+
+      if (classification === 'breakout') return 'breakout';
+      if (classification === 'pipeline_response') return 'pipeline_response';
+
+      // Unknown classification value
+      this.onDebug?.(`[chat] Semantic breakout: unknown classification value "${classification}"`);
+      return 'unclear';
+    } catch (error) {
+      const elapsed = Date.now() - startTime;
+      this.onDebug?.(
+        `[chat] Semantic breakout classification error (${elapsed}ms): ` +
+        `${error instanceof Error ? error.message : String(error)}`,
+      );
+      // On any error, return 'unclear' — resume pipeline (non-destructive)
+      return 'unclear';
+    }
+  }
+
+  /**
    * Detect if an orchestrator pipeline is paused for this session.
    *
    * Reads pipeline-state.json from the session's data directory.
@@ -3097,7 +3679,7 @@ export class ClaudeAgent extends BaseAgent {
    * @param sessionId - Current session ID
    * @returns Agent info if a paused orchestrator pipeline exists, null otherwise
    */
-  private detectPausedOrchestrator(sessionId: string): { slug: string; agent: LoadedAgent } | null {
+  private detectPausedOrchestrator(sessionId: string): { slug: string; agent: LoadedAgent; breakoutPending: boolean } | null {
     try {
       const sessionPath = getSessionPath(this.workspaceRootPath, sessionId);
       const state = PipelineState.loadFrom(sessionPath);
@@ -3107,8 +3689,8 @@ export class ClaudeAgent extends BaseAgent {
       if (state.agentSlug) {
         const agent = loadAgent(this.workspaceRootPath, state.agentSlug);
         if (agent) {
-          this.onDebug?.(`[orchestrator] detectPausedOrchestrator: found via pipeline-state.json agentSlug=${state.agentSlug}`);
-          return { slug: state.agentSlug, agent };
+          this.onDebug?.(`[orchestrator] detectPausedOrchestrator: found via pipeline-state.json agentSlug=${state.agentSlug} breakoutPending=${state.isBreakoutPending}`);
+          return { slug: state.agentSlug, agent, breakoutPending: state.isBreakoutPending };
         }
       }
 
@@ -3131,7 +3713,7 @@ export class ClaudeAgent extends BaseAgent {
             const agent = loadAgent(this.workspaceRootPath, slug);
             if (agent) {
               this.onDebug?.(`[orchestrator] detectPausedOrchestrator: found via bridge state slug=${slug}`);
-              return { slug, agent };
+              return { slug, agent, breakoutPending: false };
             }
           }
         } catch {
@@ -3184,6 +3766,432 @@ export class ClaudeAgent extends BaseAgent {
       this.onDebug?.(`[orchestrator] clearOrchestratorBridgeState: agent=${agentSlug} existed=${existed}`);
     } catch {
       // Best-effort cleanup — non-fatal
+    }
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // BREAKOUT RESUME DETECTION + CONFIRMATION
+  // ──────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Detect if a breakout_resume_pending confirmation is awaiting a response.
+   *
+   * This is the SECOND TURN detector — after we've already asked the user
+   * "1. Resume / 2. Start fresh" and recorded a breakout_resume_pending event.
+   * The response does NOT need an [agent:] mention (G2 fix).
+   *
+   * @returns Resume info if pending, null otherwise
+   */
+  private detectBreakoutResumePending(
+    sessionId: string,
+  ): { slug: string; agent: LoadedAgent; resumeFromStage: number } | null {
+    try {
+      const sessionPath = getSessionPath(this.workspaceRootPath, sessionId);
+      const state = PipelineState.loadFrom(sessionPath);
+      if (!state || !state.isBreakoutResumePending) return null;
+
+      // Resolve agent slug — either from state metadata or from the pending event data
+      const agentSlug = state.agentSlug;
+      if (!agentSlug) {
+        this.onDebug?.('[orchestrator] detectBreakoutResumePending: no agentSlug in pipeline state');
+        return null;
+      }
+
+      const agent = loadAgent(this.workspaceRootPath, agentSlug);
+      if (!agent) {
+        this.onDebug?.(`[orchestrator] detectBreakoutResumePending: agent ${agentSlug} not found`);
+        return null;
+      }
+
+      const resumeFromStage = state.lastCompletedStageIndex + 1;
+      this.onDebug?.(
+        `[orchestrator] detectBreakoutResumePending: agent=${agentSlug} resumeFromStage=${resumeFromStage}`,
+      );
+      return { slug: agentSlug, agent, resumeFromStage };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Detect if an agent has a resumable broken-out pipeline in this session.
+   *
+   * This is the FIRST TURN detector — when the user re-invokes [agent:slug]
+   * and we check if a prior breakout exists that can be resumed.
+   *
+   * Phase 6 hardening: Includes a 24-hour staleness guard — pipelines
+   * broken out more than 24 hours ago are not considered resumable.
+   *
+   * @param sessionId - Current session ID
+   * @param agentSlug - Agent slug to check for resumable state
+   * @returns Resume info if resumable, null otherwise
+   */
+  private detectResumableBreakout(
+    sessionId: string,
+    agentSlug: string,
+  ): { lastCompletedStage: number } | null {
+    try {
+      const sessionPath = getSessionPath(this.workspaceRootPath, sessionId);
+      const state = PipelineState.loadFrom(sessionPath);
+      if (!state) return null;
+
+      // Must be the same agent
+      if (state.agentSlug && state.agentSlug !== agentSlug) return null;
+
+      if (!state.isResumableAfterBreakout) return null;
+
+      // Phase 6 staleness guard: Skip if the breakout happened more than 24h ago
+      const lastBreakoutEvent = [...state.events].reverse().find(e => e.type === 'breakout');
+      if (lastBreakoutEvent?.timestamp) {
+        const breakoutAge = Date.now() - new Date(lastBreakoutEvent.timestamp).getTime();
+        const STALE_THRESHOLD_MS = 24 * 60 * 60 * 1000; // 24 hours
+        if (breakoutAge > STALE_THRESHOLD_MS) {
+          this.onDebug?.(
+            `[orchestrator] detectResumableBreakout: breakout is stale ` +
+            `(age=${Math.round(breakoutAge / 3600000)}h > 24h) — skipping resume offer`,
+          );
+          return null;
+        }
+      }
+
+      const lastCompletedStage = state.lastCompletedStageIndex;
+      this.onDebug?.(
+        `[orchestrator] detectResumableBreakout: agent=${agentSlug} ` +
+        `lastCompletedStage=${lastCompletedStage} isResumable=true`,
+      );
+      return { lastCompletedStage };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Emit the breakout-resume confirmation prompt.
+   *
+   * Records breakout_resume_pending event and yields a text_complete with
+   * "1. Resume from stage N / 2. Start fresh" prompt.
+   *
+   * This mirrors the pattern of emitBreakoutConfirmation() but with
+   * inverted semantics — "1" means resume (not exit).
+   *
+   * @param resumableInfo - Agent and stage info for resume
+   */
+  private async *emitBreakoutResumeConfirmation(
+    resumableInfo: { slug: string; agent: LoadedAgent; resumeFromStage: number },
+  ): AsyncGenerator<AgentEvent> {
+    const sessionId = this.config.session?.id ?? '';
+    const sessionPath = getSessionPath(this.workspaceRootPath, sessionId);
+
+    try {
+      const state = PipelineState.loadFrom(sessionPath);
+      if (state) {
+        const updatedState = state.addEvent({
+          type: 'breakout_resume_pending',
+          stage: resumableInfo.resumeFromStage,
+          data: { agentSlug: resumableInfo.slug },
+        });
+        updatedState.saveTo(sessionPath);
+      }
+    } catch (pendingError) {
+      this.onDebug?.(
+        `[chat] Breakout-resume pending event error: ` +
+        `${pendingError instanceof Error ? pendingError.message : String(pendingError)}`,
+      );
+    }
+
+    // Load agent config to get stage names for the confirmation message
+    let stageNames: string[] = [];
+    try {
+      const agentConfig = this.toOrchestratorAgentConfig(resumableInfo.agent);
+      stageNames = agentConfig.controlFlow.stages.map(s => s.name);
+    } catch {
+      // Non-fatal — confirmation message will omit stage names
+    }
+
+    const resumeStage = resumableInfo.resumeFromStage;
+    const resumeStageName = stageNames[resumeStage] ?? `Stage ${resumeStage}`;
+    const completedCount = resumeStage;
+    const totalCount = stageNames.length || '?';
+
+    const confirmationMessage =
+      `I found a previous research pipeline for this agent that was interrupted.\n\n` +
+      `**Progress:** ${completedCount}/${totalCount} stages completed\n` +
+      `**Resume point:** ${resumeStageName}\n\n` +
+      `Would you like to:\n` +
+      `1. **Resume** — continue from ${resumeStageName}\n` +
+      `2. **Start fresh** — begin a new research pipeline from scratch`;
+
+    yield {
+      type: 'text_complete',
+      text: confirmationMessage,
+      isIntermediate: false,
+      turnId: `breakout-resume-confirm-${Date.now()}`,
+    };
+    yield { type: 'complete' };
+  }
+
+  /**
+   * Clean up stale pipeline artifacts when user chooses "Start fresh" after breakout.
+   *
+   * G4 fix: Prevents resolveFollowUpSessionId from contaminating the new pipeline
+   * with stale context. Deletes pipeline-state.json and pipeline-summary.json
+   * so the fresh pipeline starts clean.
+   *
+   * Does NOT delete answer.json — that's legitimate follow-up context if the
+   * previous pipeline completed successfully before the breakout.
+   *
+   * @param sessionPath - Session directory path
+   */
+  private cleanupStaleBreakoutArtifacts(sessionPath: string): void {
+    const filesToClean = [
+      join(sessionPath, 'data', 'pipeline-state.json'),
+      join(sessionPath, 'data', 'pipeline-summary.json'),
+    ];
+
+    for (const filePath of filesToClean) {
+      try {
+        if (existsSync(filePath)) {
+          unlinkSync(filePath);
+          this.onDebug?.(`[orchestrator] cleanupStaleBreakoutArtifacts: deleted ${filePath}`);
+        }
+      } catch (cleanupError) {
+        this.onDebug?.(
+          `[orchestrator] cleanupStaleBreakoutArtifacts: failed to delete ${filePath}: ` +
+          `${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`,
+        );
+      }
+    }
+  }
+
+  /**
+   * Resume a pipeline from a breakout state.
+   *
+   * Mirrors resumeOrchestrator() structure — MCP bridge wiring, cost tracker,
+   * orchestrator creation — but calls orchestrator.resumeFromBreakout() instead
+   * of orchestrator.resume().
+   *
+   * G6 note: pipeline-summary.json is overwritten in the finally block when
+   * the resumed pipeline completes/pauses/errors. This is intentional — the
+   * summary should reflect the latest pipeline state after resumption.
+   */
+  private async *resumeFromBreakoutOrchestrator(
+    userMessage: string,
+    resumableInfo: { slug: string; agent: LoadedAgent; resumeFromStage: number },
+  ): AsyncGenerator<AgentEvent> {
+    const sessionId = this.config.session?.id ?? `orch-${Date.now()}`;
+    const sessionPath = getSessionPath(this.workspaceRootPath, sessionId);
+    const agentConfig = this.toOrchestratorAgentConfig(resumableInfo.agent);
+    const runId = `orch-resume-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const agentSlug = resumableInfo.slug;
+    const fromStage = resumableInfo.resumeFromStage;
+
+    this.onDebug?.(
+      `[orchestrator] Resuming from breakout: agent=${agentSlug} ` +
+      `fromStage=${fromStage} runId=${runId}`,
+    );
+
+    let exitReason: OrchestratorExitReason = 'completed';
+
+    // Re-create cost tracker (costs from earlier stages are in pipeline-state.json)
+    const budgetUsd = agentConfig.orchestrator?.budgetUsd ?? 50;
+    const costTracker = new CostTracker({ budgetUsd });
+
+    // ── MCP Bridge wiring (same as runOrchestrator / resumeOrchestrator) ──
+    let mcpBridge: OrchestratorMcpBridge_T | null = null;
+    const mcpLifecycle = new McpLifecycleManager();
+
+    try {
+      const mcpSourceSlug = resumableInfo.agent.metadata.sources
+        ?.find(s => s.required)?.slug;
+
+      if (mcpSourceSlug) {
+        try {
+          const sourceConfig = loadSourceConfig(this.workspaceRootPath, mcpSourceSlug);
+          if (sourceConfig?.mcp) {
+            const transportConfig = extractTransportConfig(
+              sourceConfig.mcp as unknown as Record<string, unknown>,
+              this.workspaceRootPath,
+            );
+            this.onDebug?.(
+              `[orchestrator] MCP bridge connect attempt (resumeFromBreakout): source=${mcpSourceSlug} ` +
+              `transport=${transportConfig.transport}`,
+            );
+            const mcpClient = await mcpLifecycle.connect(transportConfig);
+            mcpBridge = new OrchestratorMcpBridge(mcpClient);
+            this.onDebug?.(`[orchestrator] MCP bridge connected for resumeFromBreakout: ${mcpSourceSlug}`);
+          }
+        } catch (mcpError) {
+          this.onDebug?.(
+            `[orchestrator] MCP bridge connection failed on resumeFromBreakout (non-fatal): ` +
+            `${mcpError instanceof Error ? mcpError.message : String(mcpError)}`,
+          );
+        }
+      }
+
+      // Create orchestrator instance for resume-from-breakout
+      const orchTurnId = `orch-${runId}`;
+      const orchestrator = AgentOrchestrator.create(
+        {
+          sessionId,
+          sessionPath,
+          getAuthToken: () => this.getOrchestratorAuthToken(),
+          onStreamEvent: (event) => {
+            if (event.type === 'text_delta' && event.text) {
+              this.onDebug?.(`[orchestrator] resumeFromBreakout stream: ${event.text.slice(0, 50)}...`);
+            }
+          },
+          onDebug: this.onDebug ? (msg: string) => this.onDebug?.(msg) : undefined,
+          onSubstepEvent: (substep, stageId) => {
+            switch (substep.type) {
+              case 'mcp_start':
+                this.onAgentEvent?.({
+                  type: 'agent_substep_start',
+                  agentSlug,
+                  runId,
+                  data: {
+                    stageId,
+                    toolName: substep.toolName,
+                    toolUseId: substep.toolUseId,
+                    input: substep.input,
+                    turnId: orchTurnId,
+                    parentToolUseId: substep.parentToolUseId,
+                  },
+                });
+                break;
+              case 'mcp_result':
+                this.onAgentEvent?.({
+                  type: 'agent_substep_result',
+                  agentSlug,
+                  runId,
+                  data: {
+                    stageId,
+                    toolUseId: substep.toolUseId,
+                    toolName: substep.toolName,
+                    result: substep.result,
+                    isError: substep.isError ?? false,
+                    turnId: orchTurnId,
+                    parentToolUseId: substep.parentToolUseId,
+                  },
+                });
+                break;
+              case 'llm_start':
+                this.onAgentEvent?.({
+                  type: 'agent_substep_start',
+                  agentSlug,
+                  runId,
+                  data: {
+                    stageId,
+                    toolName: 'orchestrator_llm',
+                    toolUseId: substep.toolUseId,
+                    input: { stage: substep.stageName, stageId: substep.stageId },
+                    turnId: orchTurnId,
+                    intent: `Analyzing: ${substep.stageName}`,
+                    parentToolUseId: substep.parentToolUseId,
+                  },
+                });
+                break;
+              case 'llm_complete':
+                this.onAgentEvent?.({
+                  type: 'agent_substep_result',
+                  agentSlug,
+                  runId,
+                  data: {
+                    stageId,
+                    toolUseId: substep.toolUseId,
+                    toolName: 'orchestrator_llm',
+                    result: substep.text,
+                    isError: false,
+                    turnId: orchTurnId,
+                    parentToolUseId: substep.parentToolUseId,
+                  },
+                });
+                break;
+              case 'status':
+                break;
+            }
+          },
+        },
+        mcpBridge,
+        costTracker,
+        agentConfig.orchestrator ?? undefined,
+      );
+
+      // ── Resume pipeline from breakout state ────────────────────────
+      exitReason = yield* this.processOrchestratorEvents(
+        orchestrator.resumeFromBreakout(userMessage, agentConfig, fromStage),
+        agentSlug, runId, sessionPath,
+      );
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      this.onDebug?.(`[orchestrator] ResumeFromBreakout error: ${errorMessage}`);
+      yield { type: 'error', message: `Orchestrator resume-from-breakout error: ${errorMessage}` };
+      this.onAgentEvent?.({
+        type: 'agent_run_completed',
+        agentSlug,
+        runId,
+        data: { verificationStatus: 'error', error: errorMessage },
+      });
+      exitReason = 'error';
+    }
+
+    // G6: pipeline-summary.json is overwritten here — intentional.
+    // The summary should reflect the latest state after resumption.
+    try {
+      yield { type: 'complete' };
+    } finally {
+      this.onDebug?.(`[orchestrator] ResumeFromBreakout cleanup: exitReason=${exitReason}`);
+      this.writePipelineSummary(sessionPath, agentConfig.controlFlow.stages.length, exitReason);
+      if (exitReason !== 'paused') {
+        this.clearOrchestratorBridgeState(sessionPath, agentSlug);
+      }
+      try {
+        await mcpLifecycle.close();
+      } catch {
+        // Best-effort MCP cleanup
+      }
+    }
+  }
+
+  /**
+   * Write a compact pipeline summary to disk after orchestrator completion.
+   *
+   * Called from the finally blocks of runOrchestrator() and resumeOrchestrator().
+   * The summary file is read by PromptBuilder.buildOrchestratorSummaryBlock()
+   * on every subsequent turn to inject research context that survives SDK compaction.
+   *
+   * Handles partial pipelines gracefully — whatever stageOutputs exist get summarized.
+   *
+   * @param sessionPath - Absolute path to the session directory
+   * @param totalStages - Total number of stages in the pipeline config
+   * @param exitReason - Why the pipeline ended
+   * @param preloadedState - Optional pre-loaded PipelineState to avoid redundant disk read
+   */
+  private writePipelineSummary(
+    sessionPath: string,
+    totalStages: number,
+    exitReason: PipelineExitReason,
+    preloadedState?: PipelineState,
+  ): void {
+    try {
+      const state = preloadedState ?? PipelineState.loadFrom(sessionPath);
+      if (!state) {
+        this.onDebug?.('[orchestrator] writePipelineSummary: no pipeline state found — skipping');
+        return;
+      }
+
+      const summary = state.generateSummary(totalStages, exitReason);
+      const summaryPath = join(sessionPath, 'data', 'pipeline-summary.json');
+      const dir = join(sessionPath, 'data');
+      if (!existsSync(dir)) {
+        mkdirSync(dir, { recursive: true });
+      }
+      writeFileSync(summaryPath, JSON.stringify(summary, null, 2), 'utf-8');
+      this.onDebug?.(`[orchestrator] writePipelineSummary: written to ${summaryPath}`);
+    } catch (error) {
+      // Non-fatal — best-effort summary writing
+      this.onDebug?.(
+        `[orchestrator] writePipelineSummary error: ${error instanceof Error ? error.message : String(error)}`,
+      );
     }
   }
 
@@ -3500,6 +4508,8 @@ export class ClaudeAgent extends BaseAgent {
       yield { type: 'complete' };
     } finally {
       this.onDebug?.(`[orchestrator] Cleanup: exitReason=${exitReason}`);
+      // Write pipeline summary for context injection on subsequent turns
+      this.writePipelineSummary(sessionPath, agentConfig.controlFlow.stages.length, exitReason);
       // Only clear bridge state when pipeline is done — preserve on pause for resume detection (G4)
       if (exitReason !== 'paused') {
         this.clearOrchestratorBridgeState(sessionPath, agentSlug);
@@ -3699,6 +4709,8 @@ export class ClaudeAgent extends BaseAgent {
       yield { type: 'complete' };
     } finally {
       this.onDebug?.(`[orchestrator] Resume cleanup: exitReason=${exitReason}`);
+      // Write pipeline summary for context injection on subsequent turns
+      this.writePipelineSummary(sessionPath, agentConfig.controlFlow.stages.length, exitReason);
       // Only clear bridge state when pipeline is done — preserve on pause for resume detection (G4)
       if (exitReason !== 'paused') {
         this.clearOrchestratorBridgeState(sessionPath, agentSlug);

@@ -2031,7 +2031,7 @@ export class CodexAgent extends BaseAgent {
     // This includes: date/time, session state (with plansFolderPath),
     // workspace capabilities, and working directory context
     const workspaceRoot = this.config.workspace.rootPath ?? this.workingDirectory;
-    const contextParts = this.promptBuilder.buildContextParts(
+    const { parts: contextParts } = this.promptBuilder.buildContextParts(
       {
         plansFolderPath: getSessionPlansPath(
           workspaceRoot,

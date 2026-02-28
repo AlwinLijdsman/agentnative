@@ -466,7 +466,7 @@ export class CopilotAgent extends BaseAgent {
       // Build context parts using centralized PromptBuilder
       // This includes: date/time, session state (with plansFolderPath),
       // workspace capabilities, and working directory context
-      const contextParts = this.promptBuilder.buildContextParts(
+      const { parts: contextParts } = this.promptBuilder.buildContextParts(
         { plansFolderPath: getSessionPlansPath(this.config.workspace.rootPath, this._sessionId) },
         sourceContext
       );
