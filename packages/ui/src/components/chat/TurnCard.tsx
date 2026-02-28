@@ -439,6 +439,7 @@ function getToolDisplayName(name: string): string {
     'orch_kb_search': 'Knowledge Base Search',
     'orch_citation_verify': 'Citation Verification',
     'orch_hop_retrieve': 'Deep Retrieval',
+    'orch_synthesis_step': 'Synthesis',
     'orchestrator_llm': 'LLM Analysis',
   }
 
@@ -610,6 +611,7 @@ function formatToolDisplay(
     'orch_kb_search': { name: 'Knowledge Base Search', icon: '📚' },
     'orch_citation_verify': { name: 'Citation Verification', icon: '✅' },
     'orch_hop_retrieve': { name: 'Deep Retrieval', icon: '🔗' },
+    'orch_synthesis_step': { name: 'Synthesis', icon: '✍️' },
     'orchestrator_llm': { name: 'LLM Analysis', icon: '🧠' },
   }
   if (toolName && toolName in orchestratorToolIcons) {

@@ -621,12 +621,15 @@ export class StageRunner {
 
     const useBAML = orchestratorConfig?.useBAML === true;
 
-    this.emitProgress({ type: 'status', message: `Building synthesis context from ${retrievalParagraphs.length} retrieved paragraphs` });
+    const ctxToolId = this.generateToolUseId('synth-context');
+    this.emitProgress({ type: 'mcp_start', toolName: 'orch_synthesis_step', toolUseId: ctxToolId, input: { step: 'context_build', paragraphs: retrievalParagraphs.length } });
+    this.emitProgress({ type: 'mcp_result', toolUseId: ctxToolId, toolName: 'orch_synthesis_step', result: `Building synthesis context from ${retrievalParagraphs.length} retrieved paragraphs` });
 
     // ── BAML path (Phase 10) ──────────────────────────────────────────────
     if (useBAML && this.getAuthToken) {
+      const bamlStepId = this.generateToolUseId('synth-baml');
       try {
-        this.emitProgress({ type: 'status', message: 'Synthesizing answer via BAML pipeline' });
+        this.emitProgress({ type: 'mcp_start', toolName: 'orch_synthesis_step', toolUseId: bamlStepId, input: { step: 'baml_synthesis' } });
         const authToken = await this.getAuthToken();
         const retrievalContextStr = buildStageContext({
           stageName: 'synthesize',
@@ -654,12 +657,15 @@ export class StageRunner {
           repairFeedback,
         );
         if (bamlResult) {
+          this.emitProgress({ type: 'mcp_result', toolUseId: bamlStepId, toolName: 'orch_synthesis_step', result: `BAML synthesis complete — ${bamlResult.citations.length} citations` });
           // Run deterministic post-processing to ensure inline labels exist (Section 19)
-          this.emitProgress({ type: 'status', message: `Post-processing synthesis — ${bamlResult.citations.length} citations found` });
+          const ppToolId = this.generateToolUseId('synth-postprocess');
+          this.emitProgress({ type: 'mcp_start', toolName: 'orch_synthesis_step', toolUseId: ppToolId, input: { step: 'post_process', citations: bamlResult.citations.length } });
           const priorInputs = (followUpContext?.priorSections ?? []).map(ps => ({
             sectionId: ps.sectionId, heading: ps.heading, excerpt: ps.excerpt, sectionNum: ps.sectionNum,
           }));
           const ppResult = postProcessSynthesis(bamlResult.synthesis, webSources, priorInputs);
+          this.emitProgress({ type: 'mcp_result', toolUseId: ppToolId, toolName: 'orch_synthesis_step', result: `Post-processing complete — ${bamlResult.citations.length} citations verified` });
 
           return {
             text: ppResult.synthesis,
@@ -675,16 +681,24 @@ export class StageRunner {
             },
           };
         }
+        // bamlResult null → BAML client not available, fall through to Zod
+        this.emitProgress({ type: 'mcp_result', toolUseId: bamlStepId, toolName: 'orch_synthesis_step', result: 'BAML not available — falling back to Zod path' });
       } catch (bamlError) {
         if (orchestratorConfig?.bamlFallbackToZod) {
+          this.emitProgress({ type: 'mcp_result', toolUseId: bamlStepId, toolName: 'orch_synthesis_step', result: 'BAML failed — falling back to Zod path', isError: true });
           console.warn('[orchestrator] Stage 3 BAML failed, falling back to Zod:', bamlError);
         } else {
+          this.emitProgress({ type: 'mcp_result', toolUseId: bamlStepId, toolName: 'orch_synthesis_step', result: 'BAML synthesis failed', isError: true });
           throw bamlError;
         }
       }
     }
 
     // ── Zod fallback path ─────────────────────────────────────────────────
+    const synthStepId = this.generateToolUseId('synth-prepare');
+    this.emitProgress({ type: 'mcp_start', toolName: 'orch_synthesis_step', toolUseId: synthStepId, input: { step: 'prepare', paragraphs: retrievalParagraphs.length, hasRepairFeedback: !!repairFeedback } });
+    this.emitProgress({ type: 'mcp_result', toolUseId: synthStepId, toolName: 'orch_synthesis_step', result: repairFeedback ? 'Re-synthesizing with verification feedback' : `Synthesizing answer from ${retrievalParagraphs.length} sources` });
+
     const desiredTokens = this.getDesiredTokens(stage.id, orchestratorConfig, 128_000);
 
     const systemPrompt = getStageSystemPrompt(
@@ -722,14 +736,18 @@ export class StageRunner {
 
     this.emitProgress({ type: 'llm_complete', text: 'Synthesis complete', toolUseId: synthLlmToolId, isIntermediate: true });
 
-    this.emitProgress({ type: 'status', message: 'Extracting structured data from LLM response' });
+    const extractToolId = this.generateToolUseId('synth-extract');
+    this.emitProgress({ type: 'mcp_start', toolName: 'orch_synthesis_step', toolUseId: extractToolId, input: { step: 'extract_json' } });
     const parsed = extractRawJson(result.text);
     const data = (parsed != null && typeof parsed === 'object')
       ? parsed as Record<string, unknown>
       : { rawText: result.text };
 
+    this.emitProgress({ type: 'mcp_result', toolUseId: extractToolId, toolName: 'orch_synthesis_step', result: parsed != null ? 'Structured data extracted successfully' : 'Raw text (no structured JSON found)' });
+
     // Run deterministic post-processing to ensure inline labels exist (Section 19)
-    this.emitProgress({ type: 'status', message: 'Post-processing synthesis — injecting source labels' });
+    const ppStepId = this.generateToolUseId('synth-postprocess');
+    this.emitProgress({ type: 'mcp_start', toolName: 'orch_synthesis_step', toolUseId: ppStepId, input: { step: 'post_process' } });
     const synthesisText = (typeof data['synthesis'] === 'string')
       ? data['synthesis']
       : result.text;
@@ -745,6 +763,8 @@ export class StageRunner {
     }
 
     const citationCount = Array.isArray(data['citations_used']) ? (data['citations_used'] as unknown[]).length : 0;
+    this.emitProgress({ type: 'mcp_result', toolUseId: ppStepId, toolName: 'orch_synthesis_step', result: citationCount > 0 ? `Post-processing complete — ${citationCount} citations, source labels injected` : 'Post-processing complete — source labels injected' });
+
     const summaryMsg = citationCount > 0 ? `Synthesis complete — ${citationCount} citations` : 'Synthesis complete';
 
     return {
