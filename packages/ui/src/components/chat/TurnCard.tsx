@@ -434,6 +434,12 @@ function getToolDisplayName(name: string): string {
   // Friendly display names for specific tools
   const displayNames: Record<string, string> = {
     'TodoWrite': 'Todo List Updated',
+    // Orchestrator pipeline tools — visible during agent research runs
+    'orch_web_search': 'Web Search',
+    'orch_kb_search': 'Knowledge Base Search',
+    'orch_citation_verify': 'Citation Verification',
+    'orch_hop_retrieve': 'Deep Retrieval',
+    'orchestrator_llm': 'LLM Analysis',
   }
 
   return displayNames[stripped] || stripped
@@ -596,6 +602,19 @@ function formatToolDisplay(
     const colonIdx = skillId.indexOf(':')
     const slug = colonIdx > 0 ? skillId.slice(colonIdx + 1) : skillId
     return { name: slug }
+  }
+
+  // Orchestrator pipeline tools — synthetic tools from agent research pipeline
+  const orchestratorToolIcons: Record<string, { name: string; icon: string }> = {
+    'orch_web_search': { name: 'Web Search', icon: '🔍' },
+    'orch_kb_search': { name: 'Knowledge Base Search', icon: '📚' },
+    'orch_citation_verify': { name: 'Citation Verification', icon: '✅' },
+    'orch_hop_retrieve': { name: 'Deep Retrieval', icon: '🔗' },
+    'orchestrator_llm': { name: 'LLM Analysis', icon: '🧠' },
+  }
+  if (toolName && toolName in orchestratorToolIcons) {
+    const orchTool = orchestratorToolIcons[toolName]!
+    return { name: orchTool.name, icon: orchTool.icon }
   }
 
   // Final fallback: Use LLM-generated displayName or tool name

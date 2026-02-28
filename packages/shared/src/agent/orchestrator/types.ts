@@ -26,6 +26,29 @@ export interface StreamEvent {
 }
 
 // ============================================================================
+// SUBSTEP EVENTS — Progress callback for orchestrator pipeline visibility
+// ============================================================================
+
+/**
+ * Fine-grained progress events emitted by StageRunner during stage execution.
+ * These flow: StageRunner → onProgress callback → orchestrator queue → OrchestratorEvent yield
+ * → processOrchestratorEvents → AgentEvent yields → processEvent → renderer messages.
+ */
+export type SubstepEvent =
+  | { type: 'mcp_start'; toolName: string; toolUseId: string; input: Record<string, unknown>; parentToolUseId?: string }
+  | { type: 'mcp_result'; toolUseId: string; toolName: string; result: string; isError?: boolean; parentToolUseId?: string }
+  | { type: 'llm_start'; stageId: number; stageName: string; toolUseId: string; parentToolUseId?: string }
+  | { type: 'llm_complete'; text: string; toolUseId: string; isIntermediate: boolean; parentToolUseId?: string }
+  | { type: 'status'; message: string };
+
+/**
+ * Callback type for StageRunner progress reporting.
+ * Called synchronously during stage execution — the orchestrator both queues
+ * events for post-hoc generator yield AND fires onSubstepEvent for real-time delivery.
+ */
+export type OnProgressCallback = (event: SubstepEvent) => void;
+
+// ============================================================================
 // LLM CLIENT TYPES
 // ============================================================================
 
@@ -297,7 +320,6 @@ export type StageEventType =
   | 'stage_completed'
   | 'stage_failed'
   | 'llm_call'
-  | 'mcp_tool_call'
   | 'pause_requested'
   | 'pause_formatted'
   | 'resumed';
@@ -325,6 +347,7 @@ export type OrchestratorExitReason = 'paused' | 'completed' | 'error';
 export type OrchestratorEvent =
   | { type: 'orchestrator_stage_start'; stage: number; name: string }
   | { type: 'orchestrator_stage_complete'; stage: number; name: string; stageOutput?: Record<string, unknown> }
+  | { type: 'orchestrator_substep'; stageId: number; substep: SubstepEvent }
   | { type: 'orchestrator_pause'; stage: number; message: string }
   | { type: 'orchestrator_repair_start'; iteration: number; maxIterations: number; scores?: Record<string, number> }
   | { type: 'orchestrator_budget_exceeded'; totalCost: number }
@@ -350,6 +373,12 @@ export interface OrchestratorOptions {
   onDebug?: (message: string) => void;
   /** Session ID of a prior completed research run for follow-up context (Section 18, F12). */
   previousSessionId?: string;
+  /**
+   * Real-time substep callback — fires immediately when StageRunner emits progress,
+   * bypassing the generator queue for instant UI delivery. The post-hoc generator
+   * yield still runs for JSONL persistence; deduplication by toolUseId prevents doubles.
+   */
+  onSubstepEvent?: (event: SubstepEvent, stageId: number) => void;
 }
 
 // ============================================================================

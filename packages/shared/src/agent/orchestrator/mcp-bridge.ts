@@ -128,18 +128,55 @@ export function extractMcpText(raw: unknown, toolName: string): string {
 // ZOD SCHEMAS — Validation for MCP tool responses
 // ============================================================================
 
-/** Schema for a single retrieval paragraph from KB search. */
-const RetrievalParagraphSchema = z.object({
+/**
+ * Schema for a single KB search result item from the Python MCP server.
+ *
+ * Server returns: { id, content, confidence, isa_number, paragraph_ref,
+ *   sub_paragraph, application_ref, page_number, source_doc?, retrieval_path }
+ *
+ * We validate required fields and use .passthrough() to preserve extras.
+ * Field mapping to RetrievalParagraph (id, text, score, source) happens
+ * in the bridge methods below.
+ */
+const KbSearchItemSchema = z.object({
   id: z.string(),
-  text: z.string(),
-  score: z.number(),
-  source: z.string(),
-});
+  content: z.string(),
+  confidence: z.number(),
+  isa_number: z.string(),
+  paragraph_ref: z.string().optional(),
+  source_doc: z.string().optional(),
+}).passthrough();
 
-/** Schema for KB search results (array of paragraphs). */
+/** Schema for KB search results — server returns { results: [...] }. */
 const KbSearchResultSchema = z.object({
-  paragraphs: z.array(RetrievalParagraphSchema),
-}).or(z.array(RetrievalParagraphSchema));
+  results: z.array(KbSearchItemSchema),
+  total_results: z.number().optional(),
+  search_type_used: z.string().optional(),
+  warnings: z.array(z.string()).optional(),
+}).or(z.array(KbSearchItemSchema));
+
+/**
+ * Schema for hop_retrieve results — server returns
+ * { seed_id, connected: [...], total_found, max_hops_used }.
+ *
+ * Connected items have hop_score (not confidence) and hop_depth.
+ */
+const HopRetrieveItemSchema = z.object({
+  id: z.string(),
+  content: z.string(),
+  isa_number: z.string(),
+  hop_score: z.number(),
+  hop_depth: z.number(),
+  paragraph_ref: z.string().optional(),
+  source_doc: z.string().optional(),
+}).passthrough();
+
+const HopRetrieveResultSchema = z.object({
+  seed_id: z.string(),
+  connected: z.array(HopRetrieveItemSchema),
+  total_found: z.number(),
+  max_hops_used: z.number(),
+}).passthrough();
 
 /** Schema for web search results. */
 const WebSearchResultSchema = z.object({
@@ -245,11 +282,16 @@ export class OrchestratorMcpBridge implements McpBridge {
     const raw = await this.mcpClient.callTool(ISA_TOOLS.hybridSearch, args);
     const parsed = parseMcpResult(raw, KbSearchResultSchema, ISA_TOOLS.hybridSearch);
 
-    // Normalize: schema accepts both { paragraphs: [...] } and bare [...]
-    if (Array.isArray(parsed)) {
-      return parsed;
-    }
-    return parsed.paragraphs;
+    // Normalize: schema accepts both { results: [...] } and bare [...]
+    const items = Array.isArray(parsed) ? parsed : parsed.results;
+
+    // Map server field names → RetrievalParagraph interface
+    return items.map((item) => ({
+      id: item.id,
+      text: item.content,
+      score: item.confidence,
+      source: item.isa_number ? `ISA ${item.isa_number}` : (item.source_doc ?? 'unknown'),
+    }));
   }
 
   /**
@@ -281,12 +323,15 @@ export class OrchestratorMcpBridge implements McpBridge {
       paragraph_id: paragraphId,
       depth,
     });
-    const parsed = parseMcpResult(raw, KbSearchResultSchema, ISA_TOOLS.hopRetrieve);
+    const parsed = parseMcpResult(raw, HopRetrieveResultSchema, ISA_TOOLS.hopRetrieve);
 
-    if (Array.isArray(parsed)) {
-      return parsed;
-    }
-    return parsed.paragraphs;
+    // Map server field names → RetrievalParagraph interface
+    return parsed.connected.map((item) => ({
+      id: item.id,
+      text: item.content,
+      score: item.hop_score,
+      source: item.isa_number ? `ISA ${item.isa_number}` : (item.source_doc ?? 'unknown'),
+    }));
   }
 
   /**

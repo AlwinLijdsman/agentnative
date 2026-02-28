@@ -126,10 +126,11 @@ export default function AgentRunDetailPage({
     })
   }, [])
 
-  // Determine stage status
+  // Determine stage status (only use liveRunState if it matches this run's ID)
+  const isLiveRun = liveRunState?.runId === runId
   const getStageStatus = (stageId: number): 'completed' | 'running' | 'pending' => {
     if (detail?.completedStages.includes(stageId)) return 'completed'
-    if (liveRunState?.isRunning && liveRunState.currentStage === stageId) return 'running'
+    if (isLiveRun && liveRunState?.isRunning && liveRunState.currentStage === stageId) return 'running'
     if (detail?.currentStage === stageId) return 'running'
     return 'pending'
   }
@@ -190,7 +191,7 @@ export default function AgentRunDetailPage({
                 {detail.toolCallCount}
               </Info_Table.Row>
               <Info_Table.Row label="Status">
-                {liveRunState?.isRunning ? (
+                {isLiveRun && liveRunState?.isRunning ? (
                   <Info_Badge color="default">Running</Info_Badge>
                 ) : (
                   <Info_Badge color="success">Completed</Info_Badge>
@@ -209,7 +210,7 @@ export default function AgentRunDetailPage({
                 Array.from({ length: Math.max(
                   ...detail.completedStages,
                   detail.currentStage,
-                  liveRunState?.currentStage ?? -1,
+                  isLiveRun ? (liveRunState?.currentStage ?? -1) : -1,
                   0
                 ) + 1 }, (_, i) => i).map((stageId) => {
                   const status = getStageStatus(stageId)
@@ -219,8 +220,8 @@ export default function AgentRunDetailPage({
                   )?.data?.stageName as string | undefined
 
                   return (
+                    <React.Fragment key={stageId}>
                     <div
-                      key={stageId}
                       className={cn(
                         "flex items-center gap-3 py-2 px-3 rounded-[8px] text-sm",
                         status === 'completed' && "bg-emerald-500/5 border border-emerald-500/20",
@@ -235,6 +236,7 @@ export default function AgentRunDetailPage({
                       <span className="font-mono text-xs text-muted-foreground w-4 shrink-0">{stageId}</span>
                       <span className="font-medium">{stageName ?? `Stage ${stageId}`}</span>
                     </div>
+                  </React.Fragment>
                   )
                 })
               )}

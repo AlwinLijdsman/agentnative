@@ -21,11 +21,13 @@ import type {
   AgentConfig,
   FollowUpContext,
   McpBridge,
+  OnProgressCallback,
   OrchestratorConfig,
   RetrievalParagraph,
   StageConfig,
   StageResult,
   StreamEvent,
+  SubstepEvent,
   WebSearchExecutionTelemetry,
   WebSearchResult,
 } from './types.ts';
@@ -53,6 +55,9 @@ const MAX_STAGE1_WEB_QUERIES = 5;
 // ============================================================================
 
 export class StageRunner {
+  private toolUseCounter = 0;
+  private _onProgress?: OnProgressCallback;
+
   constructor(
     private readonly llmClient: OrchestratorLlmClient,
     private readonly mcpBridge: McpBridge | null,
@@ -60,6 +65,24 @@ export class StageRunner {
     private readonly onStreamEvent?: (event: StreamEvent) => void,
     private readonly getAuthToken?: () => Promise<string>,
   ) {}
+
+  /**
+   * Set the progress callback. Called by the orchestrator before each pipeline run
+   * so substep events can be queued and yielded via the OrchestratorEvent generator.
+   */
+  setOnProgress(callback: OnProgressCallback | undefined): void {
+    this._onProgress = callback;
+  }
+
+  /** Emit a substep progress event (null-safe). */
+  private emitProgress(event: SubstepEvent): void {
+    this._onProgress?.(event);
+  }
+
+  /** Generate a synthetic tool use ID with orch- prefix to avoid SDK collisions. */
+  private generateToolUseId(prefix: string): string {
+    return `orch-${prefix}-${++this.toolUseCounter}`;
+  }
 
   /**
    * Dispatch stage execution based on stage name.
@@ -171,6 +194,9 @@ export class StageRunner {
       );
     }
 
+    const llmToolId = this.generateToolUseId('llm-analyze');
+    this.emitProgress({ type: 'llm_start', stageId: stage.id, stageName: 'analyze_query', toolUseId: llmToolId });
+
     const result = await this.llmClient.call({
       systemPrompt,
       userMessage: enhancedMessage,
@@ -178,6 +204,8 @@ export class StageRunner {
       effort: this.getStageEffort(orchestratorConfig),
       onStreamEvent: this.onStreamEvent,
     });
+
+    this.emitProgress({ type: 'llm_complete', text: result.text.slice(0, 200), toolUseId: llmToolId, isIntermediate: true });
 
     // Parse structured output — extract JSON from LLM text
     const parsed = extractRawJson(result.text);
@@ -279,6 +307,8 @@ export class StageRunner {
 
       for (const query of selectedQueries.queries) {
         execution.queriesAttempted += 1;
+        const wsToolId = this.generateToolUseId('websearch');
+        this.emitProgress({ type: 'mcp_start', toolName: 'orch_web_search', toolUseId: wsToolId, input: { query } });
         try {
           const searchResult = await this.mcpBridge.webSearch(query);
           execution.queriesSucceeded += 1;
@@ -287,6 +317,7 @@ export class StageRunner {
           }
           const resultCount = searchResult.results.length;
           execution.resultsCount += resultCount;
+          this.emitProgress({ type: 'mcp_result', toolUseId: wsToolId, toolName: 'orch_web_search', result: `${resultCount} results for "${query.slice(0, 80)}"` });
           if (resultCount > 0) {
             webResults.push(searchResult);
           }
@@ -297,6 +328,7 @@ export class StageRunner {
           );
           const message = error instanceof Error ? error.message : String(error);
           execution.warnings.push(`Query failed: ${query.slice(0, 80)} (${message})`);
+          this.emitProgress({ type: 'mcp_result', toolUseId: wsToolId, toolName: 'orch_web_search', result: message, isError: true });
         }
       }
     } else {
@@ -387,6 +419,9 @@ export class StageRunner {
       ? `\n\n<WEB_SEARCH_RESULTS>\n${JSON.stringify(webResults, null, 2)}\n</WEB_SEARCH_RESULTS>`
       : '\n\n<WEB_SEARCH_RESULTS>\nNo web search results were available. Do NOT fabricate or hallucinate web sources. Set skipped: true and web_sources: [].\n</WEB_SEARCH_RESULTS>';
 
+    const calibLlmToolId = this.generateToolUseId('llm-calibrate');
+    this.emitProgress({ type: 'llm_start', stageId: stage.id, stageName: 'websearch_calibration', toolUseId: calibLlmToolId });
+
     const result = await this.llmClient.call({
       systemPrompt,
       userMessage: userContent + webContext,
@@ -394,6 +429,8 @@ export class StageRunner {
       effort: this.getStageEffort(orchestratorConfig),
       onStreamEvent: this.onStreamEvent,
     });
+
+    this.emitProgress({ type: 'llm_complete', text: result.text.slice(0, 200), toolUseId: calibLlmToolId, isIntermediate: true });
 
     // 4. Parse calibrated query plan
     const parsed = extractRawJson(result.text);
@@ -501,6 +538,8 @@ export class StageRunner {
     const seenIds = new Set<string>();
 
     for (const query of querySource as Array<{ text: string }>) {
+      const kbToolId = this.generateToolUseId('kbsearch');
+      this.emitProgress({ type: 'mcp_start', toolName: 'orch_kb_search', toolUseId: kbToolId, input: { query: query.text } });
       try {
         const paragraphs = await this.mcpBridge.kbSearch(query.text, { maxResults: 20 });
         for (const p of paragraphs) {
@@ -509,11 +548,13 @@ export class StageRunner {
             allParagraphs.push(p);
           }
         }
+        this.emitProgress({ type: 'mcp_result', toolUseId: kbToolId, toolName: 'orch_kb_search', result: `${paragraphs.length} paragraphs for "${query.text.slice(0, 80)}"` });
       } catch (error) {
         console.warn(
           `[StageRunner] KB search failed for query "${query.text}":`,
           error instanceof Error ? error.message : error,
         );
+        this.emitProgress({ type: 'mcp_result', toolUseId: kbToolId, toolName: 'orch_kb_search', result: error instanceof Error ? error.message : String(error), isError: true });
       }
     }
 
@@ -664,6 +705,9 @@ export class StageRunner {
       followupNumber: followUpContext?.followupNumber,
     });
 
+    const synthLlmToolId = this.generateToolUseId('llm-synthesize');
+    this.emitProgress({ type: 'llm_start', stageId: stage.id, stageName: 'synthesize', toolUseId: synthLlmToolId });
+
     const result = await this.llmClient.call({
       systemPrompt,
       userMessage: userContent,
@@ -671,6 +715,8 @@ export class StageRunner {
       effort: this.getStageEffort(orchestratorConfig),
       onStreamEvent: this.onStreamEvent,
     });
+
+    this.emitProgress({ type: 'llm_complete', text: 'Synthesis complete', toolUseId: synthLlmToolId, isIntermediate: true });
 
     const parsed = extractRawJson(result.text);
     const data = (parsed != null && typeof parsed === 'object')
@@ -740,12 +786,17 @@ export class StageRunner {
     let failedCount = 0;
 
     for (const citation of citations) {
+      const cvToolId = this.generateToolUseId('citation-verify');
+      const citationRef = (citation['paragraph_ref'] ?? citation['sourceRef'] ?? citation['source'] ?? '') as string;
+      this.emitProgress({ type: 'mcp_start', toolName: 'orch_citation_verify', toolUseId: cvToolId, input: { citation: citationRef } });
       try {
         const verifyResult = await this.mcpBridge.citationVerify(citation);
         verificationResults.push(verifyResult);
-        if (verifyResult['verified'] === false) {
+        const verified = verifyResult['verified'] !== false;
+        if (!verified) {
           failedCount++;
         }
+        this.emitProgress({ type: 'mcp_result', toolUseId: cvToolId, toolName: 'orch_citation_verify', result: verified ? `Verified: ${citationRef}` : `Failed: ${citationRef}`, isError: !verified });
       } catch (error) {
         console.warn(
           `[StageRunner] Citation verification failed:`,
@@ -756,6 +807,7 @@ export class StageRunner {
           verified: false,
         });
         failedCount++;
+        this.emitProgress({ type: 'mcp_result', toolUseId: cvToolId, toolName: 'orch_citation_verify', result: error instanceof Error ? error.message : 'unknown error', isError: true });
       }
     }
 
@@ -799,6 +851,8 @@ export class StageRunner {
     agentConfig: AgentConfig,
     followUpContext?: FollowUpContext | null,
   ): Promise<StageResult> {
+    this.emitProgress({ type: 'status', message: 'Rendering output document...' });
+
     // 1. Gather data from previous stages
     const queryPlanOutput = state.getStageOutput(0);
     const calibrationOutput = state.getStageOutput(1);
