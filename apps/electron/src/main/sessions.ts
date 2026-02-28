@@ -3062,6 +3062,99 @@ export class SessionManager {
               verificationStatus: (event.data.verificationStatus as string) ?? 'pending',
             }, managed.workspace.id)
             break
+
+          // Real-time orchestrator substep events — create tool Messages immediately
+          // so the renderer shows substep activities during stage execution (not post-hoc).
+          // The post-hoc generator yield (tool_start/tool_result in processEvent) deduplicates
+          // by toolUseId via existingStartMsg check — no duplicate messages.
+          case 'agent_substep_start': {
+            const substepToolUseId = event.data.toolUseId as string
+            const substepToolName = event.data.toolName as string
+            const substepInput = event.data.input as Record<string, unknown> | undefined
+            const substepTurnId = event.data.turnId as string | undefined
+            const substepParentToolUseId = event.data.parentToolUseId as string | undefined
+            const substepIntent = event.data.intent as string | undefined
+
+            // Check if message already exists (shouldn't happen for start, but safety)
+            const existingSubstepMsg = managed.messages.find(m => m.toolUseId === substepToolUseId)
+            if (!existingSubstepMsg) {
+              const toolStartMessage: Message = {
+                id: generateMessageId(),
+                role: 'tool',
+                content: `Running ${substepToolName}...`,
+                timestamp: this.monotonic(),
+                toolName: substepToolName,
+                toolUseId: substepToolUseId,
+                toolInput: substepInput,
+                toolStatus: 'executing',
+                toolIntent: substepIntent,
+                turnId: substepTurnId,
+                parentToolUseId: substepParentToolUseId,
+              }
+              managed.messages.push(toolStartMessage)
+
+              this.sendEvent({
+                type: 'tool_start',
+                sessionId: managed.id,
+                toolName: substepToolName,
+                toolUseId: substepToolUseId,
+                toolInput: substepInput ?? {},
+                toolIntent: substepIntent,
+                turnId: substepTurnId,
+                parentToolUseId: substepParentToolUseId,
+                timestamp: toolStartMessage.timestamp,
+              }, managed.workspace.id)
+            }
+            break
+          }
+          case 'agent_substep_result': {
+            const resultToolUseId = event.data.toolUseId as string
+            const resultToolName = event.data.toolName as string
+            const resultContent = event.data.result as string
+            const resultIsError = event.data.isError as boolean | undefined
+            const resultTurnId = event.data.turnId as string | undefined
+            const resultParentToolUseId = event.data.parentToolUseId as string | undefined
+
+            const existingToolMsg = managed.messages.find(m => m.toolUseId === resultToolUseId)
+            const wasAlreadyComplete = existingToolMsg?.toolStatus === 'completed'
+
+            if (existingToolMsg) {
+              existingToolMsg.content = resultContent
+              existingToolMsg.toolResult = resultContent
+              existingToolMsg.toolStatus = 'completed'
+              existingToolMsg.isError = resultIsError
+            } else {
+              // No prior tool_start — create completed message directly
+              const toolMessage: Message = {
+                id: generateMessageId(),
+                role: 'tool',
+                content: resultContent,
+                timestamp: this.monotonic(),
+                toolName: resultToolName,
+                toolUseId: resultToolUseId,
+                toolResult: resultContent,
+                toolStatus: 'completed',
+                isError: resultIsError,
+                turnId: resultTurnId,
+                parentToolUseId: resultParentToolUseId,
+              }
+              managed.messages.push(toolMessage)
+            }
+
+            if (!wasAlreadyComplete) {
+              this.sendEvent({
+                type: 'tool_result',
+                sessionId: managed.id,
+                toolUseId: resultToolUseId,
+                toolName: resultToolName,
+                result: resultContent,
+                turnId: resultTurnId,
+                parentToolUseId: resultParentToolUseId,
+                isError: resultIsError ?? false,
+              }, managed.workspace.id)
+            }
+            break
+          }
           default:
             // Unknown agent event — log but don't broadcast
             sessionLog.warn(`Unknown agent event type: ${event.type}`)

@@ -475,6 +475,8 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
 
   // Handle missing session - loading or deleted
   if (!session) {
+    // [DIAG] Session null — helps trace "conversation disappears" bug
+    console.warn('[ChatPage] session is null', { sessionId, hasMeta: !!sessionMeta, isLoaded: messagesLoaded })
     if (sessionMeta) {
       // Session exists in metadata but not loaded yet - show loading state
       const skeletonSession = {

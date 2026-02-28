@@ -574,6 +574,9 @@ export default function App() {
       const isStreaming = atomSession?.isProcessing === true
       const isHandoff = handoffEventTypes.has(event.type)
 
+      // [DIAG] Session event entry — helps trace "conversation disappears" bug
+      console.debug('[SESSION_EVENT]', event.type, sessionId, { isStreaming, isHandoff, hasAtomSession: !!atomSession })
+
       // During streaming OR for handoff events: use atom as source of truth
       // This ensures all events during streaming see the complete state
       if (isStreaming || isHandoff) {
@@ -585,6 +588,9 @@ export default function App() {
           currentSession,
           workspaceId
         )
+
+        // [DIAG] Post-process state — helps trace "conversation disappears" bug
+        console.debug('[SESSION_EVENT] processed', event.type, { messageCount: updatedSession.messages.length, isProcessing: updatedSession.isProcessing })
 
         // Update atom directly (UI sees update immediately)
         updateSessionDirect(sessionId, () => updatedSession)

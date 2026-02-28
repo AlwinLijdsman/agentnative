@@ -264,12 +264,20 @@ export function processEvent(
             },
           },
         },
-        effects: [],
+        effects: [{
+          type: 'agent_run_state_update',
+          agentSlug: event.agentSlug,
+          runId: event.runId,
+          currentStage: event.stage,
+          stageName: '',
+          isRunning: false,
+        }],
       }
-
     default: {
       // Unknown event type - return state unchanged but as new reference
       // to ensure atom sync detects the "change"
+      // [DIAG] Log unhandled events — helps trace "conversation disappears" bug
+      console.warn('[processEvent] unhandled event type:', (event as unknown as { type: string }).type)
       const _exhaustiveCheck: never = event
       return {
         state: { ...state, session: { ...state.session } },

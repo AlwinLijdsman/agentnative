@@ -1197,4 +1197,540 @@ Both are required. The cwd isolation prevents future transcript corruption; the 
 
 ---
 
+# Fix: Dynamic Stage Thinking Visibility
+
+> **Branch:** `feature/dynamic-stage-thinking`
+> **Goal:** Remove the broken custom thinking UI path and fix lifecycle gaps so agent pipeline runs use the existing, working conversation indicators (ProcessingIndicator + TurnCard "Thinking...") instead of the stuck blue StageThinkingIndicator.
+
+## Problem Statement
+
+The Dynamic Stage Thinking feature (implemented in prior phases, all marked `[x]`) is broken in practice:
+- Shows a **stuck "Stage 1: websearch_calibration / Processing..."** indicator with blue styling
+- The custom `StageThinkingIndicator` component never clears because `agentStageThinkingAtom` is never reset on pause/complete
+- User requirement: **"leverage the thinking steps that regular conversations use or exactly mirror it"** — not custom blue UI
+
+## Root Cause Analysis
+
+| # | Root Cause | Impact |
+|---|-----------|--------|
+| 1 | **Parallel UI path** — Custom `agent_stage_thinking` → atom → `StageThinkingIndicator` duplicates existing `ProcessingIndicator` + TurnCard indicators | Blue stuck indicator, visual inconsistency |
+| 2 | **Resume forwarding gap** — `resumeOrchestrator()` only has debug logging in `onStreamEvent`, no thinking forwarding | Moot after removal — nothing to forward |
+| 3 | **Pause lifecycle gap** — `agent_stage_gate_pause` handler in processor.ts sets `pausedAgent` but emits NO effect → `agentRunStateAtom.isRunning` stays `true` | Stale "running" state after pause, indicator never unmounts |
+| 4 | **No text_delta yield** — Orchestrator doesn't yield `text_delta` during active LLM streaming (only at stage completion via `text_complete`) | No content to drive the custom indicator — it shows static text |
+| 5 | **Custom blue styling** — `StageThinkingIndicator` uses `bg-blue-500/10`, `text-blue-400`, Brain icon | Violates user requirement to match existing conversation UI |
+
+## Solution Strategy
+
+**Remove the entire custom thinking path** (eliminates root causes 1, 2, 4, 5). **Fix pause lifecycle** (root cause 3). **Fix runId bleed** in AgentRunDetailPage (bonus gap from audit).
+
+The existing indicators already work during agent runs:
+- `ProcessingIndicator` — cycling "Thinking...", "Working..." messages with elapsed time (reads `session.isProcessing`)
+- TurnCard "Thinking..." — via `shouldShowThinkingIndicator()` for `pending`/`awaiting` turn phases
+- Stage completion activities — via `text_complete` with `isIntermediate: true` yielded at stage boundaries
+
+## Key Files
+
+| File | Layer | Action |
+|------|-------|--------|
+| `packages/shared/src/agent/claude-agent.ts` | Agent | Remove `_currentOrchestratorStage` property and all thinking forwarding |
+| `apps/electron/src/main/sessions.ts` | Main | Remove `pendingThinkingDeltas`/`thinkingFlushTimers` maps, handler, queue/flush methods |
+| `apps/electron/src/renderer/event-processor/processor.ts` | Renderer | Remove `agent_stage_thinking` case; add `agent_run_state_update` effect to pause handler |
+| `apps/electron/src/renderer/event-processor/types.ts` | Renderer | Remove `AgentStageThinkingEvent`, union entry, effect type |
+| `apps/electron/src/shared/types.ts` | IPC | Remove `agent_stage_thinking` from `SessionEvent` union |
+| `apps/electron/src/renderer/App.tsx` | Renderer | Remove thinking atom imports, clearing logic, entire thinking_update handler |
+| `apps/electron/src/renderer/atoms/agents.ts` | State | Remove `agentStageThinkingAtom` and `THINKING_TEXT_CAP` |
+| `StageThinkingIndicator.tsx` | UI | **Delete entire file** |
+| `apps/electron/src/renderer/components/app-shell/ChatDisplay.tsx` | UI | Remove StageThinkingIndicator import and JSX |
+| `apps/electron/src/renderer/pages/AgentRunDetailPage.tsx` | UI | Remove thinking imports/usage; add runId guard |
+
+## Phase 1: Atomic Removal of Custom Thinking Path
+
+**Goal:** Remove all code added by the original Dynamic Stage Thinking feature across all layers in a single atomic phase. This prevents any intermediate broken state.
+
+### 1A: Backend (claude-agent.ts)
+
+- [x] 1A.1 Remove `_currentOrchestratorStage` property declaration (~L464-469)
+- [x] 1A.2 Remove thinking forwarding block from `runOrchestrator()` `onStreamEvent` callback (~L3395-3413) — keep existing `sessionLog.debug()` lines
+- [x] 1A.3 Remove `this._currentOrchestratorStage = { stage, stageName }` set in `processOrchestratorEvents()` `orchestrator_stage_start` case (~L3611)
+- [x] 1A.4 Remove `this._currentOrchestratorStage = null` clear in `orchestrator_stage_complete` case (~L3625)
+- [x] 1A.5 Remove `this._currentOrchestratorStage = null` clear in `orchestrator_complete` case (~L3674)
+- [x] 1A.6 Remove `this._currentOrchestratorStage = null` clear in `orchestrator_error` case (~L3704)
+
+### 1B: Main Process (sessions.ts)
+
+- [x] 1B.1 Remove `pendingThinkingDeltas` map declaration (~L913)
+- [x] 1B.2 Remove `thinkingFlushTimers` map declaration (~L914)
+- [x] 1B.3 Remove `agent_stage_thinking` case from `onAgentEvent` switch (~L3073-3083)
+- [x] 1B.4 Remove `queueThinkingDelta()` method (~L6028-6050)
+- [x] 1B.5 Remove `flushThinkingDelta()` method (~L6052-6085)
+
+### 1C: Renderer Event Processing
+
+- [x] 1C.1 Remove `AgentStageThinkingEvent` interface from `event-processor/types.ts` (~L497-506)
+- [x] 1C.2 Remove `AgentStageThinkingEvent` from `AgentEvent` union in `types.ts` (~L555)
+- [x] 1C.3 Remove `agent_stage_thinking_update` from `Effect` type in `types.ts` (~L567)
+- [x] 1C.4 Remove `agent_stage_thinking` case from `processor.ts` switch (~L269-280)
+
+### 1D: IPC Types
+
+- [x] 1D.1 Remove `agent_stage_thinking` variant from `SessionEvent` union in `apps/electron/src/shared/types.ts` (~L511)
+
+### 1E: Renderer State & App
+
+- [x] 1E.1 Remove `agentStageThinkingAtom` and `THINKING_TEXT_CAP` from `atoms/agents.ts` (~L36-44)
+- [x] 1E.2 Remove `agentStageThinkingAtom` / `THINKING_TEXT_CAP` imports from `App.tsx` (~L44)
+- [x] 1E.3 Remove thinking atom clearing from `agent_run_state_update` handler in `App.tsx` — both the stage-change block (~L514-520) and run-complete block (~L537-543)
+- [x] 1E.4 Remove entire `agent_stage_thinking_update` case from `App.tsx` (~L547-579)
+
+### 1F: UI Components
+
+- [x] 1F.1 Delete `apps/electron/src/renderer/components/app-shell/StageThinkingIndicator.tsx` entirely
+- [x] 1F.2 Remove `StageThinkingIndicator` import from `ChatDisplay.tsx` (~L55)
+- [x] 1F.3 Remove `<StageThinkingIndicator>` JSX usage from `ChatDisplay.tsx` (~L1522)
+- [x] 1F.4 Remove `agentStageThinkingAtom` import from `AgentRunDetailPage.tsx` (~L17)
+- [x] 1F.5 Remove `thinkingStates` / `liveThinking` usage from `AgentRunDetailPage.tsx` (~L68-69)
+- [x] 1F.6 Remove blue thinking panel JSX from `AgentRunDetailPage.tsx` (~L246-255)
+
+### 1G: Validate
+
+- [x] 1G.1 Run `pnpm run typecheck:all` — must pass with zero errors
+- [x] 1G.2 Run `pnpm run lint` — must pass (all errors pre-existing)
+- [x] 1G.3 Verify no remaining references: `grep -r "agentStageThinking\|agent_stage_thinking\|StageThinkingIndicator\|THINKING_TEXT_CAP\|_currentOrchestratorStage\|pendingThinkingDeltas\|thinkingFlushTimers\|queueThinkingDelta\|flushThinkingDelta" --include="*.ts" --include="*.tsx" packages/ apps/`
+
+## Phase 2: Fix Pause Lifecycle Gap
+
+**Goal:** When the orchestrator pauses (stage gate), ensure `agentRunStateAtom` reflects `isRunning: false` so all run-dependent indicators (ProcessingIndicator, TurnCard thinking) stop correctly.
+
+- [x] 2.1 In `processor.ts`, modify the `agent_stage_gate_pause` case (~L253-266) to emit an `agent_run_state_update` effect alongside setting `pausedAgent`, with payload `{ isRunning: false }`
+- [x] 2.2 In `App.tsx`, verify the `agent_run_state_update` handler correctly processes `isRunning: false` from pause events — existing handler deletes the atom entry, resume re-creates it via `agent_stage_started`
+- [x] 2.3 Run `pnpm run typecheck:all` — PASS
+- [x] 2.4 Run `pnpm run test:e2e` — 177 pass, 0 fail, 1 skipped
+
+## Phase 3: Fix RunId Bleed in AgentRunDetailPage
+
+**Goal:** Prevent stale run state from a previous run from leaking into the current AgentRunDetailPage view.
+
+- [x] 3.1 In `AgentRunDetailPage.tsx`, add `isLiveRun = liveRunState?.runId === runId` guard; `getStageStatus()` only uses `liveRunState` when `isLiveRun` is true
+- [x] 3.2 Add same runId guard to Status badge rendering — don't show "Running" badge if `!isLiveRun`
+- [x] 3.3 Add same runId guard to live stage count display — don't include `liveRunState.currentStage` from a different run
+- [x] 3.4 Run `pnpm run typecheck:all` — PASS
+- [x] 3.5 Run `pnpm run test:e2e` — 177 pass, 0 fail, 1 skipped
+
+## Risks & Considerations
+
+| Risk | Mitigation |
+|------|------------|
+| Removing thinking path loses all live visibility during stages | Acceptable — `ProcessingIndicator` already shows "Thinking..." with elapsed time. TurnCard shows "Thinking..." for pending turns. Stage completions appear as intermediate activities. Future enhancement can pipe `text_delta` through the existing message path. |
+| Pause effect may conflict with resume flow | Resume handler already sets `isRunning: true` — the pause→resume cycle will work: pause sets `false`, resume sets `true` |
+| RunId guard too strict — blocks legitimate state | Guard only applies in `AgentRunDetailPage` which always has a specific `runId` from URL params. No impact on other components. |
+| Large diff from removing feature code | All changes are deletions or minimal additions — low regression risk. Typecheck + lint + E2E provide safety net. |
+
+## Testing Strategy
+
+| Test | Method | When |
+|------|--------|------|
+| TypeScript strictness | `pnpm run typecheck:all` | Every phase |
+| Lint | `pnpm run lint` | Every phase |
+| Unit tests | `pnpm run test` | Phase 2, Phase 3 |
+| E2E tests | `pnpm run test:e2e` | Phase 2, Phase 3 |
+| Dead code verification | `grep` for all removed identifiers | Phase 1 |
+| Manual smoke test | Run agent pipeline, verify ProcessingIndicator shows, no blue indicator | After all phases |
+
+---
+
+_Last updated: 2026-02-27_
+_Replaces: Original "Dynamic Stage Thinking Visibility" plan (all phases completed but feature broken in practice)_
+
+---
+
+# Rich Agent Pipeline Substep Visibility (Approach A — Gap-Aware)
+
+> **Status: ACTIVE**
+> Continues on branch `feature/dynamic-stage-thinking` after the completed fix plan above.
+
+## Goal
+
+Surface every meaningful substep of the agent orchestrator pipeline (MCP tool calls, LLM streaming, intermediate results, stage transitions) as rich chat activities — matching the visual fidelity users see in regular (non-agent) conversations. The user should be able to follow web searches, KB queries, LLM thinking, citation verification, and synthesis in real time, not just see "Stage N completed."
+
+## Gap Analysis — What the Previous Overview Missed
+
+| # | Gap | Impact | How This Plan Addresses It |
+|---|-----|--------|---------------------------|
+| G1 | **Dual pipeline under-modeled** — orchestrator status uses `onAgentEvent` callback (fire-and-forget), while rich activities already flow through yielded `AgentEvent` → `processEvent` → messages[] | Adding new SessionEvent variants is unnecessary scope; substeps should flow through the *existing* yielded path | Substeps are yielded as standard `AgentEvent` (`tool_start`, `tool_result`, `text_complete`) from `processOrchestratorEvents()` — no new IPC types needed |
+| G2 | **`onStreamEvent` already exists but is only logged** — `claude-agent.ts` L3388–3395 receives `text_delta`/`thinking_delta` from LLM calls but discards them | LLM streaming during stages is invisible | Forward `onStreamEvent` deltas as yielded `text_delta` events with proper turnId |
+| G3 | **`turnId` missing on orchestrator yields** — current `text_complete` yields in `processOrchestratorEvents()` have no `turnId` | Renderer falls back to "last streaming assistant message" — substeps from different stages can mis-associate | Generate a per-run `turnId` prefix; each stage gets a derived turnId like `orch-{runId}-s{stageId}` |
+| G4 | **Nested substeps need synthetic IDs** — TurnCard hierarchy depends on `toolUseId`/`parentToolUseId` | Without IDs, MCP calls can't nest under their parent stage in the activity list | Generate synthetic `toolUseId` for each MCP call; set `parentToolUseId` to the stage's synthetic ID |
+| G5 | **Dead `mcp_tool_call` type** — exists in `StageEventType` union but is never emitted | Confusion about what's implemented vs. planned | Clean up: wire it to real MCP call logging in `PipelineState`, or remove if unused |
+| G6 | **Output injection duplicate risk** — `tryInjectAgentOutputFile()` + stage-5 auto-inject in `onAgentEvent` can both fire | User sees the research output twice | Add dedup guard: skip injection if content already present in messages |
+
+## Architecture: How Substeps Will Flow
+
+```
+StageRunner.runWebsearchCalibration()
+  ├── mcpBridge.webSearch(query)  →  yield tool_start + tool_result (synthetic IDs)
+  ├── llmClient.call()            →  yield text_delta (streaming) + text_complete (intermediate)
+  └── return StageResult
+
+Orchestrator.executePipeline()
+  ├── yield orchestrator_stage_start    (existing)
+  ├── stageRunner.runStage()            → substep events via onProgress callback
+  │     ├── onProgress('mcp_start', ...)   → queued, yielded below
+  │     ├── onProgress('mcp_result', ...)  → queued, yielded below
+  │     ├── onProgress('llm_start', ...)   → queued, yielded below
+  │     └── onProgress('llm_complete', .) → queued, yielded below
+  ├── yield* queued substep events      (NEW — OrchestratorEvent variants)
+  └── yield orchestrator_stage_complete (existing)
+
+ClaudeAgent.processOrchestratorEvents()
+  ├── orchestrator_stage_start       → onAgentEvent (existing)
+  ├── orchestrator_substep_*         → yield AgentEvent { tool_start | tool_result | text_delta | text_complete }
+  └── orchestrator_stage_complete    → onAgentEvent + yield text_complete (existing)
+
+sessions.ts: processEvent()
+  └── tool_start / tool_result / text_delta / text_complete  →  messages[] → IPC → renderer
+      (EXISTING path — no new SessionEvent types needed!)
+
+Renderer: TurnCard
+  └── groupMessagesByTurn() → activities[] → ActivityRow rendering
+      (EXISTING — MCP substeps appear as nested tool activities with icons)
+```
+
+## Key Files
+
+| File | Layer | Action |
+|------|-------|--------|
+| `packages/shared/src/agent/orchestrator/types.ts` | Orchestrator | Add new `OrchestratorEvent` variants for substeps; add `OnProgressCallback` type; clean up dead `mcp_tool_call` |
+| `packages/shared/src/agent/orchestrator/stage-runner.ts` | Orchestrator | Accept `onProgress` callback; emit progress events around every MCP call and LLM call in each stage handler |
+| `packages/shared/src/agent/orchestrator/mcp-bridge.ts` | Orchestrator | No change needed — StageRunner wraps bridge calls with progress emission |
+| `packages/shared/src/agent/orchestrator/index.ts` | Orchestrator | Pass `onProgress` to StageRunner; collect and yield substep `OrchestratorEvent`s between stage start/complete |
+| `packages/shared/src/agent/claude-agent.ts` | Agent | Map new `OrchestratorEvent` substep variants to yielded `AgentEvent` (`tool_start`, `tool_result`, `text_delta`, `text_complete`) with synthetic turnId/toolUseId |
+| `apps/electron/src/main/sessions.ts` | Main | Add dedup guard to `tryInjectAgentOutputFile()`; no other changes — existing `processEvent()` already handles tool_start/tool_result/text_* |
+| `apps/electron/src/shared/types.ts` | IPC | No changes needed — all events use existing SessionEvent variants |
+| `apps/electron/src/renderer/event-processor/` | Renderer | No changes needed — existing handlers process tool_start/tool_result/text_* |
+| `packages/ui/src/components/chat/TurnCard.tsx` | UI | Add orchestrator tool display mappings (icons/labels for webSearch, kbSearch, citationVerify, llmCall) |
+| `packages/ui/src/components/chat/turn-utils.ts` | UI | No structural changes — existing `messageToActivity()` handles tool messages with toolDisplayMeta |
+
+---
+
+## Phase 1: Orchestrator Progress Callback Infrastructure
+
+**Goal:** Add a typed progress callback system to StageRunner so each stage handler can emit substep events without becoming an async generator itself.
+
+### 1.1: Define OnProgressCallback and new OrchestratorEvent variants
+
+In `packages/shared/src/agent/orchestrator/types.ts`:
+
+- [x] 1.1.1 Added `SubstepEvent` type (5 variants: mcp_start, mcp_result, llm_start, llm_complete, status) and `OnProgressCallback` type in types.ts
+- [x] 1.1.2 Added `orchestrator_substep` variant to `OrchestratorEvent` union
+- [x] 1.1.3 Removed dead `mcp_tool_call` from `StageEventType` — confirmed unused via grep
+
+### 1.2: Wire onProgress into StageRunner
+
+In `packages/shared/src/agent/orchestrator/stage-runner.ts`:
+
+- [x] 1.2.1 Added `setOnProgress()` mutable setter (not constructor param — StageRunner constructed in `create()` before pipeline runs). Added `_onProgress` and `toolUseCounter` class fields.
+- [x] 1.2.2 Created `private emitProgress(event: SubstepEvent)` — calls `this._onProgress?.(event)` null-safely
+- [x] 1.2.3 Created `private generateToolUseId(prefix: string): string` — returns `orch-{prefix}-{counter++}`
+
+### 1.3: Emit progress events from each stage handler
+
+In `packages/shared/src/agent/orchestrator/stage-runner.ts`:
+
+- [x] 1.3.1 **`runAnalyzeQuery()`**: Emits `llm_start`/`llm_complete` around `this.llmClient.call()`. llm_delta deferred to Phase 5.
+- [x] 1.3.2 **`runWebsearchCalibration()`**: Emits `mcp_start`/`mcp_result` around each `this.mcpBridge.webSearch()` in loop (including error case). Emits `llm_start`/`llm_complete` around calibration LLM call.
+- [x] 1.3.3 **`runRetrieve()`**: Emits `mcp_start`/`mcp_result` around each `this.mcpBridge.kbSearch()` in loop (including error case).
+- [x] 1.3.4 **`runSynthesize()`**: Emits `llm_start`/`llm_complete` around synthesis LLM call. llm_delta deferred to Phase 5.
+- [x] 1.3.5 **`runVerify()`**: Emits `mcp_start`/`mcp_result` around each `this.mcpBridge.citationVerify()` in loop (including error case).
+- [x] 1.3.6 **`runOutput()`**: Emits `status` event: "Rendering output document..."
+
+### 1.4: Orchestrator collects and yields substep events
+
+In `packages/shared/src/agent/orchestrator/index.ts`:
+
+- [x] 1.4.1 Created `substepQueue: SubstepEvent[]` as class member of `AgentOrchestrator` (shared between executePipeline and repair loop)
+- [x] 1.4.2 Wired `this.stageRunner.setOnProgress()` in constructor — pushes events to class-member queue
+- [x] 1.4.3 Added queue drain (yield `orchestrator_substep` for each queued event) in 3 locations: pause-after branch, normal-run branch, repair loop branch
+- [x] 1.4.4 Queue cleared before each stage in all 3 drain locations
+
+### 1.5: Validate Phase 1
+
+- [x] 1.5.1 Run `pnpm run typecheck:all` — must pass
+- [x] 1.5.2 Run `pnpm run lint` — must pass (0 new errors, 5 pre-existing)
+- [-] 1.5.3 Run `pnpm run test:e2e` — deferred to final validation
+
+---
+
+## Phase 2: ClaudeAgent Translation Layer + Streaming
+
+**Goal:** Map the new `orchestrator_substep` events to standard `AgentEvent` yields (`tool_start`, `tool_result`, `text_delta`, `text_complete`) with proper synthetic IDs, so they flow through the existing `processEvent` → messages pipeline in sessions.ts.
+
+### 2.1: Generate orchestrator turnId
+
+In `packages/shared/src/agent/claude-agent.ts`:
+
+- [x] 2.1.1 In `processOrchestratorEvents()`, generate a per-run orchestrator turnId: `const orchTurnId = \`orch-${runId}\`` (stable across the entire pipeline run)
+- [x] 2.1.2 Add to all existing yields in this method (`text_complete` for stage complete, pause message, error, text) a `turnId: orchTurnId` property
+
+### 2.2: Map substep events to AgentEvent yields
+
+In `packages/shared/src/agent/claude-agent.ts`, in the `processOrchestratorEvents()` switch:
+
+- [x] 2.2.1 Add `case 'orchestrator_substep':` handler that switches on `event.substep.type`:
+  - `mcp_start` → yield `{ type: 'tool_start', toolName: substep.toolName, toolUseId: substep.toolUseId, input: substep.input, turnId: orchTurnId, parentToolUseId: substep.parentToolUseId, displayName: formatOrchestratorToolName(substep.toolName) }`
+  - `mcp_result` → yield `{ type: 'tool_result', toolUseId: substep.toolUseId, toolName: substep.toolName, result: substep.result, isError: substep.isError ?? false, turnId: orchTurnId, parentToolUseId: substep.parentToolUseId }`
+  - `llm_start` → yield `{ type: 'tool_start', toolName: 'orchestrator_llm', toolUseId: generateSyntheticId(), input: { stage: substep.stageName }, turnId: orchTurnId, intent: \`Analyzing stage: ${substep.stageName}\` }`
+  - `llm_delta` → yield `{ type: 'text_delta', text: substep.text, turnId: orchTurnId }`
+  - `llm_complete` → yield `{ type: 'text_complete', text: substep.text, isIntermediate: substep.isIntermediate, turnId: orchTurnId }`
+  - `status` → yield `{ type: 'status', message: substep.message }`
+
+### 2.3: Forward LLM streaming from onStreamEvent
+
+In `packages/shared/src/agent/claude-agent.ts`:
+
+- [-] 2.3.1 **Critical architectural decision:** Deferred to Phase 5 (optional). Post-hoc llm_start/llm_complete events provide meaningful visibility without real-time streaming.
+- [-] 2.3.2 **Solution: Real-time forwarding via shared channel.** Deferred to Phase 5 (optional).
+- [x] 2.3.3 **Fallback if real-time is too complex for Phase 2:** deferred `llm_delta` streaming to Phase 5. The `llm_start`/`llm_complete` events (post-hoc) give meaningful visibility.
+
+### 2.4: Validate Phase 2
+
+- [x] 2.4.1 Run `pnpm run typecheck:all` — must pass
+- [x] 2.4.2 Run `pnpm run lint` — must pass (0 new errors)
+- [-] 2.4.3 Manual test: deferred to manual smoke test after final validation
+- [-] 2.4.4 Run `pnpm run test:e2e` — deferred to final validation
+
+---
+
+## Phase 3: Renderer Display — Tool Metadata & Icons
+
+**Goal:** Ensure orchestrator substep tool messages render with meaningful names and icons in TurnCard, matching the visual quality of regular conversation tool activities.
+
+### 3.1: Add orchestrator tool display mappings
+
+In `packages/ui/src/components/chat/TurnCard.tsx`:
+
+- [x] 3.1.1 In `formatToolDisplay()` (~L540), add display mappings for orchestrator tool names:
+  - `orch_web_search` → display: "Web Search", icon: 🔍
+  - `orch_kb_search` → display: "Knowledge Base Search", icon: 📚
+  - `orch_citation_verify` → display: "Citation Verification", icon: ✅
+  - `orch_hop_retrieve` → display: "Deep Retrieval", icon: 🔗
+  - `orchestrator_llm` → display: "LLM Analysis", icon: 🧠
+  Also added friendly names in `getToolDisplayName()` for all 5 tools.
+- [-] 3.1.2 Preview text extraction deferred — tool input already shows in expandable tool details
+
+### 3.2: Verify activity nesting
+
+- [x] 3.2.1 Confirmed: orchestrator MCP tools with `parentToolUseId` correctly nest via existing `calculateActivityDepths()` — uses `parentId` matching against `toolUseId`, works out of the box
+- [x] 3.2.2 Confirmed: orchestrator tools without natural parent appear at depth 0 — acceptable as top-level activities within the turn
+
+### 3.3: Stage status in ProcessingIndicator
+
+In `apps/electron/src/renderer/components/app-shell/ChatDisplay.tsx`:
+
+- [x] 3.3.1 Status substep events yield `{ type: 'status', message }` from claude-agent.ts — these flow through existing `processEvent` → `handleStatus()` → `currentStatus` pipeline automatically
+- [x] 3.3.2 Verified: no additional code change needed — status events already flow through processEvent correctly
+
+### 3.4: Validate Phase 3
+
+- [x] 3.4.1 Run `pnpm run typecheck:all` — PASS (exit code 0)
+- [x] 3.4.2 Run `pnpm run lint` — PASS (0 new errors)
+- [-] 3.4.3 Manual smoke test deferred to post-implementation manual validation
+
+---
+
+## Phase 4: Dedup Guard & Edge Cases
+
+**Goal:** Fix the output injection duplicate risk and handle edge cases.
+
+### 4.1: Dedup guard for output injection
+
+In `apps/electron/src/main/sessions.ts`:
+
+- [x] 4.1.1 Verified: `injectOutputIfNotPresent()` already has a 200-char content prefix dedup check (`const contentPrefix = fileContent.substring(0, 200)`). No new dedup risk from substep events — substeps are tool activities, not output file content.
+- [x] 4.1.2 Verified: orchestrator substep events don't inject file content. Output injection only happens via `tryInjectAgentOutputFile()` which already has Strategy 1 (pipeline-state.json) + Strategy 2 (agent-events.jsonl) guards.
+
+### 4.2: Graceful degradation
+
+- [x] 4.2.1 Verified: `emitProgress()` uses `this._onProgress?.(event)` — null-safe by design. StageRunner works identically without callback.
+- [x] 4.2.2 Verified: `processEvent` tool_result handler at L5497 creates fallback message when no matching tool_start found ("RESULT WITHOUT START" log). Safe for race conditions.
+- [x] 4.2.3 Verified: orchestrator tool events yield `tool_start`/`tool_result` which don't trigger permission requests. No implicit-allow list exists — permissions only apply to SDK-initiated tool calls, not yielded events.
+
+### 4.3: Validate Phase 4
+
+- [x] 4.3.1 Run `pnpm run typecheck:all` — PASS (no changes in Phase 4, already validated)
+- [x] 4.3.2 Run `pnpm run lint` — PASS (no changes in Phase 4)
+- [-] 4.3.3 Run `pnpm run test:e2e` — deferred to final validation
+- [-] 4.3.4 Manual test deferred to post-implementation manual validation
+
+---
+
+## Phase 5: Real-Time LLM Streaming (Optional Enhancement) — DEFERRED
+
+**Goal:** Enable real-time `text_delta` streaming from orchestrator LLM calls so users see Claude's thinking/writing live during synthesis and analysis — not just post-hoc summaries.
+
+**Status:** Deferred. Phases 1-4 provide full post-hoc visibility for all substeps. Real-time streaming adds architectural complexity (async iterable merging with stage execution loop) and can be implemented as a follow-up enhancement.
+
+### 5.1: Implement SubstepChannel
+
+- [-] 5.1.1 Deferred — async iterable queue architecture deferred to future enhancement
+- [-] 5.1.2 Deferred
+- [-] 5.1.3 Deferred
+- [-] 5.1.4 Deferred
+
+### 5.2: Validate Phase 5
+
+- [-] 5.2.1 Deferred
+- [-] 5.2.2 Deferred
+- [-] 5.2.3 Deferred
+
+---
+
+## Risks & Considerations
+
+| Risk | Mitigation |
+|------|------------|
+| Synthetic tool IDs conflicting with real SDK tool IDs | Use `orch-` prefix that SDK never generates; IDs are only used within the orchestrator run's turn |
+| Too many substep messages cluttering the chat | Orchestrator typically runs 3-5 web searches, ~5 KB queries, 2-3 LLM calls = ~15 activities. Regular conversations routinely show 20+ tool activities. Acceptable. |
+| `text_delta` real-time streaming adds complexity (Phase 5) | Phase 5 is optional. Phases 1-4 give full post-hoc visibility without real-time streaming. Phase 5 can be deferred. |
+| Existing `processEvent` handlers assume SDK-originated events | Synthetic tool events use the same `AgentEvent` type; `processEvent` doesn't check event origin. Safe. |
+| Orchestrator tool_result may contain large payloads (e.g., KB paragraphs) | Apply existing MAX_PERSISTED_RESULT_CHARS truncation in sessions.ts — already handles this for all tool results |
+| Stage repair loop re-runs stages — duplicate substep activities | Queue is cleared before each stage. Repair iterations will show as additional tool activities (which is correct — user should see the re-run attempts) |
+| Generator yield timing — `processOrchestratorEvents` is already a `yield*` delegation | All new yields happen inside the existing `for await ... switch` — no structural change to the generator chain |
+
+## Testing Strategy
+
+| Test | Method | When |
+|------|--------|------|
+| TypeScript strictness | `pnpm run typecheck:all` | Every phase |
+| Lint | `pnpm run lint` | Every phase |
+| E2E tests | `pnpm run test:e2e` | Every phase |
+| Substep event emission | Unit test: mock McpBridge, verify StageRunner emits expected onProgress calls | Phase 1 |
+| Event translation | Unit test: feed OrchestratorEvent to processOrchestratorEvents, verify yielded AgentEvent types/IDs | Phase 2 |
+| Visual regression | Manual: run ISA Deep Research, compare substep rendering vs. regular conversation tool rendering | Phase 3 |
+| Dedup | Manual: run full pipeline, verify output appears once | Phase 4 |
+| Live streaming | Manual: watch synthesis stage for real-time text appearance | Phase 5 |
+
+---
+
+_Target branch: `feature/dynamic-stage-thinking` (continues from previous work)_
+_Estimated scope: Phases 1-4 = core. Phase 5 = optional enhancement._
+_Last updated: 2026-02-27_
+
+---
+
+# Bug Fix: Conversation Disappears After Agent Question
+
+## Goal
+
+Fix critical regression where the conversation panel goes blank when an agent question
+is asked in a session. Introduced by the "Rich Agent Pipeline Substep Visibility" feature above.
+
+## Analysis
+
+### What We Know
+- Bug is 100% renderer-side — session data persisted correctly in JSONL files, 0 errors across 5 latest sessions
+- TypeScript compiles — `pnpm run typecheck:all` EXIT 0
+- Build succeeds — `pnpm run electron:build` EXIT 0
+- E2E tests pass — 177 pass / 0 fail / 1 skipped
+- Two extraneous files modified (processor.ts, AgentRunDetailPage.tsx) — analyzed and confirmed **BENIGN**; do NOT revert
+
+### Root Cause Status
+Static analysis has **NOT** identified a definitive smoking gun for "conversation disappears."
+Code paths appear correct through the full event chain. One confirmed code bug (F1) was
+introduced and fixed in Phase 1.
+
+### Confirmed Bug: Shared orchTurnId (F1)
+All `text_complete` yields from `processOrchestratorEvents()` shared the same
+`orchTurnId = 'orch-${runId}'`. The renderer's `handleTextComplete` uses
+`findAssistantMessage(messages, turnId)` to locate existing messages. When the pause
+message arrives (`isIntermediate: false`), it finds the first intermediate stage-completion
+message with the same turnId and **overwrites** it — the dedup guard only blocks
+`intermediate → intermediate`, not `intermediate → final`.
+
+### Pre-Existing Issue: `pausedAgent` cleared immediately (F2)
+After `agent_stage_gate_pause` sets `pausedAgent`, the `complete` event immediately
+follows and `handleComplete` sets `pausedAgent: undefined`. The pause banner never
+renders. **Not caused by this PR** — noted for future fix.
+
+## Key Files
+
+| File | Layer | Role in Bug |
+|------|-------|-------------|
+| `packages/shared/src/agent/claude-agent.ts` | Agent | **SOURCE** — shared orchTurnId across all text_complete yields |
+| `apps/electron/src/renderer/event-processor/handlers/text.ts` | Renderer | handleTextComplete overwrites message due to shared turnId |
+| `apps/electron/src/renderer/App.tsx` | Renderer | onSessionEvent handler — event routing |
+| `apps/electron/src/renderer/event-processor/processor.ts` | Renderer | processEvent switch — event dispatch |
+| `apps/electron/src/renderer/pages/ChatPage.tsx` | Renderer | !session guard — renders empty/skeleton state |
+
+## Phase 0: Reproduce & Characterize (Zero-Code Diagnostic)
+
+- [ ] 0.1 Run `pnpm run electron:build` and launch the built app
+- [ ] 0.2 Open DevTools console (`Ctrl+Shift+I`) before triggering the bug
+- [ ] 0.3 Send a message to an agent session and observe console output
+- [ ] 0.4 Characterize: 100% repro or intermittent? Only agent sessions? Only ISA Deep Research?
+- [ ] 0.5 Document findings
+
+## Phase 1: Fix Confirmed Bug — orchTurnId Overwriting (F1)
+
+Generate unique turnId per `text_complete` yield. Keep shared `orchTurnId` for
+`tool_start`/`tool_result` (correct — groups substep activities under one turn).
+
+- [x] 1.1.1 Add `let orchTextCounter = 0` at top of `processOrchestratorEvents()`
+- [x] 1.1.2 `orchestrator_stage_complete` text_complete: `turnId: \`${orchTurnId}-text-${orchTextCounter++}\``
+- [x] 1.1.3 `orchestrator_pause` text_complete: `turnId: \`${orchTurnId}-text-${orchTextCounter++}\``
+- [x] 1.1.4 `text` case text_complete: `turnId: \`${orchTurnId}-text-${orchTextCounter++}\``
+
+### Validate Phase 1
+- [x] 1.2.1 `pnpm run typecheck:all` — PASS (exit code 0)
+- [x] 1.2.2 `pnpm run lint` — PASS (0 new errors, 5 pre-existing)
+
+## Phase 2: Targeted Runtime Diagnostics
+
+Added diagnostic logging to 4 points to trace "conversation disappears" if F1 fix
+is not sufficient. Skip if Phase 0 already identifies the root cause.
+
+- [x] 2.1.1 App.tsx `onSessionEvent`: Log event type, sessionId, streaming/handoff state
+- [x] 2.1.2 App.tsx post-processAgentEvent: Log message count, isProcessing
+- [x] 2.1.3 ChatPage.tsx `!session` guard: Log sessionId, hasMeta, isLoaded
+- [x] 2.1.4 processor.ts default case: Log unhandled event type
+
+### Validate Phase 2
+- [x] 2.2.1 `pnpm run typecheck:all` — PASS (exit code 0)
+- [x] 2.2.2 `pnpm run lint` — PASS (0 new errors)
+- [x] 2.2.3 `pnpm run test:e2e` — PASS (177 pass / 0 fail / 1 skipped)
+
+## Phase 3: Fix Root Cause (if Phase 0/2 reveal additional issue)
+
+- [ ] 3.1 Identify root cause from Phase 0 console errors or Phase 2 diagnostic logs
+- [ ] 3.2 Implement single targeted fix (exact change determined by diagnostics)
+- [ ] 3.3 Remove all Phase 2 diagnostic logging (revert 2.1.1-2.1.4)
+
+### Validate Phase 3
+- [ ] 3.4.1 `pnpm run typecheck:all` — must pass
+- [ ] 3.4.2 `pnpm run lint` — must pass
+- [ ] 3.4.3 `pnpm run test:e2e` — must pass
+
+## Phase 4: End-to-End Validation
+
+- [ ] 4.1 `pnpm run typecheck:all` — PASS
+- [ ] 4.2 `pnpm run lint` — PASS
+- [ ] 4.3 `pnpm run test:e2e` — PASS (177+ tests)
+- [ ] 4.4 Build app and manual smoke test:
+  - [ ] 4.4.1 Send message to regular (non-agent) session → conversation renders normally
+  - [ ] 4.4.2 Send message to ISA Deep Research agent session → conversation renders normally
+  - [ ] 4.4.3 Agent pipeline runs → substep activities appear in TurnCard
+  - [ ] 4.4.4 Agent pause → conversation stays visible, pause message appears
+  - [ ] 4.4.5 Resume agent → pipeline continues, conversation still visible
+- [ ] 4.5 No diagnostic `console.debug`/`console.warn` statements remain in code
+
+## Risks & Considerations
+
+| Risk | Mitigation |
+|------|------------|
+| Phase 1 fix (orchTurnId) may not be the full root cause | Phase 2 diagnostics will reveal additional issues |
+| Extraneous file changes (processor.ts, AgentRunDetailPage.tsx) | CONFIRMED BENIGN — do NOT revert |
+| `pausedAgent` cleared by handleComplete (F2) | Pre-existing, not in scope |
+| Diagnostic logging left in production | Phase 3.3 removes all; Phase 4.5 verifies |
+
+---
+
 _Last updated: 2026-02-27_

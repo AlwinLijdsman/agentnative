@@ -43,6 +43,7 @@ import type {
   OrchestratorEvent,
   OrchestratorOptions,
   StreamEvent,
+  SubstepEvent,
 } from './types.ts';
 import { createNullCostTracker } from './types.ts';
 import { ZERO_USAGE } from './types.ts';
@@ -153,6 +154,19 @@ export class AgentOrchestrator {
   private readonly onDebug?: (message: string) => void;
   private readonly previousSessionId?: string;
 
+  /**
+   * Shared substep event queue — StageRunner pushes events via onProgress callback,
+   * the pipeline generator drains them after each runStage() call completes.
+   * Used by both executePipeline() and executeRepairLoop().
+   */
+  private readonly substepQueue: SubstepEvent[] = [];
+
+  /** Real-time substep callback — fires immediately, bypassing generator queue. */
+  private readonly onSubstepEvent?: (event: SubstepEvent, stageId: number) => void;
+
+  /** Current stage ID — set at top of stage loop, used by onProgress callback. */
+  private currentStageId = 0;
+
   private constructor(
     options: OrchestratorOptions,
     stageRunner: StageRunner,
@@ -163,8 +177,17 @@ export class AgentOrchestrator {
     this.onStreamEvent = options.onStreamEvent;
     this.onDebug = options.onDebug;
     this.previousSessionId = options.previousSessionId;
+    this.onSubstepEvent = options.onSubstepEvent;
     this.stageRunner = stageRunner;
     this.costTracker = costTracker;
+
+    // Wire onProgress callback — pushes substep events to shared queue
+    // AND fires real-time callback for immediate UI delivery
+    this.stageRunner.setOnProgress((event: SubstepEvent) => {
+      this.substepQueue.push(event);
+      // Real-time delivery — bypasses generator queue so UI shows substeps during execution
+      this.onSubstepEvent?.(event, this.currentStageId);
+    });
   }
 
   /**
@@ -351,6 +374,9 @@ export class AgentOrchestrator {
       const stage = stages[i];
       if (!stage) continue;
 
+      // Track current stage for real-time substep callback
+      this.currentStageId = stage.id;
+
       // ── 0. Skip intercept (Section 20 — F2) ─────────────────────────
       // Placed BEFORE both pause-after and normal-run branches so that
       // skipped stages never call runStage().
@@ -407,10 +433,20 @@ export class AgentOrchestrator {
       // ── 2. Check if this is a pause-after stage ──────────────────────
       if (agentConfig.controlFlow.pauseAfterStages?.includes(stage.id)) {
         try {
+          // Clear substep queue for this stage
+          this.substepQueue.length = 0;
+
           // Run the stage to generate the pause message
           const pauseResult = await this.stageRunner.runStage(
             stage, state, userMessage, agentConfig, followUpContext,
           );
+
+          // Drain substep events collected during stage execution
+          for (const substep of this.substepQueue) {
+            yield { type: 'orchestrator_substep', stageId: stage.id, substep };
+          }
+          this.substepQueue.length = 0;
+
           state = state.setStageOutput(stage.id, pauseResult);
           state = state.addEvent({
             type: 'stage_completed',
@@ -474,9 +510,18 @@ export class AgentOrchestrator {
 
       // ── 3. Run the stage ─────────────────────────────────────────────
       try {
+        // Clear substep queue for this stage
+        this.substepQueue.length = 0;
+
         const stageResult = await this.stageRunner.runStage(
           stage, state, userMessage, agentConfig, followUpContext,
         );
+
+        // Drain substep events collected during stage execution
+        for (const substep of this.substepQueue) {
+          yield { type: 'orchestrator_substep', stageId: stage.id, substep };
+        }
+        this.substepQueue.length = 0;
 
         // ── 4. Record output in state (TypeScript writes state — not LLM)
         state = state.setStageOutput(stage.id, stageResult);
@@ -579,6 +624,9 @@ export class AgentOrchestrator {
         const repairStage = stages.find((s) => s.id === repairStageId);
         if (!repairStage) continue;
 
+        // Track current stage for real-time substep callback
+        this.currentStageId = repairStageId;
+
         const feedback = currentVerifyOutput?.data?.[repairUnit.feedbackField] as string | undefined;
         state = state.addEvent({
           type: 'stage_started',
@@ -588,9 +636,18 @@ export class AgentOrchestrator {
 
         yield { type: 'orchestrator_stage_start', stage: repairStageId, name: repairStage.name };
 
+        // Clear substep queue for repair stage
+        this.substepQueue.length = 0;
+
         const repairResult = await this.stageRunner.runStage(
           repairStage, state, userMessage, agentConfig, followUpContext,
         );
+
+        // Drain substep events collected during repair stage execution
+        for (const substep of this.substepQueue) {
+          yield { type: 'orchestrator_substep', stageId: repairStageId, substep };
+        }
+        this.substepQueue.length = 0;
 
         state = state.setStageOutput(repairStageId, repairResult);
         state = state.addEvent({

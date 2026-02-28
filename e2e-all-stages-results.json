@@ -1,8 +1,8 @@
 {
-  "timestamp": "2026-02-27T07:57:10.175Z",
+  "timestamp": "2026-02-27T12:59:58.973Z",
   "query": "What should I consider when testing insurance reserves under ISA 540?",
-  "totalDurationSec": 303.965,
-  "totalCostUsd": 0.46255500000000005,
+  "totalDurationSec": 248.429,
+  "totalCostUsd": 0.37721,
   "pipelineCompleted": true,
   "allOrchestrator": true,
   "stageReports": [
@@ -11,15 +11,15 @@
       "stageName": "analyze_query",
       "verdict": "PASS",
       "method": "LLM",
-      "duration": 27.695,
-      "notes": "Paused correctly. 402 stream chunks. Output: **Query Analysis Complete** — Clarity: 85% (above 70% threshold)\n\n**Assumptions*..."
+      "duration": 31.591,
+      "notes": "Paused correctly. 470 stream chunks. Output: **Query Analysis Complete** — Clarity: 82% (above 70% threshold)\n\n**Assumptions*..."
     },
     {
       "stageId": 1,
       "stageName": "websearch_calibration",
       "verdict": "PASS",
       "method": "LLM",
-      "duration": 0.002,
+      "duration": 0.004,
       "notes": "Paused correctly. 0 stream chunks. Output: **Web Search Calibration — UNAVAILABLE**\n\nWeb search could not run because MCP b..."
     },
     {
@@ -35,7 +35,7 @@
       "stageName": "synthesize",
       "verdict": "PASS",
       "method": "LLM",
-      "duration": 276.26,
+      "duration": 216.824,
       "notes": "LLM call completed. Streaming OK"
     },
     {
@@ -51,7 +51,7 @@
       "stageName": "output",
       "verdict": "PASS",
       "method": "Render",
-      "duration": 0.006,
+      "duration": 0.007,
       "notes": "Deterministic render completed"
     }
   ],

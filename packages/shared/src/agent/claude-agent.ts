@@ -3380,22 +3380,93 @@ export class ClaudeAgent extends BaseAgent {
 
       // ── Create orchestrator instance ───────────────────────────────
       // Inside try block so create() failures are caught and yield 'complete' (F7 fix)
+      // Compute orchTurnId so the real-time callback and generator use the same turnId
+      const orchTurnId = `orch-${runId}`;
       const orchestrator = AgentOrchestrator.create(
         {
           sessionId,
           sessionPath,
           getAuthToken: () => this.getOrchestratorAuthToken(),
           onStreamEvent: (event) => {
-            // Forward text deltas for debug logging.
-            // Real-time streaming to UI is limited by the generator pattern —
-            // callbacks can't yield. Stage text is accumulated and yielded
-            // as intermediate text events between stages (F5 mitigation).
+            // Forward text/thinking deltas for debug logging.
             if (event.type === 'text_delta' && event.text) {
               this.onDebug?.(`[orchestrator] stream: ${event.text.slice(0, 50)}...`);
             }
           },
           onDebug: this.onDebug ? (msg: string) => this.onDebug?.(msg) : undefined,
           previousSessionId, // Section 21: auto-detected from prior answer.json
+          // Real-time substep delivery — fires immediately during stage execution,
+          // bypassing the generator queue so the UI shows progress in real-time.
+          onSubstepEvent: (substep, stageId) => {
+            switch (substep.type) {
+              case 'mcp_start':
+                this.onAgentEvent?.({
+                  type: 'agent_substep_start',
+                  agentSlug,
+                  runId,
+                  data: {
+                    stageId,
+                    toolName: substep.toolName,
+                    toolUseId: substep.toolUseId,
+                    input: substep.input,
+                    turnId: orchTurnId,
+                    parentToolUseId: substep.parentToolUseId,
+                  },
+                });
+                break;
+              case 'mcp_result':
+                this.onAgentEvent?.({
+                  type: 'agent_substep_result',
+                  agentSlug,
+                  runId,
+                  data: {
+                    stageId,
+                    toolUseId: substep.toolUseId,
+                    toolName: substep.toolName,
+                    result: substep.result,
+                    isError: substep.isError ?? false,
+                    turnId: orchTurnId,
+                    parentToolUseId: substep.parentToolUseId,
+                  },
+                });
+                break;
+              case 'llm_start':
+                this.onAgentEvent?.({
+                  type: 'agent_substep_start',
+                  agentSlug,
+                  runId,
+                  data: {
+                    stageId,
+                    toolName: 'orchestrator_llm',
+                    toolUseId: substep.toolUseId,
+                    input: { stage: substep.stageName, stageId: substep.stageId },
+                    turnId: orchTurnId,
+                    intent: `Analyzing: ${substep.stageName}`,
+                    parentToolUseId: substep.parentToolUseId,
+                  },
+                });
+                break;
+              case 'llm_complete':
+                this.onAgentEvent?.({
+                  type: 'agent_substep_result',
+                  agentSlug,
+                  runId,
+                  data: {
+                    stageId,
+                    toolUseId: substep.toolUseId,
+                    toolName: 'orchestrator_llm',
+                    result: substep.text,
+                    isError: false,
+                    turnId: orchTurnId,
+                    parentToolUseId: substep.parentToolUseId,
+                  },
+                });
+                break;
+              case 'status':
+                // Status events are transient — no real-time delivery needed
+                break;
+            }
+          },
         },
         mcpBridge,
         costTracker,
@@ -3513,6 +3584,8 @@ export class ClaudeAgent extends BaseAgent {
       }
 
       // Create orchestrator instance for resume
+      // Compute orchTurnId so the real-time callback and generator use the same turnId
+      const orchTurnId = `orch-${runId}`;
       const orchestrator = AgentOrchestrator.create(
         {
           sessionId,
@@ -3524,6 +3597,76 @@ export class ClaudeAgent extends BaseAgent {
             }
           },
           onDebug: this.onDebug ? (msg: string) => this.onDebug?.(msg) : undefined,
+          // Real-time substep delivery — same callback as runOrchestrator
+          onSubstepEvent: (substep, stageId) => {
+            switch (substep.type) {
+              case 'mcp_start':
+                this.onAgentEvent?.({
+                  type: 'agent_substep_start',
+                  agentSlug,
+                  runId,
+                  data: {
+                    stageId,
+                    toolName: substep.toolName,
+                    toolUseId: substep.toolUseId,
+                    input: substep.input,
+                    turnId: orchTurnId,
+                    parentToolUseId: substep.parentToolUseId,
+                  },
+                });
+                break;
+              case 'mcp_result':
+                this.onAgentEvent?.({
+                  type: 'agent_substep_result',
+                  agentSlug,
+                  runId,
+                  data: {
+                    stageId,
+                    toolUseId: substep.toolUseId,
+                    toolName: substep.toolName,
+                    result: substep.result,
+                    isError: substep.isError ?? false,
+                    turnId: orchTurnId,
+                    parentToolUseId: substep.parentToolUseId,
+                  },
+                });
+                break;
+              case 'llm_start':
+                this.onAgentEvent?.({
+                  type: 'agent_substep_start',
+                  agentSlug,
+                  runId,
+                  data: {
+                    stageId,
+                    toolName: 'orchestrator_llm',
+                    toolUseId: substep.toolUseId,
+                    input: { stage: substep.stageName, stageId: substep.stageId },
+                    turnId: orchTurnId,
+                    intent: `Analyzing: ${substep.stageName}`,
+                    parentToolUseId: substep.parentToolUseId,
+                  },
+                });
+                break;
+              case 'llm_complete':
+                this.onAgentEvent?.({
+                  type: 'agent_substep_result',
+                  agentSlug,
+                  runId,
+                  data: {
+                    stageId,
+                    toolUseId: substep.toolUseId,
+                    toolName: 'orchestrator_llm',
+                    result: substep.text,
+                    isError: false,
+                    turnId: orchTurnId,
+                    parentToolUseId: substep.parentToolUseId,
+                  },
+                });
+                break;
+              case 'status':
+                break;
+            }
+          },
         },
         mcpBridge,
         costTracker,
@@ -3585,6 +3728,12 @@ export class ClaudeAgent extends BaseAgent {
     // Section 16 (G3): Track exit reason as generator return value
     let exitReason: OrchestratorExitReason = 'completed';
 
+    // Stable orchestrator turn ID — groups all substep tool activities under one turn
+    const orchTurnId = `orch-${runId}`;
+    // Unique counter for text_complete yields — each gets its own turnId so
+    // handleTextComplete never overwrites a previous stage's assistant message (F1 fix)
+    let orchTextCounter = 0;
+
     for await (const event of events) {
       switch (event.type) {
         case 'orchestrator_stage_start':
@@ -3611,12 +3760,67 @@ export class ClaudeAgent extends BaseAgent {
             },
           });
           // F5: Yield intermediate text so UI shows stage progress between LLM calls
+          // Each text_complete gets a unique turnId (F1 fix — prevents message overwriting)
           yield {
             type: 'text_complete',
             text: `**Stage ${event.stage} (${event.name})** completed.`,
             isIntermediate: true,
+            turnId: `${orchTurnId}-text-${orchTextCounter++}`,
           };
           break;
+
+        case 'orchestrator_substep': {
+          const substep = event.substep;
+          switch (substep.type) {
+            case 'mcp_start':
+              yield {
+                type: 'tool_start',
+                toolName: substep.toolName,
+                toolUseId: substep.toolUseId,
+                input: substep.input,
+                turnId: orchTurnId,
+                parentToolUseId: substep.parentToolUseId,
+              };
+              break;
+            case 'mcp_result':
+              yield {
+                type: 'tool_result',
+                toolUseId: substep.toolUseId,
+                toolName: substep.toolName,
+                result: substep.result,
+                isError: substep.isError ?? false,
+                turnId: orchTurnId,
+                parentToolUseId: substep.parentToolUseId,
+              };
+              break;
+            case 'llm_start':
+              yield {
+                type: 'tool_start',
+                toolName: 'orchestrator_llm',
+                toolUseId: substep.toolUseId,
+                input: { stage: substep.stageName, stageId: substep.stageId },
+                turnId: orchTurnId,
+                intent: `Analyzing: ${substep.stageName}`,
+                parentToolUseId: substep.parentToolUseId,
+              };
+              break;
+            case 'llm_complete':
+              yield {
+                type: 'tool_result',
+                toolUseId: substep.toolUseId,
+                toolName: 'orchestrator_llm',
+                result: substep.text,
+                isError: false,
+                turnId: orchTurnId,
+                parentToolUseId: substep.parentToolUseId,
+              };
+              break;
+            case 'status':
+              yield { type: 'status', message: substep.message };
+              break;
+          }
+          break;
+        }
 
         case 'orchestrator_repair_start':
           this.onAgentEvent?.({
@@ -3635,7 +3839,8 @@ export class ClaudeAgent extends BaseAgent {
           this.writeOrchestratorBridgeState(sessionPath, agentSlug, event.stage, runId);
 
           // Yield pause message as assistant text so user sees the analysis
-          yield { type: 'text_complete', text: event.message, isIntermediate: false };
+          // Unique turnId per text_complete (F1 fix — prevents message overwriting)
+          yield { type: 'text_complete', text: event.message, isIntermediate: false, turnId: `${orchTurnId}-text-${orchTextCounter++}` };
 
           // Emit stage gate pause for renderer's agentRunStateAtom
           this.onAgentStagePause?.({
@@ -3673,7 +3878,8 @@ export class ClaudeAgent extends BaseAgent {
           break;
 
         case 'text':
-          yield { type: 'text_complete', text: event.text, isIntermediate: false };
+          // Unique turnId per text_complete (F1 fix — prevents message overwriting)
+          yield { type: 'text_complete', text: event.text, isIntermediate: false, turnId: `${orchTurnId}-text-${orchTextCounter++}` };
           break;
 
         case 'orchestrator_error':
