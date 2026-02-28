@@ -85,6 +85,81 @@ export class StageRunner {
   }
 
   /**
+   * Create a streaming progress wrapper that intercepts LLM stream events
+   * and emits visible progress entries as section headings are detected
+   * and thinking milestones are reached.
+   *
+   * This gives the UI real-time visibility into long-running LLM calls
+   * (especially synthesis which can take 1-3 minutes).
+   */
+  private createStreamProgressTracker(
+    parentCallback?: (event: StreamEvent) => void,
+  ): {
+    callback: (event: StreamEvent) => void;
+    flush: () => void;
+  } {
+    let textBuffer = '';
+    let thinkingChars = 0;
+    let lastThinkingMilestone = 0;
+    const thinkingInterval = 4000; // Emit thinking milestone every ~4k chars
+    const emittedSections = new Set<string>();
+    let sectionCount = 0;
+
+    // Regex to detect ## section headings in streaming JSON text
+    // Matches: "## Executive Summary", "## 1. Key Requirements", etc.
+    const sectionHeadingRegex = /##\s+(?:\d+\.\s+)?([^\n"\\]+)/g;
+
+    const callback = (event: StreamEvent): void => {
+      // Always forward to parent callback
+      parentCallback?.(event);
+
+      if (event.type === 'thinking_delta' && event.thinking) {
+        thinkingChars += event.thinking.length;
+        // Emit periodic thinking milestones
+        if (thinkingChars - lastThinkingMilestone >= thinkingInterval) {
+          lastThinkingMilestone = thinkingChars;
+          const thinkingId = this.generateToolUseId('synth-thinking');
+          const kChars = Math.round(thinkingChars / 1000);
+          this.emitProgress({ type: 'mcp_start', toolName: 'orch_synthesis_step', toolUseId: thinkingId, input: { step: 'thinking', chars: thinkingChars } });
+          this.emitProgress({ type: 'mcp_result', toolUseId: thinkingId, toolName: 'orch_synthesis_step', result: `Reasoning about synthesis approach (~${kChars}k chars)` });
+        }
+      }
+
+      if (event.type === 'text_delta' && event.text) {
+        textBuffer += event.text;
+
+        // Scan for new section headings
+        let match: RegExpExecArray | null;
+        sectionHeadingRegex.lastIndex = 0;
+        while ((match = sectionHeadingRegex.exec(textBuffer)) !== null) {
+          const heading = match[1]!.trim();
+          // Clean up JSON artifacts (trailing quotes, commas, backslashes)
+          const cleanHeading = heading.replace(/[",\\]+$/, '').trim();
+          if (cleanHeading.length > 3 && cleanHeading.length < 100 && !emittedSections.has(cleanHeading)) {
+            emittedSections.add(cleanHeading);
+            sectionCount++;
+            const sectionId = this.generateToolUseId('synth-section');
+            this.emitProgress({ type: 'mcp_start', toolName: 'orch_synthesis_step', toolUseId: sectionId, input: { step: 'writing_section', section: cleanHeading, sectionNumber: sectionCount } });
+            this.emitProgress({ type: 'mcp_result', toolUseId: sectionId, toolName: 'orch_synthesis_step', result: `Writing: ${cleanHeading}` });
+          }
+        }
+      }
+    };
+
+    const flush = (): void => {
+      // Emit final stats if any thinking occurred
+      if (thinkingChars > 0 && sectionCount > 0) {
+        const statsId = this.generateToolUseId('synth-stats');
+        const kChars = Math.round(thinkingChars / 1000);
+        this.emitProgress({ type: 'mcp_start', toolName: 'orch_synthesis_step', toolUseId: statsId, input: { step: 'generation_complete', thinking: `${kChars}k`, sections: sectionCount, textLength: textBuffer.length } });
+        this.emitProgress({ type: 'mcp_result', toolUseId: statsId, toolName: 'orch_synthesis_step', result: `Generation complete — ${sectionCount} sections written, ${Math.round(textBuffer.length / 1000)}k chars output` });
+      }
+    };
+
+    return { callback, flush };
+  }
+
+  /**
    * Dispatch stage execution based on stage name.
    *
    * Mirrors gamma's `_run_stage()` — determines which handler to call
@@ -726,13 +801,19 @@ export class StageRunner {
     const synthLlmToolId = this.generateToolUseId('llm-synthesize');
     this.emitProgress({ type: 'llm_start', stageId: stage.id, stageName: 'synthesize', toolUseId: synthLlmToolId });
 
+    // Create streaming progress tracker to surface section headings and thinking milestones
+    const streamTracker = this.createStreamProgressTracker(this.onStreamEvent);
+
     const result = await this.llmClient.call({
       systemPrompt,
       userMessage: userContent,
       desiredMaxTokens: desiredTokens,
       effort: this.getStageEffort(orchestratorConfig),
-      onStreamEvent: this.onStreamEvent,
+      onStreamEvent: streamTracker.callback,
     });
+
+    // Flush any remaining progress stats
+    streamTracker.flush();
 
     this.emitProgress({ type: 'llm_complete', text: 'Synthesis complete', toolUseId: synthLlmToolId, isIntermediate: true });
 
