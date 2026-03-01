@@ -203,6 +203,9 @@ export interface Message {
   authError?: string;             // Error message if auth failed
   authEmail?: string;             // Authenticated email (for OAuth)
   authWorkspace?: string;         // Authenticated workspace (for Slack)
+  // Edit history fields
+  editedAt?: number;              // Timestamp of last edit (undefined = never edited)
+  originalContent?: string;       // Original content before first edit (preserved across edits)
 }
 
 /**
@@ -275,6 +278,9 @@ export interface StoredMessage {
   authWorkspace?: string;
   // Queued: user message that is waiting to be processed (persisted for recovery)
   isQueued?: boolean;
+  // Edit history fields (persisted for reload)
+  editedAt?: number;
+  originalContent?: string;
 }
 
 /**

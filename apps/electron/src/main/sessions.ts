@@ -788,6 +788,9 @@ interface ManagedSession {
   // Promise that resolves when the agent instance is ready (for title gen to await)
   agentReady?: Promise<void>
   agentReadyResolve?: () => void
+  // Conversation history management: when true, next sendMessage injects prior context
+  // Set by truncateAtMessage(), consumed one-shot in sendMessage()
+  pendingContextRecovery?: boolean
 }
 
 // Convert runtime Message to StoredMessage for persistence
@@ -840,6 +843,9 @@ function messageToStored(msg: Message): StoredMessage {
     authWorkspace: msg.authWorkspace,
     // Queue state (for recovery after crash)
     isQueued: msg.isQueued,
+    // Edit history
+    editedAt: msg.editedAt,
+    originalContent: msg.originalContent,
   }
 }
 
@@ -892,6 +898,9 @@ function storedToMessage(stored: StoredMessage): Message {
     authWorkspace: stored.authWorkspace,
     // Queue state (for recovery after crash)
     isQueued: stored.isQueued,
+    // Edit history
+    editedAt: stored.editedAt,
+    originalContent: stored.originalContent,
   }
 }
 
@@ -4150,10 +4159,36 @@ export class SessionManager {
       const pipelineStatePath = join(sessionPath, 'data', 'pipeline-state.json')
       if (existsSync(pipelineStatePath)) {
         const raw = JSON.parse(readFileSync(pipelineStatePath, 'utf8'))
-        const pauseCount = (raw.events as Array<{ type: string }>)?.filter(e => e.type === 'pause_requested').length ?? 0
-        const resumeCount = (raw.events as Array<{ type: string }>)?.filter(e => e.type === 'resumed').length ?? 0
-        if (pauseCount > resumeCount && raw.agentSlug) {
-          const lastPause = [...(raw.events as Array<{ type: string; stage?: number }>)].reverse().find(e => e.type === 'pause_requested')
+        const events = raw.events as Array<{ type: string; stage?: number }> ?? []
+
+        // G3 fix: Check for breakout_resume_pending state.
+        // When a breakout-resume confirmation is pending, we need to hold
+        // the queue drain so the user's response goes through chat() path
+        // instead of being consumed by the SDK.
+        const breakoutResumePendingCount = events.filter(e => e.type === 'breakout_resume_pending').length
+        const resumeFromBreakoutCount = events.filter(e => e.type === 'resume_from_breakout').length
+        const stageStartedAfterPendingCount = events.filter(e => e.type === 'stage_started').length
+        if (breakoutResumePendingCount > resumeFromBreakoutCount) {
+          // Check that no stage_started happened after the last breakout_resume_pending
+          const lastPendingIdx = events.map((e, i) => e.type === 'breakout_resume_pending' ? i : -1).filter(i => i >= 0).pop() ?? -1
+          const hasStartAfterPending = events.slice(lastPendingIdx + 1).some(e => e.type === 'stage_started')
+          if (!hasStartAfterPending && raw.agentSlug) {
+            sessionLog.debug('[orchestrator] getPausedAgentResumeContext: breakout_resume_pending detected', {
+              agentSlug: raw.agentSlug,
+            })
+            return `<orchestrator_pipeline_breakout_resume_pending agentSlug="${raw.agentSlug}" />`
+          }
+        }
+
+        const pauseCount = events.filter(e => e.type === 'pause_requested').length
+        // Fix: resumeCount should include 'resumed' + 'resume_from_breakout' events
+        // (breakout events end a pause implicitly via pipeline termination)
+        const resumeCount = events.filter(e =>
+          e.type === 'resumed' || e.type === 'resume_from_breakout',
+        ).length
+        const breakoutCount = events.filter(e => e.type === 'breakout').length
+        if (pauseCount > (resumeCount + breakoutCount) && raw.agentSlug) {
+          const lastPause = [...events].reverse().find(e => e.type === 'pause_requested')
           const pausedStage = lastPause?.stage ?? -1
           sessionLog.debug('[orchestrator] getPausedAgentResumeContext: found via pipeline-state.json fallback', {
             agentSlug: raw.agentSlug,
@@ -4168,6 +4203,332 @@ export class SessionManager {
 
     return null
   }
+
+  // ============================================================================
+  // Conversation History Management (Delete, Edit, Restore, Branch)
+  // ============================================================================
+
+  /**
+   * Truncate session messages at a given message ID.
+   * Removes the target message and all messages after it (inclusive),
+   * or keeps the target and removes everything after (exclusive).
+   * Clears sdkSessionId so next message starts a fresh SDK session.
+   * Sets pendingContextRecovery flag for context injection on next sendMessage.
+   * Persists to disk immediately.
+   */
+  private async truncateAtMessage(
+    managed: ManagedSession,
+    messageId: string,
+    options: { inclusive: boolean; restoredContent?: string }
+  ): Promise<void> {
+    // Ensure messages are loaded
+    await this.ensureMessagesLoaded(managed)
+
+    // Find the message index
+    const messageIndex = managed.messages.findIndex(m => m.id === messageId)
+    if (messageIndex === -1) {
+      throw new Error(`Message ${messageId} not found in session ${managed.id}`)
+    }
+
+    // If processing is in progress, force-abort and wait for cleanup
+    // Matches deleteSession pattern to prevent JSONL file corruption from concurrent writes
+    if (managed.isProcessing && managed.agent) {
+      managed.agent.forceAbort(AbortReason.UserStop)
+      await new Promise(resolve => setTimeout(resolve, 100))
+    }
+
+    // Destroy current agent instance (force fresh SDK session on next send)
+    if (managed.agent) {
+      managed.agent.dispose()
+      managed.agent = null
+    }
+
+    // Clear message queue — prevents queued messages from referencing deleted context
+    managed.messageQueue = []
+
+    // Truncate messages
+    if (options.inclusive) {
+      managed.messages = managed.messages.slice(0, messageIndex)
+    } else {
+      managed.messages = managed.messages.slice(0, messageIndex + 1)
+    }
+
+    // Clear sdkSessionId — forces fresh SDK session on next send
+    managed.sdkSessionId = undefined
+
+    // Mark as not processing (any in-flight processing was aborted)
+    managed.isProcessing = false
+    managed.stopRequested = false
+
+    // Partial token usage reset: preserve accumulated costUsd and outputTokens,
+    // clear context-dependent fields that will be refreshed by SDK on next turn
+    if (managed.tokenUsage) {
+      managed.tokenUsage = {
+        ...managed.tokenUsage,
+        inputTokens: 0,
+        contextTokens: 0,
+        totalTokens: 0,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        // Preserve: costUsd, outputTokens, contextWindow
+      }
+    }
+
+    // Set pendingContextRecovery so next sendMessage injects prior context
+    managed.pendingContextRecovery = true
+
+    // Update metadata fields
+    managed.messageCount = managed.messages.length
+    const lastMessage = managed.messages[managed.messages.length - 1]
+    if (lastMessage) {
+      managed.lastMessageRole = lastMessage.role as 'user' | 'assistant' | 'plan' | 'tool' | 'error'
+      managed.lastFinalMessageId = lastMessage.id
+    }
+
+    // Persist to disk immediately
+    this.persistSession(managed)
+    await this.flushSession(managed.id)
+
+    // Emit event to renderer with updated messages
+    this.sendEvent(
+      { type: 'messages_truncated', sessionId: managed.id, messages: managed.messages, restoredContent: options.restoredContent },
+      managed.workspace.id
+    )
+  }
+
+  /**
+   * Delete a message and all messages after it (inclusive).
+   * Works for any message role (user, assistant, system, tool).
+   * @deprecated Use deleteSingleMessage instead — this cascades (removes target + all after)
+   */
+  async deleteFromMessage(sessionId: string, messageId: string): Promise<void> {
+    const managed = this.sessions.get(sessionId)
+    if (!managed) {
+      throw new Error(`Session ${sessionId} not found`)
+    }
+    await this.truncateAtMessage(managed, messageId, { inclusive: true })
+  }
+
+  /**
+   * Delete a single message by ID without affecting other messages.
+   * Removes only the target message; all other messages remain in place.
+   * Clears SDK session and sets pendingContextRecovery for next sendMessage.
+   */
+  async deleteSingleMessage(sessionId: string, messageId: string): Promise<void> {
+    const managed = this.sessions.get(sessionId)
+    if (!managed) {
+      throw new Error(`Session ${sessionId} not found`)
+    }
+
+    await this.ensureMessagesLoaded(managed)
+
+    // Verify message exists
+    const messageIndex = managed.messages.findIndex(m => m.id === messageId)
+    if (messageIndex === -1) {
+      throw new Error(`Message ${messageId} not found in session ${sessionId}`)
+    }
+
+    // If processing is in progress, force-abort and wait for cleanup
+    if (managed.isProcessing && managed.agent) {
+      managed.agent.forceAbort(AbortReason.UserStop)
+      await new Promise(resolve => setTimeout(resolve, 100))
+    }
+
+    // Destroy current agent instance (force fresh SDK session on next send)
+    if (managed.agent) {
+      managed.agent.dispose()
+      managed.agent = null
+    }
+
+    // Clear message queue
+    managed.messageQueue = []
+
+    // Remove only the target message
+    managed.messages = managed.messages.filter(m => m.id !== messageId)
+
+    // Clear sdkSessionId — forces fresh SDK session on next send
+    managed.sdkSessionId = undefined
+
+    // Mark as not processing
+    managed.isProcessing = false
+    managed.stopRequested = false
+
+    // Partial token usage reset
+    if (managed.tokenUsage) {
+      managed.tokenUsage = {
+        ...managed.tokenUsage,
+        inputTokens: 0,
+        contextTokens: 0,
+        totalTokens: 0,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+      }
+    }
+
+    // Set pendingContextRecovery so next sendMessage injects prior context
+    managed.pendingContextRecovery = true
+
+    // Update metadata fields
+    managed.messageCount = managed.messages.length
+    const lastMessage = managed.messages[managed.messages.length - 1]
+    if (lastMessage) {
+      managed.lastMessageRole = lastMessage.role as 'user' | 'assistant' | 'plan' | 'tool' | 'error'
+      managed.lastFinalMessageId = lastMessage.id
+    }
+
+    // Persist to disk immediately
+    this.persistSession(managed)
+    await this.flushSession(managed.id)
+
+    // Emit event to renderer with updated messages
+    this.sendEvent(
+      { type: 'messages_truncated', sessionId: managed.id, messages: managed.messages },
+      managed.workspace.id
+    )
+  }
+
+  /**
+   * Edit a user message in place — updates content only, preserves edit history.
+   * Does NOT truncate or re-send. Stores original content on first edit.
+   * Clears sdkSessionId so next message starts a fresh SDK session.
+   */
+  async editMessageInPlace(sessionId: string, messageId: string, newContent: string): Promise<void> {
+    const managed = this.sessions.get(sessionId)
+    if (!managed) {
+      throw new Error(`Session ${sessionId} not found`)
+    }
+
+    await this.ensureMessagesLoaded(managed)
+
+    // Find and validate message
+    const message = managed.messages.find(m => m.id === messageId)
+    if (!message) {
+      throw new Error(`Message ${messageId} not found in session ${sessionId}`)
+    }
+    if (message.role !== 'user') {
+      throw new Error(`Cannot edit non-user message (role: ${message.role})`)
+    }
+
+    // Store original content only on first edit
+    if (!message.originalContent) {
+      message.originalContent = message.content
+    }
+
+    // Update content and edit timestamp
+    message.content = newContent
+    message.editedAt = Date.now()
+
+    // Clear sdkSessionId — forces fresh SDK session on next send
+    managed.sdkSessionId = undefined
+
+    // Set pendingContextRecovery so next sendMessage injects prior context
+    managed.pendingContextRecovery = true
+
+    // Persist to disk immediately
+    this.persistSession(managed)
+    await this.flushSession(managed.id)
+
+    // Emit message_edited event to renderer
+    this.sendEvent(
+      {
+        type: 'message_edited',
+        sessionId: managed.id,
+        messageId: message.id,
+        newContent: message.content,
+        editedAt: message.editedAt,
+        originalContent: message.originalContent,
+      },
+      managed.workspace.id
+    )
+  }
+
+  /**
+   * Restore checkpoint — roll back to the state after a given message.
+   * Keeps messages up to and including afterMessageId, removes everything after.
+   * Extracts the last user message content to populate the input box.
+   */
+  async restoreCheckpoint(sessionId: string, afterMessageId: string, inclusive?: boolean): Promise<void> {
+    const managed = this.sessions.get(sessionId)
+    if (!managed) {
+      throw new Error(`Session ${sessionId} not found`)
+    }
+
+    await this.ensureMessagesLoaded(managed)
+
+    // Find the last user message at or before afterMessageId to extract content for input box
+    const afterIndex = managed.messages.findIndex(m => m.id === afterMessageId)
+    let restoredContent: string | undefined
+    if (afterIndex !== -1) {
+      // Search backwards from afterIndex for the last user message
+      for (let i = afterIndex; i >= 0; i--) {
+        if (managed.messages[i].role === 'user') {
+          restoredContent = managed.messages[i].content
+          break
+        }
+      }
+    }
+
+    await this.truncateAtMessage(managed, afterMessageId, { inclusive: inclusive ?? false, restoredContent })
+  }
+
+  /**
+   * Branch from a message — create a new sub-session with messages up to (inclusive)
+   * the target message. The new session starts fresh (no sdkSessionId) with
+   * pendingContextRecovery so the first message gets prior context.
+   */
+  async branchFromMessage(sessionId: string, messageId: string): Promise<Session> {
+    const managed = this.sessions.get(sessionId)
+    if (!managed) {
+      throw new Error(`Session ${sessionId} not found`)
+    }
+
+    await this.ensureMessagesLoaded(managed)
+
+    // Find the message index
+    const messageIndex = managed.messages.findIndex(m => m.id === messageId)
+    if (messageIndex === -1) {
+      throw new Error(`Message ${messageId} not found in session ${sessionId}`)
+    }
+
+    // Copy messages up to and including the target message
+    const branchedMessages = managed.messages.slice(0, messageIndex + 1)
+
+    // Create sub-session via existing createSubSession infrastructure
+    const branchSession = await this.createSubSession(managed.workspace.id, sessionId, {
+      name: managed.name ? `Branch of ${managed.name}` : undefined,
+      workingDirectory: managed.workingDirectory,
+      permissionMode: managed.permissionMode,
+      enabledSourceSlugs: managed.enabledSourceSlugs,
+      model: managed.model,
+      todoState: managed.todoState,
+      labels: managed.labels,
+    })
+
+    // Copy messages into the new session
+    const branchManaged = this.sessions.get(branchSession.id)
+    if (branchManaged) {
+      branchManaged.messages = branchedMessages.map(m => ({ ...m }))
+      branchManaged.pendingContextRecovery = true
+      branchManaged.messageCount = branchedMessages.length
+      branchManaged.lastMessageAt = Date.now()
+      const lastMsg = branchedMessages[branchedMessages.length - 1]
+      if (lastMsg) {
+        branchManaged.lastMessageRole = lastMsg.role as 'user' | 'assistant' | 'plan' | 'tool' | 'error'
+        branchManaged.lastFinalMessageId = lastMsg.id
+        branchManaged.preview = branchedMessages.find(m => m.role === 'user')?.content?.slice(0, 200)
+      }
+      // Persist the branched session with its messages
+      this.persistSession(branchManaged)
+      await this.flushSession(branchManaged.id)
+    }
+
+    // Return session with copied messages
+    return {
+      ...branchSession,
+      messages: branchedMessages,
+    }
+  }
+
   async sendMessage(sessionId: string, message: string, attachments?: FileAttachment[], storedAttachments?: StoredAttachment[], options?: SendMessageOptions, existingMessageId?: string, _isAuthRetry?: boolean): Promise<void> {
     const managed = this.sessions.get(sessionId)
     if (!managed) {
@@ -4545,6 +4906,42 @@ export class SessionManager {
           managed.pauseLocked = false
           sessionLog.info('[stage-gate] Cleared pauseLocked — user-initiated resume via new message')
         }
+      }
+
+      // Inject conversation recovery context for truncated sessions.
+      // After delete/edit/restore, sdkSessionId is cleared and the agent starts fresh.
+      // buildRecoveryContext() only fires on resume-failure, NOT on fresh start.
+      // We must explicitly prepend prior context here.
+      if (managed.pendingContextRecovery && managed.messages.length > 0) {
+        const recoveryMessages = managed.messages
+          .filter(m => m.role === 'user' || m.role === 'assistant')
+          .filter(m => !m.isIntermediate)
+          .slice(-6)  // Last 3 exchanges
+
+        if (recoveryMessages.length > 0) {
+          const formatted = recoveryMessages
+            .map(m => {
+              const role = m.role === 'user' ? 'User' : 'Assistant'
+              const content = m.content.length > 1000
+                ? m.content.slice(0, 1000) + '...[truncated]'
+                : m.content
+              return `[${role}]: ${content}`
+            })
+            .join('\n\n')
+
+          const recoveryContext = `<conversation_recovery>
+This conversation was edited. Here is the recent context:
+
+${formatted}
+
+Continue naturally from where this context ends.
+</conversation_recovery>
+
+`
+          message = recoveryContext + message
+          sessionLog.info('Injected conversation recovery context for truncated session')
+        }
+        managed.pendingContextRecovery = false
       }
 
       sendSpan.mark('chat.starting')

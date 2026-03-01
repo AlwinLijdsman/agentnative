@@ -491,6 +491,7 @@ export function formatStage1PauseMessage(
     lines.push('Shall I proceed?');
     lines.push('1. Yes — start retrieval with the original plan');
     lines.push('2. Modify — I\'d like to adjust something');
+    lines.push('3. Exit — abandon this research and switch to normal chat');
     lines.push('');
 
     if (costInfo) {
@@ -565,6 +566,7 @@ export function formatStage1PauseMessage(
   lines.push('Shall I proceed?');
   lines.push('1. Yes — start retrieval with the refined plan');
   lines.push('2. Modify — I\'d like to adjust something');
+  lines.push('3. Exit — abandon this research and switch to normal chat');
   lines.push('');
 
   // 5. Collapsible Raw JSON — blank lines around fenced code block for rehype-raw

@@ -314,6 +314,16 @@ export interface StageResult {
 // PIPELINE STATE EVENTS — Immutable event log
 // ============================================================================
 
+/**
+ * Classification result from semantic breakout intent detection.
+ * Used when keyword-based detection misses but we suspect off-topic message.
+ *
+ * - 'pipeline_response': User is responding to the paused pipeline (answer, clarification, option choice)
+ * - 'breakout': User is asking about something completely unrelated to the research topic
+ * - 'unclear': Classification confidence too low or classification failed — safe default is to resume
+ */
+export type BreakoutClassification = 'pipeline_response' | 'breakout' | 'unclear';
+
 /** Types of events recorded in the pipeline event log. */
 export type StageEventType =
   | 'stage_started'
@@ -322,7 +332,11 @@ export type StageEventType =
   | 'llm_call'
   | 'pause_requested'
   | 'pause_formatted'
-  | 'resumed';
+  | 'resumed'
+  | 'breakout'
+  | 'breakout_pending'
+  | 'resume_from_breakout'
+  | 'breakout_resume_pending';
 
 /** A single event in the pipeline event log. */
 export interface StageEvent {
@@ -337,11 +351,63 @@ export interface StageEvent {
 }
 
 // ============================================================================
+// PIPELINE SUMMARY — Compact context for post-pipeline conversation turns
+// ============================================================================
+
+/**
+ * Compact summary of a completed (or partial) pipeline run.
+ * Written to `{sessionPath}/data/pipeline-summary.json` after pipeline finishes.
+ * Read by `PromptBuilder.buildOrchestratorSummaryBlock()` on every subsequent turn
+ * to inject research context that survives SDK compaction.
+ *
+ * Designed to be small (~500–1500 chars when serialized) compared to the full
+ * research output (5K–30K chars).
+ */
+export interface PipelineSummary {
+  /** Original research query from Stage 0 query plan. */
+  originalQuery: string;
+  /** High-level synthesis text (truncated if needed). */
+  synthesis: string | null;
+  /** Number of citations in the synthesis. */
+  citationCount: number;
+  /** Confidence level from synthesis stage (e.g., 'high', 'medium', 'low'). */
+  confidence: string | null;
+  /** Verification scores from Stage 4 (if available). */
+  verificationScores: Record<string, unknown> | null;
+  /** Whether the pipeline needed repair iterations. */
+  neededRepair: boolean;
+  /** List of completed stage IDs. */
+  completedStages: number[];
+  /** Total number of stages in the pipeline. */
+  totalStages: number;
+  /** True if the pipeline didn't complete all stages (breakout, error, or partial). */
+  wasPartial: boolean;
+  /** Exit reason: 'completed', 'paused', 'error', or 'breakout'. */
+  exitReason: PipelineExitReason;
+  /** Output file path (if Stage 5 rendered output). */
+  outputPath: string | null;
+  /** ISO timestamp when this summary was generated. */
+  generatedAt: string;
+  // ── Stage 0 detail fields (Phase 5 — enriched compact context) ──
+  /** Sub-query texts from Stage 0 query plan (max first 5). */
+  queryDecomposition?: string[];
+  /** Assumptions from Stage 0 query plan. */
+  assumptions?: string[];
+  /** Primary ISA standards from Stage 0 query plan. */
+  primaryStandards?: string[];
+  /** Clarity score from Stage 0 query plan (0–1). */
+  clarityScore?: number;
+}
+
+// ============================================================================
 // ORCHESTRATOR EVENTS — Yielded to UI via AsyncGenerator
 // ============================================================================
 
 /** Exit reason from processOrchestratorEvents — signals why the generator ended (Section 16 G3). */
 export type OrchestratorExitReason = 'paused' | 'completed' | 'error';
+
+/** Extended exit reason that includes breakout — used for pipeline summary and context injection. */
+export type PipelineExitReason = OrchestratorExitReason | 'breakout';
 
 /** Events yielded by the orchestrator to the UI layer. */
 export type OrchestratorEvent =

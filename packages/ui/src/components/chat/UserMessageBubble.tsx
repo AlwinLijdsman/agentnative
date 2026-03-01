@@ -325,6 +325,10 @@ export interface UserMessageBubbleProps {
   ultrathink?: boolean
   /** Compact mode - reduces padding for popover embedding */
   compactMode?: boolean
+  /** Timestamp of last edit (undefined = never edited) */
+  editedAt?: number
+  /** Original content before first edit */
+  originalContent?: string
 }
 
 export function UserMessageBubble({
@@ -338,6 +342,8 @@ export function UserMessageBubble({
   isQueued,
   ultrathink,
   compactMode,
+  editedAt,
+  originalContent,
 }: UserMessageBubbleProps) {
   const hasAttachments = attachments && attachments.length > 0
 
@@ -458,6 +464,16 @@ export function UserMessageBubble({
       {isQueued && (
         <span className="text-[10px] text-muted-foreground bg-foreground/5 px-2 py-0.5 rounded-full">
           queued
+        </span>
+      )}
+
+      {/* Edited indicator */}
+      {editedAt && (
+        <span
+          className="text-[10px] text-muted-foreground cursor-default"
+          title={originalContent ? `Original: ${originalContent}` : undefined}
+        >
+          (edited)
         </span>
       )}
     </div>

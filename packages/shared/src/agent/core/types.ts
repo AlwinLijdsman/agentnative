@@ -112,6 +112,8 @@ export interface ContextBlockOptions {
   inactiveSources?: LoadedSource[];
   /** Whether local MCP is enabled */
   localMcpEnabled?: boolean;
+  /** Session path for reading orchestrator pipeline summary (absolute path to session directory) */
+  sessionPath?: string;
 }
 
 /**

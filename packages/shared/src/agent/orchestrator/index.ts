@@ -90,6 +90,7 @@ export type {
   OrchestratorConfig,
   OrchestratorEvent,
   OrchestratorOptions,
+  PipelineExitReason,
 } from './types.ts';
 
 // ============================================================================
@@ -336,6 +337,72 @@ export class AgentOrchestrator {
 
     // Continue from the stage AFTER the paused one
     yield* this.executePipeline(resumedState, userResponse, agentConfig, resumeFromStage, followUpContext, skipStages);
+  }
+
+  /**
+   * Resume the orchestrator pipeline after a breakout.
+   *
+   * Unlike resume() which requires isPaused, this method works on pipelines
+   * that were terminated via breakout. It loads state from disk, records a
+   * resume_from_breakout event, and continues from the specified stage.
+   *
+   * @param userMessage - The user's message (may include resume intent)
+   * @param agentConfig - Agent configuration (must match the original run)
+   * @param fromStage - Stage index to resume from (typically lastCompletedStageIndex + 1)
+   * @yields OrchestratorEvent items for the remaining stages
+   */
+  async *resumeFromBreakout(
+    userMessage: string,
+    agentConfig: AgentConfig,
+    fromStage: number,
+  ): AsyncGenerator<OrchestratorEvent> {
+    // Load state from disk
+    const state = PipelineState.loadFrom(this.sessionPath);
+    if (!state) {
+      yield {
+        type: 'orchestrator_error',
+        stage: -1,
+        error: `No saved pipeline state found at ${this.sessionPath}. Cannot resume from breakout.`,
+      };
+      return;
+    }
+
+    if (!state.isResumableAfterBreakout) {
+      yield {
+        type: 'orchestrator_error',
+        stage: -1,
+        error: 'Pipeline is not in a resumable-after-breakout state. Cannot resume.',
+      };
+      return;
+    }
+
+    // Record resume_from_breakout event
+    const resumedState = state.addEvent({
+      type: 'resume_from_breakout',
+      stage: fromStage,
+      data: { userMessage: userMessage.slice(0, 500), fromStage },
+    });
+
+    this.onDebug?.(
+      `[orchestrator] Resume from breakout: fromStage=${fromStage} lastCompleted=${state.lastCompletedStageIndex}`,
+    );
+
+    // Reload follow-up context from PipelineState.previousSessionId
+    let followUpContext: FollowUpContext | null = null;
+    if (resumedState.previousSessionId) {
+      const sessionsDir = dirname(this.sessionPath);
+      followUpContext = loadFollowUpContext(sessionsDir, resumedState.previousSessionId);
+      this.onDebug?.(
+        `[orchestrator] Resume-from-breakout follow-up context: ${
+          followUpContext
+            ? `loaded (followup #${followUpContext.followupNumber})`
+            : 'not found'
+        } (previousSessionId=${resumedState.previousSessionId})`,
+      );
+    }
+
+    // Continue from the specified stage
+    yield* this.executePipeline(resumedState, userMessage, agentConfig, fromStage, followUpContext);
   }
 
   // ──────────────────────────────────────────────────────────────────────────
