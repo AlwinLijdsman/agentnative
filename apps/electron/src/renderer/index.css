@@ -944,6 +944,34 @@ html.dark[data-scenic] .fullscreen-overlay-background {
 }
 
 /* =============================================================================
+   PIPELINE PROGRESS — Segmented progress bar animations
+============================================================================= */
+
+/* Bloom breathing for completed segments */
+@keyframes pipeline-glow-breathe {
+  0%, 100% { filter: brightness(1) drop-shadow(0 0 2px rgba(147, 51, 234, 0.3)); }
+  50%      { filter: brightness(1.15) drop-shadow(0 0 6px rgba(147, 51, 234, 0.5)); }
+}
+
+/* Brighter bloom for active segment */
+@keyframes pipeline-glow-active {
+  0%, 100% { filter: brightness(1.05) drop-shadow(0 0 3px rgba(147, 51, 234, 0.4)); }
+  50%      { filter: brightness(1.25) drop-shadow(0 0 8px rgba(147, 51, 234, 0.6)); }
+}
+
+/* Specular sweep (glass highlight flowing across) */
+@keyframes pipeline-specular-sweep {
+  0%   { transform: translateX(-120%); }
+  100% { transform: translateX(220%); }
+}
+
+/* Gradient background shift for active fill */
+@keyframes pipeline-gradient-shift {
+  0%, 100% { background-position: 0% 50%; }
+  50%      { background-position: 100% 50%; }
+}
+
+/* =============================================================================
    SHAKE ANIMATION
 
    Horizontal shake for invalid actions (e.g., trying to disable last mode).

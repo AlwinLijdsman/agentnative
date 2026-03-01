@@ -491,6 +491,28 @@ export interface AgentStageGatePauseEvent {
 }
 
 /**
+ * Messages truncated event — conversation history was truncated (delete/edit/restore)
+ */
+export interface MessagesTruncatedEvent {
+  type: 'messages_truncated'
+  sessionId: string
+  messages: import('../../shared/types').Message[]
+  restoredContent?: string
+}
+
+/**
+ * Message edited event — a user message was edited in place
+ */
+export interface MessageEditedEvent {
+  type: 'message_edited'
+  sessionId: string
+  messageId: string
+  newContent: string
+  editedAt: number
+  originalContent?: string
+}
+
+/**
  * Union of all agent events
  */
 export type AgentEvent =
@@ -538,6 +560,8 @@ export type AgentEvent =
   | AgentRepairIterationEvent
   | AgentRunCompletedEvent
   | AgentStageGatePauseEvent
+  | MessagesTruncatedEvent
+  | MessageEditedEvent
 
 /**
  * Side effects that need to be handled outside the pure processor
@@ -548,7 +572,8 @@ export type Effect =
   | { type: 'generate_title'; sessionId: string; userMessage: string }
   | { type: 'permission_mode_changed'; sessionId: string; permissionMode: PermissionMode }
   | { type: 'auto_retry'; sessionId: string; originalMessage: string; sourceSlug: string }
-  | { type: 'agent_run_state_update'; agentSlug: string; runId: string; currentStage: number; stageName: string; isRunning: boolean }
+  | { type: 'agent_run_state_update'; agentSlug: string; runId: string; currentStage: number; stageName: string; isRunning: boolean; isCompleted?: boolean; isPaused?: boolean; sessionId: string }
+  | { type: 'agent_run_state_clear'; sessionId: string }
 
 /**
  * Result of processing an event

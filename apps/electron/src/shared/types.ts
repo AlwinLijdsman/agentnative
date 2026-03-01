@@ -508,6 +508,9 @@ export type SessionEvent =
   | { type: 'agent_repair_iteration'; sessionId: string; agentSlug: string; runId: string; iteration: number; scores?: Record<string, number> }
   | { type: 'agent_run_completed'; sessionId: string; agentSlug: string; runId: string; verificationStatus: string }
   | { type: 'agent_stage_gate_pause'; sessionId: string; agentSlug: string; runId: string; stage: number; data?: Record<string, unknown> }
+  // Conversation history management
+  | { type: 'messages_truncated'; sessionId: string; messages: Message[]; restoredContent?: string }
+  | { type: 'message_edited'; sessionId: string; messageId: string; newContent: string; editedAt: number; originalContent?: string }
 
 // Options for sendMessage
 export interface SendMessageOptions {
@@ -563,6 +566,13 @@ export type SessionCommand =
   | { type: 'updateSiblingOrder'; orderedSessionIds: string[] }
   | { type: 'archiveCascade' }
   | { type: 'deleteCascade' }
+  // Conversation history management (delete, edit, restore, branch)
+  /** @deprecated Use deleteSingleMessage instead — this cascades (removes target + all after) */
+  | { type: 'deleteFromMessage'; messageId: string }
+  | { type: 'deleteSingleMessage'; messageId: string }
+  | { type: 'editMessage'; messageId: string; newContent: string }
+  | { type: 'restoreCheckpoint'; afterMessageId: string; inclusive?: boolean }
+  | { type: 'branchFromMessage'; messageId: string }
 
 /**
  * Session family information (parent + siblings)
@@ -919,7 +929,7 @@ export interface ElectronAPI {
   respondToCredential(sessionId: string, requestId: string, response: CredentialResponse): Promise<boolean>
 
   // Consolidated session command handler
-  sessionCommand(sessionId: string, command: SessionCommand): Promise<void | ShareResult | RefreshTitleResult | SessionFamily | { count: number }>
+  sessionCommand(sessionId: string, command: SessionCommand): Promise<void | ShareResult | RefreshTitleResult | SessionFamily | { count: number } | Session>
 
   // Pending plan execution (for reload recovery)
   getPendingPlanExecution(sessionId: string): Promise<{ planPath: string; awaitingCompaction: boolean } | null>

@@ -1,9 +1,9 @@
 {
-  "timestamp": "2026-02-27T12:59:58.973Z",
+  "timestamp": "2026-02-28T18:00:15.701Z",
   "query": "What should I consider when testing insurance reserves under ISA 540?",
-  "totalDurationSec": 248.429,
-  "totalCostUsd": 0.37721,
-  "pipelineCompleted": true,
+  "totalDurationSec": 713.992,
+  "totalCostUsd": 0.046095000000000004,
+  "pipelineCompleted": false,
   "allOrchestrator": true,
   "stageReports": [
     {
@@ -11,15 +11,15 @@
       "stageName": "analyze_query",
       "verdict": "PASS",
       "method": "LLM",
-      "duration": 31.591,
-      "notes": "Paused correctly. 470 stream chunks. Output: **Query Analysis Complete** — Clarity: 82% (above 70% threshold)\n\n**Assumptions*..."
+      "duration": 28.297,
+      "notes": "Paused correctly. 417 stream chunks. Output: **Query Analysis Complete** — Clarity: 85% (above 70% threshold)\n\n**Assumptions*..."
     },
     {
       "stageId": 1,
       "stageName": "websearch_calibration",
       "verdict": "PASS",
       "method": "LLM",
-      "duration": 0.004,
+      "duration": 0.003,
       "notes": "Paused correctly. 0 stream chunks. Output: **Web Search Calibration — UNAVAILABLE**\n\nWeb search could not run because MCP b..."
     },
     {
@@ -27,48 +27,45 @@
       "stageName": "retrieve",
       "verdict": "PASS",
       "method": "MCP",
-      "duration": 0.001,
+      "duration": 0,
       "notes": "Gracefully skipped (no MCP bridge) — returned empty result"
     },
     {
       "stageId": 3,
       "stageName": "synthesize",
-      "verdict": "PASS",
+      "verdict": "FAIL",
       "method": "LLM",
-      "duration": 216.824,
-      "notes": "LLM call completed. Streaming OK"
+      "duration": 685.689,
+      "notes": "Error: terminated"
     },
     {
       "stageId": 4,
       "stageName": "verify",
-      "verdict": "PASS",
+      "verdict": "FAIL",
       "method": "MCP",
-      "duration": 0.001,
-      "notes": "Gracefully skipped (no MCP bridge) — returned empty result"
+      "duration": 0,
+      "notes": "Stage never started — pipeline may have stopped early"
     },
     {
       "stageId": 5,
       "stageName": "output",
-      "verdict": "PASS",
+      "verdict": "FAIL",
       "method": "Render",
-      "duration": 0.007,
-      "notes": "Deterministic render completed"
+      "duration": 0,
+      "notes": "Stage never started — pipeline may have stopped early"
     }
   ],
   "eventSequence": [
     "start(0)",
+    "orchestrator_substep",
+    "orchestrator_substep",
     "pause(0)",
     "start(1)",
     "pause(1)",
     "start(2)",
     "done(2)",
     "start(3)",
-    "done(3)",
-    "start(4)",
-    "done(4)",
-    "start(5)",
-    "done(5)",
-    "COMPLETE"
+    "err(3)"
   ],
-  "allStagesPass": true
+  "allStagesPass": false
 }

@@ -39,10 +39,13 @@ import {
 } from "@craft-agent/ui"
 import { useFocusZone } from "@/hooks/keyboard"
 import { useTheme } from "@/hooks/useTheme"
+import { useSetAtom } from 'jotai'
+import { agentRunStateAtom } from '@/atoms/agents'
+import { SegmentedProgressBar } from "@/components/chat/SegmentedProgressBar"
 import type { Session, Message, FileAttachment, StoredAttachment, PermissionRequest, CredentialRequest, CredentialResponse, LoadedSource, LoadedSkill } from "../../../shared/types"
 import type { PermissionMode } from "@craft-agent/shared/agent/modes"
 import type { ThinkingLevel } from "@craft-agent/shared/agent/thinking-levels"
-import { TurnCard, UserMessageBubble, groupMessagesByTurn, formatTurnAsMarkdown, formatActivityAsMarkdown, type Turn, type AssistantTurn, type UserTurn, type SystemTurn, type AuthRequestTurn } from "@craft-agent/ui"
+import { TurnCard, UserMessageBubble, UserMessageActionsMenu, groupMessagesByTurn, formatTurnAsMarkdown, formatActivityAsMarkdown, type Turn, type AssistantTurn, type UserTurn, type SystemTurn, type AuthRequestTurn } from "@craft-agent/ui"
 import { MemoizedAuthRequestCard } from "@/components/chat/AuthRequestCard"
 import { ActiveOptionBadges } from "./ActiveOptionBadges"
 import { InputContainer, type StructuredInputState, type StructuredResponse, type PermissionResponse } from "./input"
@@ -436,6 +439,7 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
   // Input is only disabled when explicitly disabled (e.g., agent needs activation)
   // User can type during streaming - submitting will stop the stream and send
   const isInputDisabled = disabled
+  const setAgentRunState = useSetAtom(agentRunStateAtom)
   const messagesEndRef = React.useRef<HTMLDivElement>(null)
   const scrollViewportRef = React.useRef<HTMLDivElement>(null)
   const prevSessionIdRef = React.useRef<string | null>(null)
@@ -477,6 +481,10 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
   // Track which label should auto-open its value popover after being added via # menu.
   // Set when a valued label is selected, cleared once the popover opens.
   const [autoOpenLabelId, setAutoOpenLabelId] = useState<string | null>(null)
+
+  // Edit mode: messageId being edited (null = not editing)
+  const [editingMessageId, setEditingMessageId] = useState<string | null>(null)
+  const [editContent, setEditContent] = useState('')
 
   // ============================================================================
   // Search Highlighting (from session list search)
@@ -1241,6 +1249,24 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
           <div className="flex flex-1 flex-col min-h-0 min-w-0 relative z-10">
           {/* === MESSAGES AREA: Scrollable list of message bubbles === */}
           <div className="relative flex-1 min-h-0">
+            {/* Pipeline progress overlay */}
+            {!compactMode && session && (
+              <SegmentedProgressBar
+                sessionId={session.id}
+                agents={agents || []}
+                pausedAgent={session.pausedAgent}
+                onInterrupt={() => window.electronAPI.cancelProcessing(session.id, false)}
+                onDismiss={() => {
+                  setAgentRunState(prev => {
+                    const next = { ...prev }
+                    for (const [k, v] of Object.entries(next)) {
+                      if (v.sessionId === session.id) delete next[k]
+                    }
+                    return next
+                  })
+                }}
+              />
+            )}
             {/* Mask wrapper - fades content at top and bottom over transparent/image backgrounds */}
             <div
               className="h-full"
@@ -1321,23 +1347,77 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
                     // User turns - render with MemoizedMessageBubble
                     // Extra padding creates visual separation from AI responses
                     if (turn.type === 'user') {
+                      const userMsg = turn.message
+                      const isEditing = editingMessageId === userMsg.id
                       return (
                         <div
                           key={turnKey}
                           ref={el => { if (el) turnRefs.current.set(turnKey, el); else turnRefs.current.delete(turnKey) }}
                           className={cn(
                             CHAT_LAYOUT.userMessagePadding,
-                            "rounded-lg transition-all duration-200",
+                            "rounded-lg transition-all duration-200 group relative",
                             isCurrentMatch && "ring-2 ring-info ring-offset-2 ring-offset-background",
                             isAnyMatch && !isCurrentMatch && "ring-1 ring-info/30"
                           )}
                         >
-                          <MemoizedMessageBubble
-                            message={turn.message}
-                            onOpenFile={onOpenFile}
-                            onOpenUrl={onOpenUrl}
-                            compactMode={compactMode}
-                          />
+                          {isEditing ? (
+                            <div className="flex flex-col gap-2 p-3 rounded-lg bg-muted/50 border border-border">
+                              <textarea
+                                className="w-full min-h-[80px] p-2 rounded-md bg-background border border-border text-sm resize-y focus:outline-none focus:ring-1 focus:ring-ring"
+                                value={editContent}
+                                onChange={e => setEditContent(e.target.value)}
+                                autoFocus
+                              />
+                              <div className="flex justify-end gap-2">
+                                <button
+                                  className="px-3 py-1.5 text-xs rounded-md bg-muted hover:bg-muted/80 transition-colors"
+                                  onClick={() => { setEditingMessageId(null); setEditContent('') }}
+                                >
+                                  Cancel
+                                </button>
+                                <button
+                                  className="px-3 py-1.5 text-xs rounded-md bg-primary text-primary-foreground hover:bg-primary/90 transition-colors"
+                                  onClick={() => {
+                                    if (session && editContent.trim()) {
+                                      window.electronAPI.sessionCommand(session.id, { type: 'editMessage', messageId: userMsg.id, newContent: editContent.trim() })
+                                    }
+                                    setEditingMessageId(null)
+                                    setEditContent('')
+                                  }}
+                                >
+                                  Save
+                                </button>
+                              </div>
+                            </div>
+                          ) : (
+                            <>
+                              <MemoizedMessageBubble
+                                message={userMsg}
+                                onOpenFile={onOpenFile}
+                                onOpenUrl={onOpenUrl}
+                                compactMode={compactMode}
+                              />
+                              {session && !session.isProcessing && (
+                                <div className="absolute -top-3 right-1 z-10">
+                                  <UserMessageActionsMenu
+                                    onEdit={() => { setEditingMessageId(userMsg.id); setEditContent(userMsg.content) }}
+                                    onDelete={() => {
+                                      window.electronAPI.sessionCommand(session.id, { type: 'deleteSingleMessage', messageId: userMsg.id })
+                                    }}
+                                    onBranch={() => {
+                                      window.electronAPI.sessionCommand(session.id, { type: 'branchFromMessage', messageId: userMsg.id })
+                                    }}
+                                    onCopy={() => {
+                                      navigator.clipboard.writeText(userMsg.content)
+                                    }}
+                                    onRestore={() => {
+                                      window.electronAPI.sessionCommand(session.id, { type: 'restoreCheckpoint', afterMessageId: userMsg.id, inclusive: true })
+                                    }}
+                                  />
+                                </div>
+                              )}
+                            </>
+                          )}
                         </div>
                       )
                     }
@@ -1349,7 +1429,7 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
                           key={turnKey}
                           ref={el => { if (el) turnRefs.current.set(turnKey, el); else turnRefs.current.delete(turnKey) }}
                           className={cn(
-                            "rounded-lg transition-all duration-200",
+                            "rounded-lg transition-all duration-200 group relative",
                             isCurrentMatch && "ring-2 ring-info ring-offset-2 ring-offset-background",
                             isAnyMatch && !isCurrentMatch && "ring-1 ring-info/30"
                           )}
@@ -1359,6 +1439,24 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
                             onOpenFile={onOpenFile}
                             onOpenUrl={onOpenUrl}
                           />
+                          {session && !session.isProcessing && (
+                            <div className="absolute -top-3 right-1 z-10">
+                              <UserMessageActionsMenu
+                                onDelete={() => {
+                                  window.electronAPI.sessionCommand(session.id, { type: 'deleteSingleMessage', messageId: turn.message.id })
+                                }}
+                                onBranch={() => {
+                                  window.electronAPI.sessionCommand(session.id, { type: 'branchFromMessage', messageId: turn.message.id })
+                                }}
+                                onCopy={() => {
+                                  navigator.clipboard.writeText(turn.message.content)
+                                }}
+                                onRestore={() => {
+                                  window.electronAPI.sessionCommand(session.id, { type: 'restoreCheckpoint', afterMessageId: turn.message.id })
+                                }}
+                              />
+                            </div>
+                          )}
                         </div>
                       )
                     }
@@ -1497,6 +1595,32 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
                             })
                           }
                         }}
+                        onDelete={session && !session.isProcessing ? () => {
+                          // Delete the first message in this turn (single-message delete)
+                          const firstActivityMsg = turn.activities[0]
+                          if (firstActivityMsg) {
+                            window.electronAPI.sessionCommand(session.id, { type: 'deleteSingleMessage', messageId: firstActivityMsg.id })
+                          }
+                        } : undefined}
+                        onRestore={session && !session.isProcessing ? () => {
+                          // Restore to the last message in this turn
+                          const lastActivity = turn.activities[turn.activities.length - 1]
+                          const lastMsgId = turn.response?.messageId || lastActivity?.id
+                          if (lastMsgId) {
+                            window.electronAPI.sessionCommand(session.id, { type: 'restoreCheckpoint', afterMessageId: lastMsgId })
+                          }
+                        } : undefined}
+                        onBranch={session && !session.isProcessing ? () => {
+                          // Branch from the last message in this turn
+                          const lastActivity = turn.activities[turn.activities.length - 1]
+                          const lastMsgId = turn.response?.messageId || lastActivity?.id
+                          if (lastMsgId) {
+                            window.electronAPI.sessionCommand(session.id, { type: 'branchFromMessage', messageId: lastMsgId })
+                          }
+                        } : undefined}
+                        onCopy={session ? () => {
+                          navigator.clipboard.writeText(turn.response?.text ?? '')
+                        } : undefined}
                       />
                       </div>
                     )
@@ -1863,6 +1987,8 @@ function MessageBubble({
         onUrlClick={onOpenUrl}
         onFileClick={onOpenFile}
         compactMode={compactMode}
+        editedAt={message.editedAt}
+        originalContent={message.originalContent}
       />
     )
   }
@@ -1997,6 +2123,7 @@ const MemoizedMessageBubble = React.memo(MessageBubble, (prev, next) => {
     prev.message.id === next.message.id &&
     prev.message.content === next.message.content &&
     prev.message.role === next.message.role &&
+    prev.message.editedAt === next.message.editedAt &&
     prev.compactMode === next.compactMode
   )
 })

@@ -156,6 +156,20 @@ export const SIZE_CONFIG = {
 } as const
 
 // ============================================================================
+// Orchestrator Detection
+// ============================================================================
+
+/** Tool name prefixes that indicate an orchestrator pipeline turn */
+const ORCHESTRATOR_TOOL_PREFIXES = ['agent_stage_gate', 'orchestrator']
+
+/** Check if a turn contains orchestrator pipeline activities */
+export function isOrchestratorTurn(activities: ActivityItem[]): boolean {
+  return activities.some(a =>
+    a.type === 'tool' && ORCHESTRATOR_TOOL_PREFIXES.some(p => a.toolName?.startsWith(p))
+  )
+}
+
+// ============================================================================
 // Types
 // ============================================================================
 
@@ -271,6 +285,14 @@ export interface TurnCardProps {
   animateResponse?: boolean
   /** Hide footers for compact embedding (EditPopover) */
   compactMode?: boolean
+  /** Callback to delete this turn and all subsequent turns */
+  onDelete?: () => void
+  /** Callback to restore checkpoint to end of this turn */
+  onRestore?: () => void
+  /** Callback to branch from this turn into a new conversation */
+  onBranch?: () => void
+  /** Callback to copy turn response content */
+  onCopy?: () => void
 }
 
 // ============================================================================
@@ -1317,6 +1339,8 @@ export interface ResponseCardProps {
   showAcceptPlan?: boolean
   /** Hide footer for compact embedding (EditPopover) */
   compactMode?: boolean
+  /** Whether this response is from an orchestrator pipeline (gradient accent styling) */
+  isOrchestrator?: boolean
 }
 
 const MAX_HEIGHT = 540
@@ -1350,6 +1374,7 @@ export function ResponseCard({
   isLastResponse = true,
   showAcceptPlan = true,
   compactMode = false,
+  isOrchestrator = false,
 }: ResponseCardProps) {
   // Throttled content for display - updates every CONTENT_THROTTLE_MS during streaming
   const [displayedText, setDisplayedText] = useState(text)
@@ -1429,7 +1454,27 @@ export function ResponseCard({
 
     return (
       <>
-        <div className="bg-background shadow-minimal rounded-[8px] overflow-hidden relative group">
+        <div
+          className={cn(
+            "rounded-[8px] overflow-hidden relative group",
+            isOrchestrator
+              ? "shadow-tinted"
+              : "bg-background shadow-minimal"
+          )}
+          style={isOrchestrator ? {
+            '--shadow-color': '147, 51, 234',
+            background: 'linear-gradient(135deg, rgba(37,99,235,0.03), rgba(147,51,234,0.03), rgba(219,39,119,0.03))',
+          } as React.CSSProperties : undefined}
+        >
+          {/* Gradient left border accent — only for orchestrator */}
+          {isOrchestrator && (
+            <div
+              className="absolute top-0 bottom-0 left-0 w-[2px] rounded-l-[8px]"
+              style={{
+                background: 'linear-gradient(to bottom, #2563eb, #9333ea, #db2777)',
+              }}
+            />
+          )}
           {/* Fullscreen button - top right corner, visible on hover */}
           <button
             onClick={() => setIsFullscreen(true)}
@@ -1560,7 +1605,27 @@ export function ResponseCard({
 
   // Streaming response - show throttled content with spinner
   return (
-    <div className="bg-background shadow-minimal rounded-[8px] overflow-hidden">
+    <div
+      className={cn(
+        "rounded-[8px] overflow-hidden relative",
+        isOrchestrator
+          ? "shadow-tinted"
+          : "bg-background shadow-minimal"
+      )}
+      style={isOrchestrator ? {
+        '--shadow-color': '147, 51, 234',
+        background: 'linear-gradient(135deg, rgba(37,99,235,0.03), rgba(147,51,234,0.03), rgba(219,39,119,0.03))',
+      } as React.CSSProperties : undefined}
+    >
+      {/* Gradient left border accent — only for orchestrator */}
+      {isOrchestrator && (
+        <div
+          className="absolute top-0 bottom-0 left-0 w-[2px] rounded-l-[8px]"
+          style={{
+            background: 'linear-gradient(to bottom, #2563eb, #9333ea, #db2777)',
+          }}
+        />
+      )}
       {/* Content area - uses displayedText (throttled) for performance */}
       {/* Subtle fade at top and bottom edges (dark mode only) */}
       <div
@@ -1715,6 +1780,10 @@ export const TurnCard = React.memo(function TurnCard({
   displayMode = 'detailed',
   animateResponse = false,
   compactMode = false,
+  onDelete,
+  onRestore,
+  onBranch,
+  onCopy,
 }: TurnCardProps) {
   // Derive the turn phase from props using the state machine.
   // This provides a single source of truth for lifecycle state,
@@ -1728,6 +1797,9 @@ export const TurnCard = React.memo(function TurnCard({
     }
     return deriveTurnPhase(turnData as AssistantTurn)
   }, [isComplete, response, activities])
+
+  // Detect if this turn is from the orchestrator pipeline
+  const isOrchestrator = useMemo(() => isOrchestratorTurn(activities), [activities])
 
   // Use local state if no controlled state provided
   const [localExpandedTurns, setLocalExpandedTurns] = useState<Set<string>>(() => defaultExpanded ? new Set([turnId]) : new Set())
@@ -1924,6 +1996,11 @@ export const TurnCard = React.memo(function TurnCard({
                 onOpenDetails={onOpenDetails}
                 onOpenMultiFileDiff={onOpenMultiFileDiff}
                 hasEditOrWriteActivities={hasEditOrWriteActivities}
+                onDelete={onDelete}
+                onRestore={onRestore}
+                onBranch={onBranch}
+                onCopy={onCopy}
+                isComplete={isComplete}
               />
             )}
           </button>
@@ -2092,6 +2169,7 @@ export const TurnCard = React.memo(function TurnCard({
                 onAcceptWithCompact={onAcceptPlanWithCompact}
                 isLastResponse={isLastResponse}
                 compactMode={compactMode}
+                isOrchestrator={isOrchestrator}
               />
             </motion.div>
           )}
@@ -2112,6 +2190,7 @@ export const TurnCard = React.memo(function TurnCard({
             onAcceptWithCompact={onAcceptPlanWithCompact}
             isLastResponse={isLastResponse}
             compactMode={compactMode}
+            isOrchestrator={isOrchestrator}
           />
         </div>
       )}

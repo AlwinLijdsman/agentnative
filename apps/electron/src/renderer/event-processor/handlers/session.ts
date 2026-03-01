@@ -39,6 +39,8 @@ import type {
   AuthCompletedEvent,
   UsageUpdateEvent,
   TodosUpdatedEvent,
+  MessagesTruncatedEvent,
+  MessageEditedEvent,
 } from '../types'
 import type { Message } from '../../../shared/types'
 import { generateMessageId, appendMessage } from '../helpers'
@@ -295,10 +297,11 @@ export function handleInterrupted(
         isProcessing: false,
         messages,
         currentStatus: undefined,  // Clear any lingering status
+        pausedAgent: undefined,
       },
       streaming: null,
     },
-    effects: [],
+    effects: [{ type: 'agent_run_state_clear', sessionId: event.sessionId }],
   }
 }
 
@@ -884,6 +887,62 @@ export function handleTodosUpdated(
     state: {
       session: appendMessage(session, syntheticTodoMessage),
       streaming,
+    },
+    effects: [],
+  }
+}
+
+/**
+ * Handle messages_truncated — conversation history was truncated (delete/edit/restore)
+ *
+ * Replaces the entire messages array and clears processing state.
+ */
+export function handleMessagesTruncated(
+  state: SessionState,
+  event: MessagesTruncatedEvent
+): ProcessResult {
+  // If restoredContent is present, emit a custom DOM event to populate the input box
+  if (event.restoredContent) {
+    window.dispatchEvent(
+      new CustomEvent('craft:restore-input', {
+        detail: { content: event.restoredContent, sessionId: event.sessionId },
+      })
+    )
+  }
+
+  return {
+    state: {
+      ...state,
+      session: {
+        ...state.session,
+        messages: event.messages,
+        isProcessing: false,
+      },
+    },
+    effects: [],
+  }
+}
+
+/**
+ * Handle message_edited — a user message was edited in place
+ *
+ * Updates the message content, editedAt timestamp, and originalContent in state.
+ */
+export function handleMessageEdited(
+  state: SessionState,
+  event: MessageEditedEvent
+): ProcessResult {
+  return {
+    state: {
+      ...state,
+      session: {
+        ...state.session,
+        messages: state.session.messages.map(m =>
+          m.id === event.messageId
+            ? { ...m, content: event.newContent, editedAt: event.editedAt, originalContent: event.originalContent }
+            : m
+        ),
+      },
     },
     effects: [],
   }

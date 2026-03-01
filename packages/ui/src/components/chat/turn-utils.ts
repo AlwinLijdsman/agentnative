@@ -78,6 +78,9 @@ export function storedToMessage(stored: StoredMessage): Message {
     authError: stored.authError,
     authEmail: stored.authEmail,
     authWorkspace: stored.authWorkspace,
+    // Edit history
+    editedAt: stored.editedAt,
+    originalContent: stored.originalContent,
   }
 }
 

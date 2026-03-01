@@ -47,6 +47,8 @@ import {
   handleAuthCompleted,
   handleUsageUpdate,
   handleTodosUpdated,
+  handleMessagesTruncated,
+  handleMessageEdited,
 } from './handlers/session'
 
 /**
@@ -219,6 +221,7 @@ export function processEvent(
           currentStage: event.stage,
           stageName: event.stageName,
           isRunning: true,
+          sessionId: event.sessionId,
         }],
       }
     case 'agent_stage_completed':
@@ -231,11 +234,12 @@ export function processEvent(
           currentStage: event.stage,
           stageName: event.stageName,
           isRunning: true,
+          sessionId: event.sessionId,
         }],
       }
     case 'agent_run_completed':
       return {
-        state: { ...state, session: { ...state.session } },
+        state: { ...state, session: { ...state.session, pausedAgent: undefined } },
         effects: [{
           type: 'agent_run_state_update',
           agentSlug: event.agentSlug,
@@ -243,6 +247,8 @@ export function processEvent(
           currentStage: -1,
           stageName: '',
           isRunning: false,
+          isCompleted: true,
+          sessionId: event.sessionId,
         }],
       }
     case 'agent_repair_iteration':
@@ -271,8 +277,14 @@ export function processEvent(
           currentStage: event.stage,
           stageName: '',
           isRunning: false,
+          isPaused: true,
+          sessionId: event.sessionId,
         }],
       }
+    case 'messages_truncated':
+      return handleMessagesTruncated(state, event)
+    case 'message_edited':
+      return handleMessageEdited(state, event)
     default: {
       // Unknown event type - return state unchanged but as new reference
       // to ensure atom sync detects the "change"

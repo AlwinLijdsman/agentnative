@@ -613,6 +613,17 @@ export function registerIpcHandlers(sessionManager: SessionManager, windowManage
         return sessionManager.archiveSessionCascade(sessionId)
       case 'deleteCascade':
         return sessionManager.deleteSessionCascade(sessionId)
+      // Conversation history management (delete, edit, restore, branch)
+      case 'deleteFromMessage':
+        return sessionManager.deleteFromMessage(sessionId, command.messageId)
+      case 'deleteSingleMessage':
+        return sessionManager.deleteSingleMessage(sessionId, command.messageId)
+      case 'editMessage':
+        return sessionManager.editMessageInPlace(sessionId, command.messageId, command.newContent)
+      case 'restoreCheckpoint':
+        return sessionManager.restoreCheckpoint(sessionId, command.afterMessageId, command.inclusive)
+      case 'branchFromMessage':
+        return sessionManager.branchFromMessage(sessionId, command.messageId)
       default: {
         const _exhaustive: never = command
         throw new Error(`Unknown session command: ${JSON.stringify(command)}`)

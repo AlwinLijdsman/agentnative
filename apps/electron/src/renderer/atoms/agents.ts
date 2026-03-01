@@ -18,7 +18,8 @@ export const agentsAtom = atom<LoadedAgent[]>([])
 /**
  * Live run state for real-time updates (populated by event processor).
  * Keyed by agentSlug — only one active run per agent at a time.
- * When a run completes, the entry is deleted from this map.
+ * On completion, entry persists with isCompleted: true until user dismisses or a new run starts.
+ * On pause, entry persists with isPaused: true so progress bar stays visible.
  */
 export const agentRunStateAtom = atom<Record<string, {
   agentSlug: string
@@ -26,4 +27,7 @@ export const agentRunStateAtom = atom<Record<string, {
   currentStage: number
   stageName: string
   isRunning: boolean
+  isCompleted?: boolean
+  isPaused?: boolean
+  sessionId: string
 }>>({})

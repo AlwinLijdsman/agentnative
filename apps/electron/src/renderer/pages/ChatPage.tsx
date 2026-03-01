@@ -167,6 +167,20 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
     onInputChange(sessionId, value)
   }, [sessionId, onInputChange])
 
+  // Listen for restore-input events (from restoreCheckpoint) to populate the input box
+  React.useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent<{ content: string; sessionId: string }>).detail
+      if (detail.sessionId === sessionId) {
+        setInputValue(detail.content)
+        inputValueRef.current = detail.content
+        onInputChange(sessionId, detail.content)
+      }
+    }
+    window.addEventListener('craft:restore-input', handler)
+    return () => window.removeEventListener('craft:restore-input', handler)
+  }, [sessionId, onInputChange])
+
   // Session model change handler - persists per-session model and connection
   const handleModelChange = React.useCallback((model: string, connection?: string) => {
     if (activeWorkspaceId) {

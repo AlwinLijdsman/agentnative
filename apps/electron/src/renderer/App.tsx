@@ -461,7 +461,7 @@ export default function App() {
     // Handoff events signal end of streaming - need to sync back to React state
     // Also includes todo_state_changed so status updates immediately reflect in sidebar
     // async_operation included so shimmer effect on session titles updates in real-time
-    const handoffEventTypes = new Set(['complete', 'error', 'interrupted', 'typed_error', 'todo_state_changed', 'session_flagged', 'session_unflagged', 'name_changed', 'labels_changed', 'title_generated', 'async_operation'])
+    const handoffEventTypes = new Set(['complete', 'error', 'interrupted', 'typed_error', 'todo_state_changed', 'session_flagged', 'session_unflagged', 'name_changed', 'labels_changed', 'title_generated', 'async_operation', 'messages_truncated', 'message_edited'])
 
     // Helper to handle side effects (same logic for both paths)
     const handleEffects = (effects: Effect[], sessionId: string, eventType: string) => {
@@ -517,14 +517,51 @@ export default function App() {
                   currentStage: effect.currentStage,
                   stageName: effect.stageName,
                   isRunning: true,
+                  sessionId: effect.sessionId,
+                },
+              })
+            } else if (effect.isCompleted) {
+              // Pipeline completed — keep entry for persistent "all done" display
+              store.set(agentRunStateAtom, {
+                ...prev,
+                [key]: {
+                  ...prev[key],  // preserve last known currentStage
+                  agentSlug: effect.agentSlug,
+                  runId: effect.runId,
+                  isRunning: false,
+                  isCompleted: true,
+                  sessionId: effect.sessionId,
+                },
+              })
+            } else if (effect.isPaused) {
+              // Pipeline paused at stage gate — keep entry so progress bar stays visible
+              store.set(agentRunStateAtom, {
+                ...prev,
+                [key]: {
+                  ...prev[key],
+                  agentSlug: effect.agentSlug,
+                  runId: effect.runId,
+                  currentStage: effect.currentStage,
+                  isRunning: false,
+                  isPaused: true,
+                  sessionId: effect.sessionId,
                 },
               })
             } else {
-              // Run completed — remove from live state
+              // Other — remove from live state
               const next = { ...prev }
               delete next[key]
               store.set(agentRunStateAtom, next)
             }
+            break
+          }
+          case 'agent_run_state_clear': {
+            // Clear all run entries for this session (e.g., on interruption)
+            const prev = store.get(agentRunStateAtom)
+            const next = Object.fromEntries(
+              Object.entries(prev).filter(([_, v]) => v.sessionId !== effect.sessionId)
+            )
+            store.set(agentRunStateAtom, next)
             break
           }
         }
