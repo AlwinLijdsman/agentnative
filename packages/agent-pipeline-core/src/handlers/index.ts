@@ -5,7 +5,7 @@
  */
 
 // Agent Stage Gate
-export { handleAgentStageGate } from './agent-stage-gate.ts';
+export { handleAgentStageGate, setBreakoutScope, clearBreakoutScope } from './agent-stage-gate.ts';
 export type { AgentStageGateArgs } from './agent-stage-gate.ts';
 
 // Agent State

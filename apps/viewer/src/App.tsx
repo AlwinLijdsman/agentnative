@@ -278,6 +278,7 @@ export function App() {
           title={overlayData.title}
           theme={theme}
           error={overlayData.error}
+          sizeBytes={overlayData.sizeBytes}
         />
       )}
 

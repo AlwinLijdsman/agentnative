@@ -13,6 +13,7 @@
  */
 
 import type { z } from 'zod';
+import type { StageOutputSchema } from '@craft-agent/agent-pipeline-core';
 
 // ============================================================================
 // STREAM EVENTS — Progress callbacks for UI
@@ -111,6 +112,16 @@ export interface StageCostRecord {
 // STAGE CONFIGURATION — From agent config.json
 // ============================================================================
 
+/**
+ * Stage execution mode.
+ * - 'orchestrator': Direct LLM API call via OrchestratorLlmClient (default)
+ * - 'sdk_breakout': Yields control to SDK conversation for full tool access
+ */
+export type StageMode = 'orchestrator' | 'sdk_breakout';
+
+/** Resume action parsed from user response at a pause point. */
+export type ResumeAction = 'proceed' | 'amend' | 'cancel';
+
 /** Configuration for a single pipeline stage (from agent config.json). */
 export interface StageConfig {
   /** Unique stage identifier (0-based). */
@@ -119,6 +130,14 @@ export interface StageConfig {
   name: string;
   /** Human-readable description for UI/logging. */
   description?: string;
+  /** Execution mode — 'orchestrator' (default) or 'sdk_breakout'. */
+  mode?: StageMode;
+  /** User-facing instruction for pause messages (non-ISA agents). */
+  pauseInstructions?: string;
+  /** Declarative fields to render in pause messages (renders data above pauseInstructions). */
+  pauseDisplayFields?: import('../../agents/types.ts').PauseDisplayField[];
+  /** Choice labels shown at pause point — gates resume intent parsing (e.g., ['Proceed', 'Amend', 'Cancel']). */
+  pauseChoices?: string[];
 }
 
 /** Configuration for a repair unit — stages that re-run on verification failure. */
@@ -139,6 +158,20 @@ export interface ControlFlowConfig {
   pauseAfterStages?: number[];
   /** Repair units — stages that re-run on verification failure. */
   repairUnits?: RepairUnitConfig[];
+  /**
+   * Whether to auto-advance through pause-after stages instead of pausing.
+   * When true, stages in `pauseAfterStages` that do NOT have `pauseChoices`
+   * will yield their output as informational text and continue without pausing.
+   * Stages with `pauseChoices` always pause regardless (F1: preserves Amend/Cancel).
+   * SDK breakout stages are unaffected (breakout check runs before pause check).
+   */
+  autoAdvance?: boolean;
+  /**
+   * Per-stage output schema definitions for validating LLM output.
+   * Keyed by stage id (string). Used by both SDK path (agent-stage-gate.ts)
+   * and orchestrator path (executePipeline) for output validation.
+   */
+  stageOutputSchemas?: Record<string, StageOutputSchema>;
 }
 
 /** Output configuration from agent config.json. */
@@ -203,6 +236,22 @@ export interface AgentConfig {
   followUp?: {
     enabled?: boolean;
     deltaRetrieval?: boolean;
+  };
+  /**
+   * Absolute path to the workspace root directory.
+   * Used by runPromptDrivenStage() to gather workspace metadata for context injection.
+   */
+  workspacePath?: string;
+  /**
+   * Debug overrides — when enabled, external MCP bridge connections are skipped.
+   * LLM API calls proceed normally; MCP tool calls (webSearch, kbSearch, citationVerify)
+   * hit their existing null-bridge fallbacks (empty results, skipped verification).
+   * Activated via config.json `debug.enabled` or env `AGENT_DEBUG=1`.
+   */
+  debug?: {
+    enabled: boolean;
+    skipWebSearch?: boolean;
+    skipVerification?: boolean;
   };
 }
 
@@ -333,6 +382,8 @@ export type StageEventType =
   | 'pause_requested'
   | 'pause_formatted'
   | 'resumed'
+  | 'amended'
+  | 'cancelled'
   | 'breakout'
   | 'breakout_pending'
   | 'resume_from_breakout'
@@ -404,7 +455,7 @@ export interface PipelineSummary {
 // ============================================================================
 
 /** Exit reason from processOrchestratorEvents — signals why the generator ended (Section 16 G3). */
-export type OrchestratorExitReason = 'paused' | 'completed' | 'error';
+export type OrchestratorExitReason = 'paused' | 'completed' | 'error' | 'sdk_breakout';
 
 /** Extended exit reason that includes breakout — used for pipeline summary and context injection. */
 export type PipelineExitReason = OrchestratorExitReason | 'breakout';
@@ -419,6 +470,7 @@ export type OrchestratorEvent =
   | { type: 'orchestrator_budget_exceeded'; totalCost: number }
   | { type: 'orchestrator_complete'; totalCostUsd: number; stageCount: number }
   | { type: 'orchestrator_error'; stage: number; error: string }
+  | { type: 'orchestrator_sdk_breakout'; stage: number; name: string; prompt: string; priorOutputs: Record<string, unknown> }
   | { type: 'text'; text: string };
 
 // ============================================================================
@@ -551,3 +603,107 @@ export interface FollowUpContext {
   /** Parsed sections from the prior answer with P1/P2 IDs. */
   priorSections: FollowUpPriorSection[];
 }
+
+// ============================================================================
+// CONTEXT WINDOW LOGGING — Full LLM I/O capture for diagnostics
+// ============================================================================
+
+/** LLM configuration metadata for a context window log entry (orchestrator only). */
+export interface ContextWindowLlmMeta {
+  /** Model used for this call (e.g., 'claude-opus-4-6'). */
+  model: string;
+  /** Reasoning effort level used (e.g., 'max', 'high'). */
+  effort: string;
+  /** Desired max output tokens requested for this call. */
+  desiredMaxTokens: number;
+}
+
+/** Shared fields present on every context window log entry (both orchestrator and conversation). */
+export interface ContextWindowEntryBase {
+  /** ISO timestamp when the LLM call started. */
+  timestamp: string;
+  /** Wall-clock duration of the LLM call in milliseconds (null if not measurable). */
+  durationMs: number | null;
+  /** Actual API token usage from the response. */
+  usage: {
+    inputTokens: number;
+    outputTokens: number;
+    /** Cache-read input tokens (null/undefined if not reported). */
+    cacheReadTokens?: number;
+    /** Cache-creation input tokens (null/undefined if not reported). */
+    cacheCreationTokens?: number;
+  };
+}
+
+/** A single logged orchestrator context window — one entry per orchestrator LLM API call. */
+export interface OrchestratorContextWindowEntry extends ContextWindowEntryBase {
+  /** Discriminator: this entry came from the orchestrator pipeline. */
+  source: 'orchestrator';
+  /** Pipeline stage ID (0-5). */
+  stageId: number;
+  /** Pipeline stage name (e.g., 'analyze_query', 'synthesize'). */
+  stageName: string;
+  /** Repair iteration: null for first pass, 1+ for repair loops. */
+  repairIteration: number | null;
+  /** LLM configuration used for this call. */
+  llm: ContextWindowLlmMeta;
+  /** Input sent to the LLM. */
+  input: {
+    /** Full system prompt text. */
+    systemPrompt: string;
+    /** Full user message / context text. */
+    userMessage: string;
+    /** Pre-call heuristic token estimate (via estimateTokens). */
+    estimatedInputTokens: number;
+  };
+  /** Output received from the LLM. */
+  output: {
+    /** Full response text. */
+    responseText: string;
+    /** Adaptive thinking summary (null if no thinking occurred). */
+    thinkingSummary: string | null;
+    /** Number of redacted thinking blocks (Anthropic safety system). */
+    redactedThinkingBlocks: number;
+    /** API stop reason (e.g., 'end_turn', 'max_tokens'). */
+    stopReason: string;
+  };
+}
+
+/** A single logged conversation context window — one entry per SDK conversation turn. */
+export interface ConversationContextWindowEntry extends ContextWindowEntryBase {
+  /** Discriminator: this entry came from a regular SDK conversation. */
+  source: 'conversation';
+  /** 0-based turn index within the current query() call. */
+  turnIndex: number;
+  /** Message ID from the API response (null if unavailable). */
+  turnId: string | null;
+  /** Whether this message is from a sidechain (subagent/Task). */
+  isSidechain: boolean;
+  /** Parent tool use ID for sidechain messages (null for main chain). */
+  parentToolUseId: string | null;
+  /** Actual model used for this turn (from BetaMessage.model). */
+  model: string;
+  /** Input sent to the LLM. */
+  input: {
+    /** The append portion of the system prompt (Claude Code preset is internal to SDK). */
+    systemPromptAppend: string;
+    /** User message text (actual for turn 0, "[SDK-managed turn]" for subsequent tool-use turns). */
+    userMessage: string;
+    /** Actual API-reported input token count. */
+    inputTokens: number;
+  };
+  /** Output received from the LLM. */
+  output: {
+    /** Full response text from content blocks. */
+    responseText: string;
+    /** API stop reason (null if unavailable). */
+    stopReason: string | null;
+  };
+  /** Total cost in USD (only available from result message; null on per-turn entries). */
+  costUsd: number | null;
+  /** Context window size (only available from result message; null on per-turn entries). */
+  contextWindow: number | null;
+}
+
+/** Union of all context window entry types — discriminated by `source` field. */
+export type ContextWindowEntry = OrchestratorContextWindowEntry | ConversationContextWindowEntry;

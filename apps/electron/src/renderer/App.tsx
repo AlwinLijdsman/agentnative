@@ -1615,6 +1615,7 @@ function FilePreviewRenderer({
           data={parsedData}
           theme={theme}
           error={state.error}
+          sizeBytes={state.content?.length}
         />
       )
     }

@@ -41,6 +41,7 @@ import {
   // Session persistence functions
   listSessions as listStoredSessions,
   loadSession as loadStoredSession,
+  loadSessionAsync as loadStoredSessionAsync,
   saveSession as saveStoredSession,
   createSession as createStoredSession,
   deleteSession as deleteStoredSession,
@@ -67,6 +68,7 @@ import {
   pickSessionFields,
 } from '@craft-agent/shared/sessions'
 import { loadWorkspaceSources, loadAllSources, getSourcesBySlugs, isSourceUsable, type LoadedSource, type McpServerConfig, getSourcesNeedingAuth, getSourceCredentialManager, getSourceServerBuilder, type SourceWithCredential, isApiOAuthProvider, SERVER_BUILD_ERRORS, TokenRefreshManager, createTokenGetter } from '@craft-agent/shared/sources'
+import { appendContextWindowEntry } from '@craft-agent/shared/sessions/context-window-writer'
 import { ConfigWatcher, type ConfigWatcherCallbacks } from '@craft-agent/shared/config'
 import { getValidClaudeOAuthToken } from '@craft-agent/shared/auth'
 import { setAnthropicOptionsEnv, setPathToClaudeCodeExecutable, setInterceptorPath, setExecutable } from '@craft-agent/shared/agent'
@@ -2055,7 +2057,9 @@ export class SessionManager {
    * Internal: Load messages from disk storage into the managed session.
    */
   private async loadMessagesFromDisk(managed: ManagedSession): Promise<void> {
-    const storedSession = loadStoredSession(managed.workspace.rootPath, managed.id)
+    // Use async streaming reader to avoid blocking the main process event loop
+    // for large session files (hundreds of messages with large tool results).
+    const storedSession = await loadStoredSessionAsync(managed.workspace.rootPath, managed.id)
     if (storedSession) {
       managed.messages = (storedSession.messages || []).map(storedToMessage)
       managed.tokenUsage = storedSession.tokenUsage
@@ -2793,6 +2797,19 @@ export class SessionManager {
             enabled: true,
             logFilePath: getLogFilePath(),
           } : undefined,
+          // Inject auth token provider for orchestrator LLM calls.
+          // Reads fresh token via direct callback instead of mutable process.env,
+          // avoiding race conditions when reinitializeAuth() clears env vars.
+          getAuthToken: async () => {
+            if (connection?.authType === 'oauth' && connection.providerType === 'anthropic') {
+              const result = await getValidClaudeOAuthToken(connection.slug)
+              return result.accessToken
+            }
+            // For API key connections, read from credential store
+            const manager = getCredentialManager()
+            const apiKey = await manager.getLlmApiKey(connection?.slug || '')
+            return apiKey
+          },
         })
         sessionLog.info(`Created Claude agent for session ${managed.id}${managed.sdkSessionId ? ' (resuming)' : ''}`)
       }
@@ -2827,6 +2844,16 @@ export class SessionManager {
           sessionId: managed.id,
           permissionMode: managed.permissionMode,
         }, managed.workspace.id)
+      }
+
+      // Wire up context window logging — emit per-turn entries to context-windows.json
+      managed.agent.onContextWindowEntry = (entry) => {
+        try {
+          const sessionPath = getSessionStoragePath(managed.workspace.rootPath, managed.id)
+          appendContextWindowEntry(sessionPath, entry)
+        } catch (err) {
+          console.warn('[SessionManager] Failed to write context window entry:', err)
+        }
       }
 
       // Wire up onPlanSubmitted to add plan message to conversation
@@ -6389,6 +6416,22 @@ To view this task's output:
           managed.tokenUsage.inputTokens = event.usage.inputTokens
           if (event.usage.contextWindow) {
             managed.tokenUsage.contextWindow = event.usage.contextWindow
+          }
+          // Accumulate output tokens and cost when present (deferred breakout usage).
+          // During SDK breakout auto-resume, the 'complete' event is suppressed to
+          // prevent generator.return() — full usage is emitted via usage_update instead.
+          if (event.usage.outputTokens !== undefined) {
+            managed.tokenUsage.outputTokens += event.usage.outputTokens
+            managed.tokenUsage.totalTokens = managed.tokenUsage.inputTokens + managed.tokenUsage.outputTokens
+          }
+          if (event.usage.costUsd !== undefined) {
+            managed.tokenUsage.costUsd += event.usage.costUsd
+          }
+          if (event.usage.cacheReadTokens !== undefined) {
+            managed.tokenUsage.cacheReadTokens = event.usage.cacheReadTokens
+          }
+          if (event.usage.cacheCreationTokens !== undefined) {
+            managed.tokenUsage.cacheCreationTokens = event.usage.cacheCreationTokens
           }
 
           // Send to renderer for immediate UI update

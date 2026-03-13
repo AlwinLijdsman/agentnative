@@ -1819,6 +1819,7 @@ export const ChatDisplay = React.forwardRef<ChatDisplayHandle, ChatDisplayProps>
           title={overlayData.title}
           theme={isDark ? 'dark' : 'light'}
           error={overlayData.error}
+          sizeBytes={overlayData.sizeBytes}
         />
       )}
 

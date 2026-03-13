@@ -36,6 +36,17 @@ const craftAgentLightTheme = {
   '--w-rjv-background-color': 'transparent',
 }
 
+// ── Size thresholds (same as JSONPreviewOverlay) ───────────────────────────
+
+/** Skip JSON.parse entirely above this size to prevent renderer freezes */
+const MAX_JSON_PARSE_BYTES = 1_000_000
+
+/** Skip deepParseJson above this size */
+const SIZE_THRESHOLD_BYTES = 100_000
+
+/** Cap arrays at this many entries */
+const ARRAY_TRUNCATE_LIMIT = 50
+
 // ── Deep parse helper (same as JSONPreviewOverlay) ─────────────────────────
 // Recursively parse stringified JSON within JSON values so nested objects
 // like {"result": "{\"nested\": \"value\"}"} display as expandable nodes.
@@ -71,6 +82,29 @@ function deepParseJson(value: unknown): unknown {
   }
 
   return value
+}
+
+/**
+ * Walk the JSON tree and cap arrays longer than `limit`.
+ * Appends a string sentinel so the user sees truncation in the tree.
+ */
+function truncateLargeArrays(value: unknown, limit: number): unknown {
+  if (value === null || value === undefined || typeof value !== 'object') return value
+
+  if (Array.isArray(value)) {
+    if (value.length > limit) {
+      const sliced = value.slice(0, limit).map(v => truncateLargeArrays(v, limit))
+      sliced.push(`... and ${value.length - limit} more items`)
+      return sliced
+    }
+    return value.map(v => truncateLargeArrays(v, limit))
+  }
+
+  const result: Record<string, unknown> = {}
+  for (const [key, val] of Object.entries(value)) {
+    result[key] = truncateLargeArrays(val, limit)
+  }
+  return result
 }
 
 // ── Error boundary ────────────────────────────────────────────────────────
@@ -121,11 +155,17 @@ export interface MarkdownJsonBlockProps {
 export function MarkdownJsonBlock({ code, className }: MarkdownJsonBlockProps) {
   const [copied, setCopied] = React.useState(false)
 
-  // Try to parse – fall back to syntax-highlighted CodeBlock if invalid JSON
+  // Try to parse – fall back to syntax-highlighted CodeBlock if invalid JSON.
+  // Skip JSON.parse entirely for huge payloads (>1MB) to prevent renderer freezes.
+  // Skip deepParseJson for large payloads (>100KB) to avoid UI freezes.
+  // Always truncate arrays >50 items.
   const parsed = React.useMemo(() => {
+    if (code.length > MAX_JSON_PARSE_BYTES) return null
     try {
       const raw = JSON.parse(code)
-      return deepParseJson(raw) as object
+      const isLarge = code.length > SIZE_THRESHOLD_BYTES
+      const processed = isLarge ? raw : deepParseJson(raw)
+      return truncateLargeArrays(processed, ARRAY_TRUNCATE_LIMIT) as object
     } catch {
       return null
     }

@@ -40,6 +40,7 @@ export {
   getOrCreateSessionById,
   saveSession,
   loadSession,
+  loadSessionAsync,
   listSessions,
   deleteSession,
   clearSessionMessages,
@@ -95,6 +96,7 @@ export {
 export {
   readSessionHeader,
   readSessionJsonl,
+  readSessionJsonlAsync,
   writeSessionJsonl,
   createSessionHeader,
 } from './jsonl.ts';

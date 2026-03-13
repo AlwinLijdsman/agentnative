@@ -3,12 +3,31 @@
  *
  * Uses @uiw/react-json-view for expand/collapse tree navigation.
  * Wraps PreviewOverlay for consistent presentation with other overlays.
+ *
+ * Size-aware rendering:
+ * - Payloads > 100 KB skip deepParseJson (expensive recursive parsing)
+ * - Payloads > 100 KB auto-collapse to depth 2
+ * - Arrays > 50 items are truncated with a sentinel marker
  */
 
 import * as React from 'react'
 import { useMemo } from 'react'
 import JsonView from '@uiw/react-json-view'
+import { vscodeTheme } from '@uiw/react-json-view/vscode'
+import { githubLightTheme } from '@uiw/react-json-view/githubLight'
+import { Braces, Copy, Check } from 'lucide-react'
 import { ContentFrame } from './ContentFrame'
+import { PreviewOverlay } from './PreviewOverlay'
+
+// ── Size thresholds ──────────────────────────────────────────────────────
+
+/** Skip deepParseJson and auto-collapse above this size */
+const SIZE_THRESHOLD_BYTES = 100_000
+
+/** Cap arrays at this many entries */
+const ARRAY_TRUNCATE_LIMIT = 50
+
+// ── Helpers ──────────────────────────────────────────────────────────────
 
 /**
  * Recursively parse stringified JSON within JSON values.
@@ -16,10 +35,8 @@ import { ContentFrame } from './ContentFrame'
  * so they display as expandable tree nodes instead of plain strings.
  */
 function deepParseJson(value: unknown): unknown {
-  // Handle null/undefined
   if (value === null || value === undefined) return value
 
-  // If it's a string, try to parse it as JSON
   if (typeof value === 'string') {
     const trimmed = value.trim()
     if (
@@ -27,22 +44,18 @@ function deepParseJson(value: unknown): unknown {
       (trimmed.startsWith('[') && trimmed.endsWith(']'))
     ) {
       try {
-        // Recursively parse the result in case of multiple nesting levels
         return deepParseJson(JSON.parse(trimmed))
       } catch {
-        // Not valid JSON, return original string
         return value
       }
     }
     return value
   }
 
-  // If it's an array, recursively process each element
   if (Array.isArray(value)) {
     return value.map(deepParseJson)
   }
 
-  // If it's an object, recursively process each property
   if (typeof value === 'object') {
     const result: Record<string, unknown> = {}
     for (const [key, val] of Object.entries(value)) {
@@ -51,13 +64,50 @@ function deepParseJson(value: unknown): unknown {
     return result
   }
 
-  // Primitives (number, boolean) - return as-is
   return value
 }
-import { vscodeTheme } from '@uiw/react-json-view/vscode'
-import { githubLightTheme } from '@uiw/react-json-view/githubLight'
-import { Braces, Copy, Check } from 'lucide-react'
-import { PreviewOverlay } from './PreviewOverlay'
+
+/**
+ * Walk the JSON tree and cap arrays longer than `limit`.
+ * Appends a string sentinel so the user sees truncation in the tree.
+ * Returns the processed data and the number of arrays that were truncated.
+ */
+function truncateLargeArrays(
+  value: unknown,
+  limit: number,
+): { data: unknown; truncatedCount: number } {
+  let truncatedCount = 0
+
+  function walk(v: unknown): unknown {
+    if (v === null || v === undefined || typeof v !== 'object') return v
+
+    if (Array.isArray(v)) {
+      if (v.length > limit) {
+        truncatedCount++
+        const sliced = v.slice(0, limit).map(walk)
+        sliced.push(`... and ${v.length - limit} more items`)
+        return sliced
+      }
+      return v.map(walk)
+    }
+
+    const result: Record<string, unknown> = {}
+    for (const [key, val] of Object.entries(v)) {
+      result[key] = walk(val)
+    }
+    return result
+  }
+
+  const data = walk(value)
+  return { data, truncatedCount }
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  return `${(bytes / 1024).toFixed(0)} KB`
+}
+
+// ── Types ────────────────────────────────────────────────────────────────
 
 export interface JSONPreviewOverlayProps {
   /** Whether the overlay is visible */
@@ -74,14 +124,14 @@ export interface JSONPreviewOverlayProps {
   theme?: 'light' | 'dark'
   /** Optional error message */
   error?: string
+  /** Approximate byte size of the raw JSON — enables size-aware rendering */
+  sizeBytes?: number
   /** Render inline without dialog (for playground) */
   embedded?: boolean
 }
 
-/**
- * Custom theme that adapts to our app's CSS variables.
- * Falls back to VS Code dark theme colors for JSON-specific styling.
- */
+// ── Themes ───────────────────────────────────────────────────────────────
+
 const craftAgentDarkTheme = {
   ...vscodeTheme,
   '--w-rjv-font-family': 'var(--font-mono, ui-monospace, monospace)',
@@ -94,6 +144,8 @@ const craftAgentLightTheme = {
   '--w-rjv-background-color': 'transparent',
 }
 
+// ── Component ────────────────────────────────────────────────────────────
+
 export function JSONPreviewOverlay({
   isOpen,
   onClose,
@@ -102,17 +154,36 @@ export function JSONPreviewOverlay({
   title = 'JSON',
   theme = 'dark',
   error,
+  sizeBytes,
   embedded,
 }: JSONPreviewOverlayProps) {
-  // Select theme based on mode
   const jsonTheme = useMemo(() => {
     return theme === 'dark' ? craftAgentDarkTheme : craftAgentLightTheme
   }, [theme])
 
-  // Recursively parse any stringified JSON within the data for better display
-  const processedData = useMemo(() => {
-    return deepParseJson(data) as object
-  }, [data])
+  const isLargePayload = (sizeBytes ?? 0) > SIZE_THRESHOLD_BYTES
+
+  // Process data: deep-parse nested JSON strings (skip for large payloads),
+  // then truncate oversized arrays.
+  const { processedData, truncatedCount } = useMemo(() => {
+    const parsed = isLargePayload ? data : deepParseJson(data)
+    const { data: truncated, truncatedCount } = truncateLargeArrays(parsed, ARRAY_TRUNCATE_LIMIT)
+    return { processedData: truncated as object, truncatedCount }
+  }, [data, isLargePayload])
+
+  // Build subtitle for size-aware info
+  const subtitle = useMemo(() => {
+    const parts: string[] = []
+    if (isLargePayload && sizeBytes) {
+      parts.push(`Large payload (${formatBytes(sizeBytes)}) — collapsed to depth 2`)
+    }
+    if (truncatedCount > 0) {
+      parts.push(
+        `${truncatedCount} array${truncatedCount > 1 ? 's' : ''} capped at ${ARRAY_TRUNCATE_LIMIT} items`
+      )
+    }
+    return parts.length > 0 ? parts.join(', ') : undefined
+  }, [isLargePayload, sizeBytes, truncatedCount])
 
   return (
     <PreviewOverlay
@@ -125,6 +196,7 @@ export function JSONPreviewOverlay({
       }}
       filePath={filePath}
       title={title}
+      subtitle={subtitle}
       theme={theme}
       error={error ? { label: 'Parse Error', message: error } : undefined}
       embedded={embedded}
@@ -136,7 +208,7 @@ export function JSONPreviewOverlay({
             <JsonView
               value={processedData}
               style={jsonTheme}
-              collapsed={false}
+              collapsed={isLargePayload ? 2 : false}
               enableClipboard={true}
               displayDataTypes={false}
               shortenTextAfterLength={100}
@@ -144,7 +216,6 @@ export function JSONPreviewOverlay({
               {/* Custom copy icon using lucide-react */}
               <JsonView.Copied
                 render={(props) => {
-                  // Type assertion needed - @uiw/react-json-view types don't include data-copied
                   const isCopied = (props as Record<string, unknown>)['data-copied']
                   return isCopied ? (
                     <Check

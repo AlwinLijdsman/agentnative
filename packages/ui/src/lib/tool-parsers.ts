@@ -209,6 +209,8 @@ export interface JSONOverlayData {
   rawContent: string
   title: string
   error?: string
+  /** Approximate byte size of the raw JSON content — used for size-aware rendering */
+  sizeBytes?: number
 }
 
 /** Rendered markdown document — used for Write tool results on .md/.txt files */
@@ -341,10 +343,13 @@ export function extractOverlayData(activity: ActivityItem): OverlayData | null {
   }
 
   // Try to detect JSON content for unknown tools (MCP tools, WebFetch, etc.)
-  // JSON objects/arrays get interactive tree viewer, other content falls through to generic
+  // JSON objects/arrays get interactive tree viewer, other content falls through to generic.
+  // Skip JSON.parse for content larger than 1MB to prevent renderer freezes.
+  const MAX_JSON_PARSE_BYTES = 1_000_000
   const trimmedContent = rawContent.trim()
-  if ((trimmedContent.startsWith('{') && trimmedContent.endsWith('}')) ||
-      (trimmedContent.startsWith('[') && trimmedContent.endsWith(']'))) {
+  if (trimmedContent.length <= MAX_JSON_PARSE_BYTES &&
+      ((trimmedContent.startsWith('{') && trimmedContent.endsWith('}')) ||
+       (trimmedContent.startsWith('[') && trimmedContent.endsWith(']')))) {
     try {
       const parsed = JSON.parse(trimmedContent)
       return {
@@ -353,6 +358,7 @@ export function extractOverlayData(activity: ActivityItem): OverlayData | null {
         rawContent: trimmedContent,
         title: activity.displayName || activity.toolName || 'JSON Result',
         error: activity.error,
+        sizeBytes: trimmedContent.length,
       }
     } catch {
       // Not valid JSON, fall through to generic

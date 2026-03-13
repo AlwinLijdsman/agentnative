@@ -1,648 +1,334 @@
-# Craft Agent (AgentNative) -- Technical Specification
+# Plan: Fix SDK Breakout Auto-Resume — Deferred `complete` Event
 
-> Single source of truth for repository structure, architecture, and conventions.
-> Completed implementation plans are archived to `plans/YYMMDD-{slug}.md`.
-
----
-
-## 1. Project Identity
-
-| Field | Value |
-|-------|-------|
-| Name | **Craft Agent** (repo: `agentnative`) |
-| Version | 0.4.5 |
-| Description | Electron desktop app -- Claude Agent SDK-powered coding assistant with MCP server support |
-| License | MIT (app), Apache-2.0 (packages) |
-| Origin | Fork of `lukilabs/craft-agents-oss` |
-| Remote `origin` | `github.com/AlwinLijdsman/agentnative` |
-| Remote `upstream` | `github.com/lukilabs/craft-agents-oss` |
-| Platform | Windows ARM64 -- uses **pnpm + tsx**, never bun |
+> **Status: [x] COMPLETED** — All changes implemented, tested, and verified in a live pipeline run.
+> Prior plan archived to: `plans/260313-auto-chain-orchestrator-resume.md`
+>
+> Status markers: `[ ]` pending | `[x]` done | `[~]` in progress | `[-]` skipped
 
 ---
 
-## 2. Stack & Toolchain
+## Problem Statement
 
-| Layer | Choice | Notes |
-|-------|--------|-------|
-| Language | TypeScript 5.x | Strict mode everywhere |
-| Runtime | Electron 39 + Node.js | Main + renderer processes |
-| UI Framework | React 18 | Functional components only |
-| Styling | Tailwind CSS 4 | Utility-first, no CSS modules |
-| State Management | Jotai | Atoms in `renderer/atoms/` |
-| Build (main/preload) | esbuild | CJS output (`dist/main.cjs`, `dist/preload.cjs`) |
-| Build (renderer) | Vite 6 | React plugin, Tailwind plugin |
-| AI SDK | `@anthropic-ai/claude-agent-sdk` | Claude Agent SDK for agent orchestration |
-| Copilot SDK | `@github/copilot-sdk` | VS Code Copilot integration backend |
-| Agent Types | `@craft-agent/codex-types` | Auto-generated from Codex API |
-| MCP SDK | `@modelcontextprotocol/sdk` | Model Context Protocol client + servers |
-| Package Manager | pnpm | Workspaces, `shamefully-hoist=true` |
-| Linting | ESLint 9 | Custom rules in `eslint-rules/` |
-| Testing | Node.js test runner | Via `npx tsx --test` |
-| Distribution | electron-builder | macOS (DMG), Windows (NSIS), Linux |
-| Error Tracking | Sentry | Production builds only |
-| Python | Python 3.11+ | ISA KB MCP server (pip, venv) |
+The dev-loop agent pipeline stalls after SDK breakout stages (Stage 1, 4, 5). When the LLM calls
+`stage_gate(complete)` during an SDK breakout, `checkAndResumeBreakout()` should fire and auto-chain
+into the next orchestrator/breakout stage. Instead it **never fires** because `generator.return()`
+propagation kills the generator chain before post-loop code executes.
 
----
+### Symptom (session `260313-early-poplar`)
 
-## 3. Monorepo Folder Map
+Pipeline stuck at Stage 1 (`plan`, `sdk_breakout` mode). After `stage_gate(complete)` is called:
+- `breakoutStage: 1` persists in `current-run-state.json`
+- Stage 2 (review) never starts
+- User must manually intervene
+
+### Root Cause
+
+`chat()` has a for-await loop that yields every event from `convertSDKMessage()`, including
+`{type: 'complete', usage}`. The delegation chain is:
 
 ```
-agentnative/
-|
-+-- apps/
-|   +-- electron/                      # Main Electron desktop app
-|   |   +-- src/
-|   |   |   +-- main/                  # Main process (Node.js)
-|   |   |   |   +-- index.ts           #   App entry, Sentry init, window creation (~470 lines)
-|   |   |   |   +-- sessions.ts        #   SessionManager -- agent/session lifecycle (~5570 lines)
-|   |   |   |   +-- ipc.ts             #   IPC handler registration (~3798 lines)
-|   |   |   |   +-- window-manager.ts  #   BrowserWindow creation & management
-|   |   |   |   +-- auto-update.ts     #   electron-updater integration
-|   |   |   |   +-- deep-link.ts       #   craft-agent:// protocol handler
-|   |   |   |   +-- menu.ts            #   Native menu bar
-|   |   |   |   +-- notifications.ts   #   System notifications
-|   |   |   |   +-- power-manager.ts   #   Prevent sleep while agent runs
-|   |   |   |   +-- search.ts          #   In-page search (Cmd/Ctrl+F)
-|   |   |   |   +-- logger.ts          #   electron-log configuration
-|   |   |   |   +-- shell-env.ts       #   Load user shell env (PATH, nvm, etc.)
-|   |   |   |   +-- onboarding.ts      #   First-run setup flow
-|   |   |   |   +-- lib/               #   Config watcher helper
-|   |   |   +-- preload/
-|   |   |   |   +-- index.ts           #   Context-isolated bridge (IPC to renderer)
-|   |   |   +-- renderer/
-|   |   |   |   +-- main.tsx           #   React entry point
-|   |   |   |   +-- App.tsx            #   Root component with routing
-|   |   |   |   +-- atoms/             #   Jotai atoms (5 files)
-|   |   |   |   +-- pages/             #   Page components (7 pages)
-|   |   |   |   +-- components/        #   UI components (172 files, 18 directories)
-|   |   |   |   +-- hooks/             #   React hooks (23 files)
-|   |   |   |   +-- contexts/          #   React contexts (Theme, AppShell, Modal, Focus)
-|   |   |   |   +-- actions/           #   IPC action wrappers
-|   |   |   |   +-- utils/             #   Renderer-side utilities
-|   |   |   +-- shared/                #   Types shared between main & renderer
-|   |   |   +-- __tests__/             #   E2E and integration tests
-|   |   +-- resources/                 #   Bundled assets (synced to ~/.craft-agent/)
-|   |   +-- electron-builder.yml       #   electron-builder config
-|   +-- viewer/                        #   Standalone session viewer (Vite + React)
-|
-+-- packages/
-|   +-- core/                          #   @craft-agent/core -- type definitions
-|   +-- shared/                        #   @craft-agent/shared -- ALL business logic
-|   |   +-- src/
-|   |       +-- agent/                 #     Agent backends (see Section 5)
-|   |       |   +-- orchestrator/      #       Deterministic pipeline (16 source files)
-|   |       |   +-- __tests__/         #       Agent tests (14 files)
-|   |       +-- auth/                  #     Authentication (16 files, ~3950 lines)
-|   |       +-- config/                #     Configuration (11 files, ~6450 lines)
-|   |       +-- credentials/           #     Credential management (3 files, ~940 lines)
-|   |       +-- mcp/                   #     MCP client utilities (3 files, ~725 lines)
-|   |       +-- sessions/              #     Session persistence (9 files, ~2500 lines)
-|   |       +-- sources/               #     Source management (8 files, ~3560 lines)
-|   |       +-- prompts/               #     System prompts
-|   |       +-- tools/                 #     Tool definitions
-|   |       +-- types/                 #     Shared type definitions
-|   |       +-- ...                    #     labels, statuses, views, search, etc.
-|   +-- ui/                            #   @craft-agent/ui -- shared React components
-|   +-- agent-pipeline-core/           #   @craft-agent/agent-pipeline-core -- pipeline handlers
-|   |   +-- src/handlers/
-|   |       +-- agent-stage-gate.ts    #     Pipeline stage lifecycle (~1550 lines)
-|   |       +-- agent-render-output/   #     Research output renderer (6 files, ~1300 lines)
-|   |       +-- agent-state.ts         #     Persistent key-value state (~116 lines)
-|   |       +-- agent-validate.ts      #     Agent validation (~308 lines)
-|   +-- session-tools-core/            #   @craft-agent/session-tools-core -- platform tool handlers
-|   |   +-- src/handlers/
-|   |       +-- source-test.ts         #     Source connectivity testing (~841 lines)
-|   |       +-- source-oauth.ts        #     OAuth flow handler (~353 lines)
-|   |       +-- ...                    #     config, credential, mermaid, skill, submit-plan
-|   +-- bridge-mcp-server/             #   @craft-agent/bridge-mcp-server -- stdio MCP bridge
-|   +-- session-mcp-server/            #   @craft-agent/session-mcp-server -- session MCP
-|   +-- mermaid/                       #   @craft-agent/mermaid -- flowchart -> SVG renderer
-|   +-- codex-types/                   #   @craft-agent/codex-types -- auto-generated API types
-|
-+-- agents/
-|   +-- isa-deep-research/             #   ISA Deep Research agent (config.json, prompts/)
-|   +-- _templates/                    #   Agent template scaffolding
-|
-+-- sources/                           #   14 MCP source configurations (see Section 7)
-+-- skills/                            #   7 Claude Code slash commands (SKILL.md)
-+-- scripts/                           #   Build, dev, test scripts (16 files)
-+-- plans/                             #   Archived implementation plans (14 files)
-+-- sessions/                          #   Session logs (JSONL format)
-+-- labels/                            #   Label configuration
-+-- statuses/                          #   Status workflow configuration
-+-- isa-kb-mcp-server/                 #   Python MCP server for ISA knowledge base
-|   +-- src/isa_kb_mcp_server/         #     SQLite + vector search + graph traversal (13 modules)
-+-- claude-teams/                      #   Multi-agent team definitions
-+-- .github/agents/                    #   VS Code Copilot Chat agents (6 agents)
+sessions.ts consumer → for-await chatIterator
+  └─ executeSdkBreakoutStage()     ← sets _activeBreakoutMeta
+       └─ yield* chat()
+            └─ for-await SDK messages → convertSDKMessage() → yield event
 ```
 
+When `{type: 'complete'}` is yielded at line ~2083:
+1. It propagates through `yield*` to sessions.ts
+2. sessions.ts does `return` on `event.type === 'complete'`
+3. `return` triggers `generator.return()` per ECMAScript spec
+4. `generator.return()` propagates through the entire yield* chain
+5. Post-loop code at line ~2125 (`checkAndResumeBreakout()`) is **never reached**
+6. `_activeBreakoutMeta` stays set, `clearBreakoutScope()` never runs
+
+### Solution
+
+Single-point fix in `chat()`'s inner event loop: when `_activeBreakoutMeta` is set (i.e., inside
+an SDK breakout), intercept `{type: 'complete'}` — capture `usage` data but **don't yield it**.
+The for-await loop exits naturally, reaching `checkAndResumeBreakout()` which triggers auto-resume.
+
+Deferred `usage` data is re-emitted as `{type: 'usage_update'}` so sessions.ts token tracking
+isn't lost.
+
 ---
 
-## 4. Package Dependency Graph
+## All Changes Made (4 Files Modified/Created)
 
-```
-                    +--------------+
-                    |  codex-types |  (auto-generated Codex API types)
-                    +--------------+
-                           |
-                    +------v-------+
-                    |     core     |  (Workspace, Session, Message types)
-                    +--------------+
-                       |       |
-              +--------v--+  +-v--------+
-              |   shared   |  |    ui    |  (React components)
-              | (all biz   |  |          |
-              |  logic)    |  +----------+
-              +------+-----+       |
-                |  |  |            |
-   +------------+  |  +--+---------+--------------+
-   |               |     |         |              |
-   |  +------------v--+  |         |              |
-   |  | agent-pipeline |  |         |              |
-   |  | core (pipeline |  |         |              |
-   |  | handlers)      |  |         |              |
-   |  +-------^--------+  |         |              |
-   |          |            |         |              |
-   |    +-----+-------v---+    |              |
-   |    | session-tools-core  |>---+              |
-   |    | (platform handlers) |                   |
-   |    +---------------------+                   |
-   |        |          |                          |
-   |  +-----v------+ +-v--------------+          |
-   |  | bridge-mcp | | session-mcp    |          |
-   |  | server     | | server         |          |
-   |  +------------+ +----------------+          |
-   |                                              |
-   v                                              v
-+--------------------------------------------------+
-|              apps/electron                        |
-|  (imports: core, shared, ui, session-tools-core,  |
-|   agent-pipeline-core)                            |
-+--------------------------------------------------+
+### File 1: `packages/core/src/types/message.ts` (line 410)
 
-   mermaid  >--  session-tools-core  (mermaid validation handler)
+**What changed:** Widened the `usage_update` type in the `AgentEvent` union so it can carry full
+`AgentEventUsage` data (not just `inputTokens` + `contextWindow`). This is needed because deferred
+`complete` events carry `outputTokens`, `costUsd`, `cacheReadTokens`, etc.
+
+**Before:**
+```typescript
+| { type: 'usage_update'; usage: Pick<AgentEventUsage, 'inputTokens' | 'contextWindow'> }
 ```
 
-All internal dependencies use workspace protocol: `"@craft-agent/shared": "workspace:*"`.
-
----
-
-## 5. Architecture Deep Dive
-
-### 5a. Electron Process Model
-
-```
-+-------------------------------------------------------------+
-|  Main Process (src/main/)                                    |
-|  - Window management, native menus, auto-update              |
-|  - SessionManager: creates/manages agent sessions            |
-|  - IPC handlers: bridges renderer requests to business logic |
-|  - Shell env loading: ensures PATH includes nvm, brew, etc.  |
-|  - Power manager: prevents sleep during agent execution      |
-+-------------------------------------------------------------+
-             | contextBridge (preload/index.ts)
-             | IPC channels only, no nodeIntegration
-+-------------------------------------------------------------+
-|  Renderer Process (src/renderer/)                            |
-|  - React 18 SPA with Jotai atoms                            |
-|  - Pages: Chat, Preferences, AgentInfo, SourceInfo, etc.    |
-|  - All state in atoms/ (sessions, agents, sources, skills)   |
-|  - Tailwind CSS 4 for styling                                |
-+-------------------------------------------------------------+
+**After:**
+```typescript
+| { type: 'usage_update'; usage: Pick<AgentEventUsage, 'inputTokens'> & Partial<Omit<AgentEventUsage, 'inputTokens'>> }
 ```
 
-**Security**: `nodeIntegration: false`, `contextIsolation: true`. All IPC goes through the preload bridge. The renderer never accesses Node.js APIs directly.
+**Why:** The original narrow type only allowed `inputTokens` and `contextWindow`. But when deferring
+a `complete` event during breakout, the usage data includes `outputTokens`, `costUsd`,
+`cacheReadTokens`, `cacheCreationTokens` — all of which need to flow through `usage_update` to
+sessions.ts. The widened type makes `inputTokens` required and everything else optional, which is
+backward-compatible with existing callers.
 
-### 5b. Agent Backends
+---
 
-Three agent backends share a common base class:
+### File 2: `packages/shared/src/agent/claude-agent.ts` (3 changes)
 
-| Backend | File | Lines | Purpose |
-|---------|------|-------|---------|
-| `ClaudeAgent` | `claude-agent.ts` | ~4450 | Claude Agent SDK + orchestrator pipeline + breakout/resume |
-| `CodexAgent` | `codex-agent.ts` | ~2290 | Codex API integration |
-| `CopilotAgent` | `copilot-agent.ts` | ~1300 | VS Code Copilot SDK |
-| `BaseAgent` | `base-agent.ts` | ~800 | Shared: permissions, mode management, source toggling |
+#### Change 2a: Import `AgentEventUsage` type (line 95)
 
-All agents implement the `chat()` async generator pattern, yielding `AgentEvent` objects (text, tool calls, errors, completion).
-
-### 5c. Orchestrator Pipeline
-
-The **deterministic orchestrator** (`packages/shared/src/agent/orchestrator/`) replaces SDK-driven tool calling with a TypeScript for-loop controlling stage execution. Each stage = 1 focused LLM call with shaped context.
-
-**Design principles:**
-- TypeScript writes state -- LLM never touches it
-- Deterministic: for-loop over stages from `config.json`
-- Immutable state with event sourcing (`PipelineState`)
-- Per-stage cost tracking and budget enforcement
-
-**Pipeline stages** (ISA Deep Research agent):
-
-| # | Stage | Pauses | Description |
-|---|-------|--------|-------------|
-| 0 | `analyze_query` | Yes | Decompose query, assess clarity, build sub-query plan |
-| 1 | `websearch_calibration` | Yes | Optional web search to refine query plan |
-| 2 | `retrieve` | No | Hybrid search + graph traversal via MCP tools |
-| 3 | `synthesize` | No | Generate structured answer from XML context |
-| 4 | `verify` | No | 4-axis verification (entity grounding, citation accuracy, relation preservation, contradictions) |
-| 5 | `output` | No | Format final output with progressive disclosure |
-
-**Repair loop**: Stages 3-4 form a repair unit. If verification fails, synthesis is re-run with feedback (max 2 iterations).
-
-**Orchestrator source files** (16 files, ~6200 lines total):
-
-| File | Lines | Purpose |
-|------|-------|---------|
-| `stage-runner.ts` | ~1272 | Per-stage dispatch, context assembly, LLM calls, substep progress |
-| `pause-formatter.ts` | ~700 | Deterministic pause message formatting (includes "Exit" option) |
-| `index.ts` | ~692 | `AgentOrchestrator` class -- run/resume/resumeFromBreakout, event loop |
-| `pipeline-state.ts` | ~521 | Immutable event-sourced state with breakout/resume getters |
-| `types.ts` | ~504 | All orchestrator type definitions (incl. breakout/resume types) |
-| `synthesis-post-processor.ts` | ~474 | Safety net: inject `WEB_REF`/`PRIOR_REF` markers + inline labels |
-| `mcp-bridge.ts` | ~326 | MCP tool call abstraction |
-| `cost-tracker.ts` | ~262 | Per-stage token accounting, USD budget enforcement |
-| `follow-up-context.ts` | ~250 | Follow-up session context loading |
-| `context-builder.ts` | ~248 | XML context assembly with token budgeting |
-| `mcp-lifecycle.ts` | ~246 | MCP server connect/disconnect lifecycle |
-| `baml-adapter.ts` | ~175 | BAML structured output (feature-flagged) |
-| `llm-client.ts` | ~157 | Anthropic API wrapper with streaming |
-| `context-budget.ts` | ~131 | Token estimation and overflow management |
-| `json-extractor.ts` | ~131 | Robust JSON extraction from LLM responses |
-| `baml-types.ts` | ~84 | BAML type definitions |
-
-**Key `PipelineState` capabilities:**
-- Event-sourced state: `addEvent()` / `loadFrom()` / `saveTo()` with stage outputs, verification scores
-- Breakout tracking: `hasBreakout`, `isPaused`, `isBreakoutPending` (counts breakout events as resolving)
-- Resume-from-breakout: `isResumableAfterBreakout`, `isBreakoutResumePending`, `lastCompletedStageIndex`
-- Summary generation: `generateSummary()` for compaction-safe context injection
-- Query extraction: `originalQuery`, `subQueryTexts` for semantic breakout classification
-
-**Breakout & resume flow in `claude-agent.ts`:**
-1. **Breakout detection**: Keyword-based (`isBreakoutIntent()`, 23 patterns) + LLM semantic classifier (`classifyBreakoutIntent()`, Opus effort:low) as fallback
-2. **Confirmation gate**: Two-step -- detect intent → ask confirmation → act (prevents false-positive data loss)
-3. **Context preservation**: `writePipelineSummary()` writes compact JSON; `buildOrchestratorSummaryBlock()` re-injects on every turn via `buildContextParts()`
-4. **Resume from breakout**: On re-invocation, `detectOrchestratableAgent()` checks `isResumableAfterBreakout`; `classifyResumeIntent()` determines resume vs. fresh start; `resumeFromBreakout()` continues from `lastCompletedStageIndex + 1` with 24h staleness guard
-
-**14 test files** in `orchestrator/__tests__/` covering: breakout intent classification, breakout-resume intent, follow-up detection, MCP bridge (KB + web), MCP lifecycle, pipeline state (summary, breakout-resume, previous-session), resume/skip routing, Stage 1 telemetry, synthesis post-processing, and orchestrator summary block.
-
-### 5d. Session Lifecycle
-
-| Concept | Detail |
-|---------|--------|
-| Session | Conversation scope with SDK session binding |
-| ID format | `msg-{timestamp}-{random}` via `generateMessageId()` |
-| Persistence | Debounced 500ms writes via `persistence-queue.ts` |
-| Storage | `sessions/{slug}/session.jsonl` (first line = metadata) |
-| Metadata | messageCount, tokenUsage, permissionMode, status, labels |
-
-**Session files** (9 files, ~2500 lines in `packages/shared/src/sessions/`):
-
-Core session operations: create, load, save, archive, rename, delete. Session metadata stored as first JSONL line; subsequent lines are message events.
-
-**SDK session continuity**: The `ClaudeAgent` captures `session_id` exclusively from the SDK's canonical `system:init` message (not from other message types which may carry stale IDs). On session expiry, dual-channel recovery (result-error + catch-path) clears the session and retries with full context restoration.
-
-### 5e. Source MCP Server Architecture
-
-Sources are external data providers connected via MCP (Model Context Protocol). Each source has a `config.json` in `sources/{slug}/`.
-
-**Transport types:**
-- **stdio** -- subprocess MCP server (e.g., ISA KB, PDF, Brave Search)
-- **http/sse** -- HTTP-based MCP server (e.g., Azure services)
-
-**Credential flow:**
-```
-Main Process -> decrypt credentials.enc -> write .credential-cache.json (0600)
-                                              |
-Bridge MCP Server (subprocess) <--------------+ reads on each request
+**Before:**
+```typescript
+import type { AgentEvent } from '@craft-agent/core/types';
 ```
 
-**Auto-enable**: Agents declare required sources in `AGENT.md` frontmatter. When an agent is @mentioned, its required sources are automatically enabled.
-
-### 5f. Renderer Architecture
-
-**Jotai atoms** (5 files):
-
-| Atom File | State |
-|-----------|-------|
-| `sessions.ts` | Active session, message list, streaming state |
-| `agents.ts` | Loaded agents, active agent |
-| `sources.ts` | Source configs, connection status |
-| `skills.ts` | Available skills |
-| `overlay.ts` | Modal/overlay state |
-
-**Pages** (7):
-
-| Page | Purpose |
-|------|---------|
-| `ChatPage` | Main conversation UI with message rendering |
-| `PreferencesPage` | Settings editor |
-| `AgentInfoPage` | Agent details and configuration |
-| `AgentRunDetailPage` | Agent run history and results |
-| `SourceInfoPage` | Source details and testing |
-| `SkillInfoPage` | Skill details |
-| `ShortcutsPage` | Keyboard shortcuts reference |
-
-**Component directories** (172 files across 18 directories): `chat/`, `settings/`, `onboarding/`, `markdown/`, `workspace/`, `app-shell/`, `ui/`, `icons/`, `info/`, `files/`, `preview/`, `right-sidebar/`, `shiki/`, `apisetup/`.
-
-### 5g. Build Pipeline
-
-```
-pnpm run electron:build
-  +-- electron:build:main      -> esbuild -> dist/main.cjs
-  +-- electron:build:preload   -> esbuild -> dist/preload.cjs
-  +-- electron:build:renderer  -> Vite    -> dist/renderer/
-  +-- electron:build:resources -> Copy resources/ -> dist/resources/
-  +-- electron:build:assets    -> Copy additional assets
+**After:**
+```typescript
+import type { AgentEvent, AgentEventUsage } from '@craft-agent/core/types';
 ```
 
-**Dev mode**: `pnpm run electron:dev` -- watches all source files, rebuilds on change, hot reloads renderer.
+**Why:** The `deferredCompleteUsage` variable needs the `AgentEventUsage` type annotation.
 
-**Distribution**: `pnpm run electron:dist` -> electron-builder packages for current platform.
+#### Change 2b: Declare `deferredCompleteUsage` variable + defer complete in inner loop (line ~1960 and ~2088)
 
-### 5h. Session-Scoped Tools
+**Added variable declaration** at line 1955-1960 (before the for-await loop):
+```typescript
+// Deferred usage from a 'complete' event suppressed during SDK breakout.
+// When _activeBreakoutMeta is set, we must NOT yield 'complete' (it would
+// trigger generator.return() from the consumer, killing the chain before
+// checkAndResumeBreakout() can execute). The usage is emitted post-loop
+// via 'usage_update' so token tracking is preserved.
+let deferredCompleteUsage: AgentEventUsage | undefined;
+```
 
-Tools registered in `session-scoped-tools.ts` (~844 lines), implemented in `session-tools-core/src/handlers/`:
+**Added deferral logic** in the inner event loop at line ~2088-2098:
+```typescript
+if (event.type === 'complete') {
+  receivedComplete = true;
+  // When inside an SDK breakout, defer the 'complete' yield.
+  // Yielding 'complete' triggers generator.return() from the consumer
+  // (sessions.ts), killing the yield* chain before post-loop code
+  // (checkAndResumeBreakout) can execute. Instead, capture usage and
+  // let the for-await loop exit naturally when the SDK has no more messages.
+  if (this._activeBreakoutMeta) {
+    deferredCompleteUsage = event.usage;
+    continue;
+  }
+}
+yield event;
+```
 
-| Tool | Handler | Lines | Purpose |
-|------|---------|-------|---------|
-| `agent_stage_gate` | `agent-stage-gate.ts` | ~1550 | Pipeline stage lifecycle (start, complete, resume, repair) |
-| `agent_render_research_output` | `agent-render-output/` | ~1300 | Assemble structured research documents |
-| `agent_state` | `agent-state.ts` | ~116 | Persistent key-value state across turns |
-| `agent_validate` | `agent-validate.ts` | ~308 | Agent configuration validation |
-| `source_test` | `source-test.ts` | ~841 | Source connectivity testing |
-| `source_oauth` | `source-oauth.ts` | ~353 | OAuth flow handler |
-| `config_validate` | `config-validate.ts` | ~191 | Configuration validation |
-| `credential_prompt` | `credential-prompt.ts` | ~83 | Credential input prompting |
-| `mermaid_validate` | `mermaid-validate.ts` | ~58 | Mermaid diagram validation |
-| `skill_validate` | `skill-validate.ts` | ~68 | Skill validation |
-| `submit_plan` | `submit-plan.ts` | ~51 | Plan submission |
+**How it works:** When `event.type === 'complete'` arrives from the SDK during an active breakout:
+1. `receivedComplete` is set to `true` (existing behavior)
+2. The usage data is captured into `deferredCompleteUsage`
+3. The loop `continue`s — skipping the `yield event` statement
+4. The for-await loop exits naturally when the SDK stream ends
+5. Post-loop code (including `checkAndResumeBreakout()`) is now reachable
 
-### 5i. Synthesis Post-Processor
+When NOT in a breakout (`_activeBreakoutMeta` is falsy), behavior is completely unchanged —
+the `complete` event is yielded normally.
 
-Deterministic safety net (`synthesis-post-processor.ts`, ~555 lines) that runs after Stage 3 LLM synthesis to guarantee `WEB_REF`/`PRIOR_REF` markers and inline `[W#]`/`[P#]` labels exist. Measured LLM adherence for inline labels was 0% -- this module compensates.
+#### Change 2c: Emit deferred usage before auto-resume check (line ~2140-2155)
 
-**Algorithm:**
-1. For each web source missing a `WEB_REF` marker, find the best-matching section by keyword overlap and inject a Sources blockquote
-2. For each source missing an inline `[W#]` label, find the best-matching sentence and append the label
-3. Same for `PRIOR_REF` / `[P#]` labels (follow-up sessions)
+**Added** in the post-loop breakout section (before the existing `checkAndResumeBreakout()` call):
+```typescript
+// Post-turn breakout completion check — runs on EVERY turn while
+// breakout is active. If the stage was completed via stage_gate(complete),
+// auto-resumes the orchestrator pipeline.
+if (this._activeBreakoutMeta) {
+  // Emit deferred usage via usage_update before auto-resume check.
+  // Can't yield 'complete' here (would trigger generator.return()),
+  // but usage_update lets sessions.ts track tokens without ending the turn.
+  if (deferredCompleteUsage) {
+    yield { type: 'usage_update', usage: deferredCompleteUsage };
+  }
+  yield* this.checkAndResumeBreakout();
+  // Only reachable if auto-resume did NOT fire (stage not completed).
+  // Auto-resume path: generator.return() from the eventual 'complete'
+  // inside the orchestrator kills the chain before reaching here.
+  // Yield 'complete' without usage (already tracked via usage_update above).
+  yield { type: 'complete' };
+  return;
+}
+```
 
-Properties: pure deterministic string processing, no LLM calls, sub-millisecond, never injects duplicates.
-
-### 5j. Follow-Up Context System
-
-When a user asks a follow-up question, the orchestrator (`follow-up-context.ts`, ~295 lines) auto-detects the previous session's `answer.json` and loads prior research sections. These appear as `PRIOR_REF` markers with `[P#]` inline labels in the new synthesis.
-
-Detection: `resolveFollowUpSessionId()` in `claude-agent.ts` checks for `answer.json` presence in the previous session directory.
-
----
-
-## 6. Configuration & Data Paths
-
-### Runtime Paths (`~/.craft-agent/`)
-
-| Path | Content |
-|------|---------|
-| `config.json` | Active configuration (themes, preferences, workspace paths) |
-| `credentials.enc` | Encrypted API credentials (Fernet, machine-specific key) |
-| `.credential-cache.json` | Decrypted cache for MCP subprocess access (0600) |
-| `sessions/` | Persisted session JSONL files |
-| `themes/` | Color theme JSON files (15 built-in) |
-| `docs/` | Built-in documentation |
-| `permissions/` | Permission rule files |
-| `tool-icons/` | SVG icons for tools |
-
-### Configuration Resolution
-
-Cascading resolution: app-level -> workspace-level (last wins).
-
-### LLM Connections
-
-Configured in `packages/shared/src/config/llm-connections.ts`. Supports multiple provider types:
-- **Anthropic** (OAuth or API key)
-- **Azure OpenAI** (multiple regions)
-- **Custom endpoints**
-
-Default model: `claude-opus-4-6` with adaptive thinking.
-
----
-
-## 7. Source Configurations
-
-14 MCP source integrations in `sources/`:
-
-| Source | Transport | Purpose |
-|--------|-----------|---------|
-| `isa-knowledge-base` | stdio | ISA standards knowledge base (hybrid search, graph, verification) |
-| `brave-search` | stdio | Web search via Brave API |
-| `pdf-server` | stdio | PDF text extraction and manipulation |
-| `anthropic` | http | Direct Anthropic API access |
-| `azure-ai-search` | http | Azure Cognitive Search |
-| `azure-openai-sweden` | http | Azure OpenAI (Sweden region) |
-| `azure-openai-swiss` | http | Azure OpenAI (Swiss region) |
-| `azure-deepseek` | http | Azure DeepSeek R1 |
-| `azure-doc-intelligence` | http | Azure Document Intelligence |
-| `azure-embeddings` | http | Azure embedding models |
-| `voyage-ai` | http | Voyage AI embeddings |
-| `onedrive-server` | stdio | OneDrive file access |
-| `outlook-server` | stdio | Outlook email access |
-| `agentnative` | http | Self-referential API source |
+**How it works:** After the for-await loop exits naturally:
+1. If `deferredCompleteUsage` was captured, emit it as `usage_update` → sessions.ts accumulates
+   the output tokens, cost, cache tokens
+2. `checkAndResumeBreakout()` runs — if stage was completed via `stage_gate(complete)`, this
+   triggers auto-resume into the next stage via `resumeFromBreakoutOrchestrator()`
+3. If auto-resume fired, we never reach the final `yield { type: 'complete' }` because
+   the orchestrator's auto-chain takes over
+4. If auto-resume did NOT fire (stage not yet completed), yield a bare `complete` and return
 
 ---
 
-## 8. ISA Knowledge Base MCP Server
+### File 3: `apps/electron/src/main/sessions.ts` (line ~6420-6440)
 
-Python MCP server (`isa-kb-mcp-server/`) providing domain-specific knowledge retrieval for ISA (International Standards on Auditing).
+**What changed:** Extended the `usage_update` handler in `processEvent()` to also accumulate
+`outputTokens`, `totalTokens`, `costUsd`, `cacheReadTokens`, `cacheCreationTokens` when present.
 
-**Modules** (13 Python files):
+**Before** (only handled `inputTokens` and `contextWindow`):
+```typescript
+case 'usage_update':
+  if (event.usage) {
+    // ... init block ...
+    managed.tokenUsage.inputTokens = event.usage.inputTokens
+    if (event.usage.contextWindow) {
+      managed.tokenUsage.contextWindow = event.usage.contextWindow
+    }
+    // Send to renderer...
+  }
+  break
+```
 
-| Module | Purpose |
-|--------|---------|
-| `search.py` | Hybrid search (FTS5 + vector similarity) |
-| `vectors.py` | Vector embedding and similarity |
-| `graph.py` | Entity-relationship graph traversal |
-| `paragraphs.py` | Paragraph retrieval and formatting |
-| `verify.py` | Citation, entity, relation, contradiction verification |
-| `context.py` | Context assembly and formatting |
-| `web_search.py` | Brave web search integration |
-| `rerank.py` | Result reranking |
-| `query_expand.py` | Query expansion |
-| `db.py` | SQLite database access |
-| `diagnostics.py` | Health checks and status |
-| `schema.sql` | Database schema |
+**After** (additional accumulation block added):
+```typescript
+case 'usage_update':
+  if (event.usage) {
+    // ... init block ...
+    managed.tokenUsage.inputTokens = event.usage.inputTokens
+    if (event.usage.contextWindow) {
+      managed.tokenUsage.contextWindow = event.usage.contextWindow
+    }
+    // Accumulate output tokens and cost when present (deferred breakout usage).
+    // During SDK breakout auto-resume, the 'complete' event is suppressed to
+    // prevent generator.return() — full usage is emitted via usage_update instead.
+    if (event.usage.outputTokens !== undefined) {
+      managed.tokenUsage.outputTokens += event.usage.outputTokens
+      managed.tokenUsage.totalTokens = managed.tokenUsage.inputTokens + managed.tokenUsage.outputTokens
+    }
+    if (event.usage.costUsd !== undefined) {
+      managed.tokenUsage.costUsd += event.usage.costUsd
+    }
+    if (event.usage.cacheReadTokens !== undefined) {
+      managed.tokenUsage.cacheReadTokens = event.usage.cacheReadTokens
+    }
+    if (event.usage.cacheCreationTokens !== undefined) {
+      managed.tokenUsage.cacheCreationTokens = event.usage.cacheCreationTokens
+    }
+    // Send to renderer...
+  }
+  break
+```
 
-**MCP Tools exposed**: `isa_hybrid_search`, `isa_hop_retrieve`, `isa_list_standards`, `isa_get_paragraph`, `isa_entity_verify`, `isa_citation_verify`, `isa_relation_verify`, `isa_contradiction_check`, `isa_format_context`, `isa_web_search`, `isa_guide_search`, `isa_guide_to_isa_hop`, `isa_list_guides`, `isa_multi_tier_search`, `isa_kb_status`, `isa_debug_hop_trace`.
-
----
-
-## 9. Agent Configuration
-
-### ISA Deep Research Agent (`agents/isa-deep-research/`)
-
-The primary agent. Configured via `config.json` (~290 lines) with:
-
-**Pipeline**: 6 stages (0-5) with pause-after-stages [0, 1], repair unit on stages [3, 4] (max 2 iterations).
-
-**Depth modes**:
-
-| Mode | Sub-queries | Paragraphs/query | Repair iterations | Context budget | Web search |
-|------|-------------|-------------------|--------------------|----------------|------------|
-| quick | 3 | 10 | 0 | 4K tokens | No |
-| standard | 8 | 20 | 2 | 12K tokens | Yes |
-| deep | 15 | 30 | 3 | 24K tokens | Yes |
-
-**Verification thresholds**: Entity grounding >= 0.80, citation accuracy >= 0.75, relation preservation >= 0.70, contradictions = 0 max.
-
-**Orchestrator settings**: Model `claude-opus-4-6`, adaptive thinking, $10 USD budget, 200K context window, BAML structured output with Zod fallback.
-
-**Output configuration**: ISA-specific citation format (`ISA {number}.{paragraph}`), progressive disclosure, PDF linking via `isa-pdf` source linker, follow-up support with delta retrieval.
-
----
-
-## 10. Copilot Chat Agents & Skills
-
-### VS Code Copilot Agents (`.github/agents/`)
-
-| Agent | Name | Purpose |
-|-------|------|---------|
-| `research-and-plan.agent.md` | Plan Changes | Branch check -> research -> write `plan.md` |
-| `carefully-implement-full-phased-plan.agent.md` | Build Continuously | Execute all plan phases -> commit/push |
-| `carefully-implement-phased-plan.agent.md` | Build Step-by-Step | One phase at a time with approval |
-| `adversarial-reviewer.agent.md` | Review Code | Read-only adversarial review |
-| `code-researcher.agent.md` | Research Code | Read-only codebase analysis |
-| `e2e-test-runner.agent.md` | Run E2E Tests | Test execution |
-
-### Skills (`skills/{slug}/SKILL.md`)
-
-Claude Code slash commands with YAML frontmatter:
-
-| Skill | Purpose |
-|-------|---------|
-| `/an-research-and-plan` | Research codebase + write plan to `plan.md` |
-| `/an-implement-full` | Execute all plan phases continuously |
-| `/an-implement-phased` | Execute plan one phase at a time |
-| `/an-adversarial-reviewer` | Adversarial code review |
-| `/an-code-researcher` | Read-only code analysis |
-| `/an-clean-plan-commit-push` | Archive plan, commit, push |
+**Why:** Without this, the `outputTokens`, `costUsd`, and cache token counts from SDK breakout
+turns would be lost. The `complete` event that normally carries this data is suppressed, so the
+`usage_update` channel must carry it instead.
 
 ---
 
-## 11. Scripts
+### File 4: `packages/shared/src/agent/__tests__/breakout-auto-resume.test.ts` (NEW FILE — 237 lines)
 
-| Script | Purpose |
-|--------|---------|
-| `electron-dev.ts` | Dev mode with hot reload |
-| `electron-build-main.ts` | Build main process (esbuild) |
-| `electron-build-preload.ts` | Build preload script (esbuild) |
-| `electron-build-renderer.ts` | Build renderer (Vite) |
-| `electron-build-resources.ts` | Copy resources to dist |
-| `electron-build-assets.ts` | Copy additional assets |
-| `electron-clean.ts` | Clean build artifacts |
-| `sync-version.ts` | Sync version across packages |
-| `extract-oauth-token.ts` | Extract OAuth token from credential store |
-| `run-e2e-live.ts` | Run live E2E tests |
-| `test-full-pipeline-e2e.ts` | Full pipeline E2E test |
-| `test-orchestrator-all-stages-e2e.ts` | All-stages orchestrator E2E |
-| `test-orchestrator-live-e2e.ts` | Live orchestrator E2E (~$0.05/run) |
-| `test-stage0-e2e.ts` | Stage 0 pause E2E test |
-| `install-app.ps1` / `install-app.sh` | Platform install scripts |
+**What it tests:** 8 unit tests validating the deferred-complete mechanism using simplified async
+generators that mirror the real delegation chain.
 
----
+**Test structure:**
 
-## 12. Quick Reference Commands
+```
+describe('Breakout auto-resume: deferred complete mechanism')
+├── describe('generator.return() propagation (demonstrates the bug)')
+│   ├── BROKEN: consumer return on complete kills post-loop code
+│   └── BROKEN: yield* delegation chain is killed by generator.return()
+├── describe('deferred complete (the fix)')
+│   ├── post-loop code is reachable when complete is deferred
+│   ├── deferred usage is emitted as usage_update with full data
+│   ├── sessions.ts consumer return does NOT kill chain when complete is deferred
+│   └── non-breakout path still yields complete normally
+└── describe('usage_update type compatibility')
+    ├── AgentEventUsage is assignable to usage_update usage field
+    └── minimal usage (inputTokens only) still works with usage_update
+```
 
-| Action | Command |
-|--------|---------|
-| Install deps | `pnpm install` |
-| Dev with hot reload | `pnpm run electron:dev` |
-| Full build | `pnpm run electron:build` |
-| TypeScript check | `pnpm run typecheck:all` |
-| Lint | `pnpm run lint` |
-| Test | `pnpm run test` |
-| E2E tests | `pnpm run test:e2e` |
-| Live E2E (requires token) | `pnpm run test:e2e:live:auto` |
-| Live orchestrator E2E | `npx tsx scripts/test-orchestrator-live-e2e.ts` |
+**Key test helpers:**
+- `brokenChatLoop()` — simulates the OLD behavior (yields `complete` unconditionally)
+- `fixedChatLoop()` — simulates the FIXED behavior (defers `complete` when breakout active)
+- `consumeWithReturn()` — simulates sessions.ts consumer that returns on `complete`
+- `wrapWithYieldStar()` — simulates the `yield*` delegation chain
 
----
-
-## 13. Conventions & Constraints
-
-### TypeScript
-- Strict mode everywhere -- no `any` types unless explicitly justified
-- Proper type narrowing, no unsafe casts (`as`)
-- No unhandled promises
-
-### Naming
-- `camelCase` for functions and variables
-- `PascalCase` for types, interfaces, classes, React components
-- `UPPER_SNAKE_CASE` for constants
-
-### Imports
-- Workspace protocol (`workspace:*`) for internal packages
-- Relative imports within a package
-- Absolute workspace imports across packages
-
-### Electron Security
-- `nodeIntegration: false`, `contextIsolation: true`
-- All IPC through preload bridge
-- No direct Node.js access from renderer
-
-### Plan Tracking
-- Implementation plans in `plan.md` at project root
-- Status markers: `[ ]` pending, `[x]` done, `[~]` in progress, `[-]` skipped
-- Completed plans archived to `plans/YYMMDD-{slug}.md`
-- Never delete completed items -- mark done for audit trail
-
-### Do NOT
-- Use `bun` (not available on Windows ARM64)
-- Introduce `any` without justification
-- Use `nodeIntegration: true`
-- Skip TypeScript strict mode checks
-- Hard-code credentials or API keys
-- Commit `.claude/settings.local.json`
-
-### Do ALWAYS
-- Run `pnpm run typecheck:all` before considering changes complete
-- Run `pnpm run lint` before considering changes complete
-- Follow existing patterns before introducing new ones
-- Update `plan.md` when completing implementation phases
-- Use workspace protocol for internal packages
-- Use `npx tsx` to run TypeScript scripts directly
+**What each test proves:**
+1. **BROKEN tests** — Demonstrate the original bug: `consumeWithReturn(brokenChatLoop(...))` never
+   sees `POST_LOOP_REACHED` because `generator.return()` kills the chain
+2. **post-loop reachable** — `fixedChatLoop()` with breakout active: `complete` is not yielded,
+   `POST_LOOP_REACHED` is yielded, proving post-loop code is reachable
+3. **usage_update data** — Deferred usage is emitted with ALL fields (outputTokens, costUsd,
+   cacheReadTokens, cacheCreationTokens, contextWindow)
+4. **yield* chain survives** — When wrapped with `wrapWithYieldStar()`, both inner POST_LOOP and
+   outer POST_DELEGATION markers appear (proving the delegation chain is not killed)
+5. **non-breakout unchanged** — `fixedChatLoop(events, false)` yields `complete` normally, no
+   `usage_update`, no post-loop breakout code — proving the fix is scoped
+6. **Type compatibility** — Full `AgentEventUsage` and minimal `{inputTokens}` both satisfy the
+   widened `usage_update` type
 
 ---
 
-## 14. Completed Plans Archive
+## Validation Results
 
-| Date | Slug | Summary |
-|------|------|---------|
-| 2026-02-16 | `agent-quality-hardening` | Agent quality improvements |
-| 2026-02-16 | `subagent-abort-propagation` | Subagent abort signal propagation |
-| 2026-02-17 | `stage-gate-pause-enforcement` | Stage gate pause enforcement |
-| 2026-02-18 | `agent-branch-hygiene` | Agent branch management |
-| 2026-02-18 | `agent-default-sources` | Default source configuration |
-| 2026-02-18 | `agent-overhaul-e2e-framework` | E2E test framework overhaul |
-| 2026-02-18 | `agent-overhaul-e2e-framework-complete` | E2E framework completion |
-| 2026-02-18 | `auto-enable-agent-sources` | Auto-enable required sources |
-| 2026-02-18 | `generic-e2e-test-framework` | Generic E2E test framework |
-| 2026-02-18 | `isa-websearch-intent-clarification` | ISA websearch intent |
-| 2026-02-18 | `natural-completion-stage-gate` | Natural completion for stage gates |
-| 2026-02-18 | `stage-gate-diagnostics-logging` | Stage gate diagnostics |
-| 2026-02-18 | `stage0-lightweight-clarification-pause` | Stage 0 lightweight pause |
-| 2026-02-26 | `craft-agent-agentnative-technical-specification` | This technical spec |
-| 2026-02-27 | `extract-agent-pipeline-core` | Extract `@craft-agent/agent-pipeline-core` package (9 phases) |
-| 2026-02-27 | `mini-completion-cwd-isolation` | Fix `runMiniCompletion` cwd isolation for title gen |
-| 2026-02-27 | `transcript-validation-before-resume` | SDK transcript validation before session resume |
-| 2026-02-27 | `dynamic-stage-thinking-fix` | Remove broken custom thinking UI, fix pause lifecycle |
-| 2026-02-27 | `rich-agent-substep-visibility` | Orchestrator substep events surfaced as TurnCard activities |
-| 2026-02-27 | `conversation-disappears-bugfix` | Fix orchTurnId overwriting causing blank conversation |
-| 2026-02-28 | `orchestrator-context-continuity` | Pipeline summary context injection, breakout system, confirmation gate, semantic detection, adversarial hardening |
-| 2026-02-28 | `resume-pipeline-after-breakout` | Resume pipeline from breakout on agent re-invocation (74 tests) |
-| 2026-03-01 | `conversation-history-management` | Conversation history management: delete, edit, restore, branch (88 tasks) |
-| 2026-03-01 | `conversation-history-behavioral-fixes` | Behavioral fixes: single-delete, in-place edit, restore to input, icon action bars (42 tasks) |
+### Typecheck
+- [x] `pnpm run typecheck:all` — **PASS** (0 errors)
+
+### Lint
+- [x] `pnpm run lint` — 5 pre-existing errors, **0 new errors introduced**
+
+### Unit Tests
+- [x] `pnpm run test` — **8/8 new tests pass**, 66/66 pipeline tests pass
+- Pre-existing failures (unrelated): `base-agent.test.ts` (import issues), `tool-matching.test.ts`
+  (import issues), `skills/storage.test.ts` (`bun:` scheme error)
+
+### Live Pipeline Verification (session `260313-fresh-lotus`)
+- [x] Pipeline ran correctly: Stage 0 → 1 → 2 → 3 with auto-resume working
+- [x] Stage 1 (sdk_breakout) auto-resumed into Stage 2 (review) — **the bug is fixed**
+- [x] Stage 2 produced 8 adversarial review findings
+- [x] Stage 3 refined the plan addressing 7/8 findings, rejecting 1
+- [x] Pipeline paused at Stage 3 as configured (`pauseAfterStages: [0, 3]`)
+- Event sequence: `stage_started(0) → stage_completed(0) → pause(0) → resumed(0) →
+  stage_started(1) → breakout(1) → resume_from_breakout(2) → stage_started(2) →
+  stage_completed(2) → stage_started(3) → stage_completed(3) → pause(3)`
+- Model: `claude-opus-4-6`, 153 tool calls during Stage 1 breakout
 
 ---
 
-## 15. Future Plans & Roadmap
+## Risks & Considerations
 
-> Add upcoming features, ideas, and technical debt items here.
+1. **`runOrchestrator` edge case**: If an agent's stage 0 is `sdk_breakout`, the original userMessage
+   (containing `[agent:xxx]`) would be passed to `executeSdkBreakoutStage()` → `chat()`, where
+   `detectOrchestratableAgent()` could re-detect the agent. **Mitigation**: No current agent has
+   stage 0 as sdk_breakout. Dev-loop stage 0 is `orchestrator_llm`.
+
+2. **Generator depth**: Auto-chain adds depth to the `yield*` delegation chain. JavaScript generators
+   support this without issues.
+
+3. **Sequential breakouts**: Consecutive `sdk_breakout` stages (e.g., stage 1 → stage 4) are handled
+   correctly by the existing `checkAndResumeBreakout` → `resumeFromBreakoutOrchestrator` path.
 
 ---
+
+## File Change Summary (for applying to another branch)
+
+| # | File | Action | Lines Changed |
+|---|------|--------|---------------|
+| 1 | `packages/core/src/types/message.ts` | Modified | Line 410: widened `usage_update` type |
+| 2 | `packages/shared/src/agent/claude-agent.ts` | Modified | Line 95: added `AgentEventUsage` import |
+| 3 | `packages/shared/src/agent/claude-agent.ts` | Modified | Lines 1955-1960: added `deferredCompleteUsage` variable |
+| 4 | `packages/shared/src/agent/claude-agent.ts` | Modified | Lines 2088-2098: defer `complete` in inner loop |
+| 5 | `packages/shared/src/agent/claude-agent.ts` | Modified | Lines 2140-2155: emit deferred usage + post-loop complete |
+| 6 | `apps/electron/src/main/sessions.ts` | Modified | Lines 6420-6440: extended `usage_update` handler |
+| 7 | `packages/shared/src/agent/__tests__/breakout-auto-resume.test.ts` | Created | 237 lines: 8 unit tests |
+
+### Git Diff Snapshot
+
+To generate the exact diff for transfer:
+```bash
+git diff HEAD -- packages/core/src/types/message.ts packages/shared/src/agent/claude-agent.ts apps/electron/src/main/sessions.ts
+git diff HEAD -- packages/shared/src/agent/__tests__/breakout-auto-resume.test.ts
+```
+
+Or to create a patch file:
+```bash
+git diff HEAD > breakout-auto-resume-fix.patch
+```

@@ -15,10 +15,13 @@
  */
 
 import { join } from 'node:path';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync } from 'node:fs';
 import type { SessionToolContext } from '../context.ts';
 import type { ToolResult } from '../types.ts';
 import { successResponse, errorResponse } from '../response.ts';
 import { injectSourceBlocks } from './agent-render-output/renderer.ts';
+import { validateStageOutput } from '../stage-output-validation.ts';
+import type { StageOutputSchema } from '../stage-output-validation.ts';
 
 // ============================================================
 // Types
@@ -88,120 +91,8 @@ interface StageGateConfig {
   };
 }
 
-// ============================================================
-// Stage Output Schema Validation
-// ============================================================
-
-/**
- * Lightweight JSON schema for validating stage outputs.
- * Intentionally simple — no external deps, ~80 lines.
- *
- * Enforcement modes:
- * - "warn" (default): validation emits warnings but never blocks completion.
- * - "block": validation failures return allowed:false with a repair message,
- *   forcing the agent to fix the output before the stage can complete.
- */
-interface StageOutputSchemaProperty {
-  type?: 'string' | 'number' | 'boolean' | 'array' | 'object';
-  enum?: unknown[];
-  minItems?: number;
-  required?: string[];
-  properties?: Record<string, StageOutputSchemaProperty>;
-}
-
-interface StageOutputSchema {
-  required?: string[];
-  properties?: Record<string, StageOutputSchemaProperty>;
-  /** When "block", validation failures prevent stage completion. Default: "warn". */
-  enforcement?: 'warn' | 'block';
-  /** Message returned to the agent when enforcement is "block" and validation fails. */
-  blockMessage?: string;
-}
-
-interface ValidationResult {
-  valid: boolean;
-  warnings: string[];
-}
-
-function validateValue(
-  value: unknown,
-  schema: StageOutputSchemaProperty,
-  path: string,
-): string[] {
-  const warnings: string[] = [];
-
-  // Type check
-  if (schema.type) {
-    const actualType = Array.isArray(value) ? 'array' : typeof value;
-    if (value !== undefined && value !== null && actualType !== schema.type) {
-      warnings.push(`${path}: expected type '${schema.type}', got '${actualType}'`);
-    }
-  }
-
-  // Enum check
-  if (schema.enum && value !== undefined) {
-    if (!schema.enum.includes(value)) {
-      warnings.push(`${path}: value '${String(value)}' not in enum [${schema.enum.map(String).join(', ')}]`);
-    }
-  }
-
-  // Array minItems check
-  if (schema.minItems !== undefined && Array.isArray(value)) {
-    if (value.length < schema.minItems) {
-      warnings.push(`${path}: array has ${value.length} items, minimum is ${schema.minItems}`);
-    }
-  }
-
-  // Nested object validation
-  if (schema.properties && typeof value === 'object' && value !== null && !Array.isArray(value)) {
-    const obj = value as Record<string, unknown>;
-
-    // Check required fields
-    if (schema.required) {
-      for (const req of schema.required) {
-        if (!(req in obj)) {
-          warnings.push(`${path}.${req}: required field missing`);
-        }
-      }
-    }
-
-    // Validate known properties
-    for (const [key, propSchema] of Object.entries(schema.properties)) {
-      if (key in obj) {
-        warnings.push(...validateValue(obj[key], propSchema, `${path}.${key}`));
-      }
-    }
-  }
-
-  return warnings;
-}
-
-function validateStageOutput(
-  data: Record<string, unknown>,
-  schema: StageOutputSchema,
-): ValidationResult {
-  const warnings: string[] = [];
-
-  // Check top-level required fields
-  if (schema.required) {
-    for (const req of schema.required) {
-      if (!(req in data)) {
-        warnings.push(`${req}: required field missing`);
-      }
-    }
-  }
-
-  // Validate known properties
-  if (schema.properties) {
-    for (const [key, propSchema] of Object.entries(schema.properties)) {
-      if (key in data) {
-        warnings.push(...validateValue(data[key], propSchema, key));
-      }
-    }
-  }
-
-  return { valid: warnings.length === 0, warnings };
-}
+// Stage Output Schema types and validateStageOutput() are imported from
+// '../stage-output-validation.ts' — shared with the orchestrator pipeline.
 
 /** Run state persisted in current-run-state.json */
 interface RunState {
@@ -221,6 +112,12 @@ interface RunState {
   pausedAtStage?: number;
   /** Set when user resumes with 'modify' — holds modifications for the next stage. */
   pendingModifications?: Record<string, unknown>;
+  /**
+   * Set by the orchestrator when an SDK breakout stage begins.
+   * Only the breakout stage can be started/completed while this is set.
+   * The orchestrator clears it via clearBreakoutScope() on resume.
+   */
+  breakoutStage?: number;
 }
 
 /** Event appended to agent-events.jsonl */
@@ -546,6 +443,17 @@ function handleStart(
     });
   }
 
+  // Breakout scope enforcement: only the breakout stage can be started
+  if (state.breakoutStage !== undefined && stage !== state.breakoutStage) {
+    return makeResult(state, config, {
+      allowed: false,
+      reason:
+        `Breakout scope active for stage ${state.breakoutStage}. ` +
+        `Only the orchestrator can advance past this stage. ` +
+        `Call stage_gate(complete) to finish stage ${state.breakoutStage}.`,
+    });
+  }
+
   // Validate stage exists in config
   const stageDef = config.controlFlow.stages.find((s) => s.id === stage);
   if (!stageDef) {
@@ -631,6 +539,15 @@ function handleComplete(
     });
   }
 
+  // Breakout scope enforcement: only the breakout stage can be completed
+  if (state.breakoutStage !== undefined && stage !== state.breakoutStage) {
+    return makeResult(state, config, {
+      allowed: false,
+      reason:
+        `Cannot complete stage ${stage} — breakout scope is limited to stage ${state.breakoutStage}.`,
+    });
+  }
+
   const now = nowISO();
 
   // Mark stage as completed
@@ -638,13 +555,16 @@ function handleComplete(
     state.completedStages.push(stage);
   }
 
-  // Store stage output
+  // Store stage output (stageOutputs may be missing in orchestrator-managed runs)
   if (args.data) {
+    if (!state.stageOutputs) state.stageOutputs = {};
     state.stageOutputs[stage] = args.data;
   }
 
-  // Track tool calls
+  // Track tool calls (fields may be missing in orchestrator-managed runs)
   if (args.data?.toolCalls && Array.isArray(args.data.toolCalls)) {
+    if (state.toolCallCount === undefined) state.toolCallCount = 0;
+    if (!state.toolCallDurations) state.toolCallDurations = {};
     for (const tc of args.data.toolCalls as Array<{
       tool: string;
       durationMs: number;
@@ -1381,8 +1301,19 @@ function handleResume(
   });
 
   const nextStage = pausedStage + 1;
+
+  // When breakout scope is active, instruct the LLM to stop — the orchestrator
+  // will advance to the next stage. Prevents the LLM from self-driving past
+  // the breakout boundary. Uses the existing reason field (F7).
+  const breakoutStopReason = state.breakoutStage !== undefined
+    ? 'Stage resumed. Your work for this stage is now complete. ' +
+      'STOP working — the orchestrator will advance to the next stage. ' +
+      'Do NOT call stage_gate(start) for any subsequent stage.'
+    : undefined;
+
   return makeResult(state, config, {
     nextStage,
+    ...(breakoutStopReason ? { reason: breakoutStopReason } : {}),
     ...(decision === 'modify' && state.pendingModifications
       ? { modifications: state.pendingModifications }
       : {}),
@@ -1480,6 +1411,75 @@ function injectSourceBlocksIntoContent(
   });
 
   return processed.join('\n\n');
+}
+
+// ============================================================
+// Breakout Scope Utilities (for orchestrator-side use)
+// ============================================================
+
+/**
+ * Set the breakout scope on the agent's run state.
+ *
+ * Called by the orchestrator before yielding an `orchestrator_sdk_breakout` event.
+ * While `breakoutStage` is set, `handleStart()` and `handleComplete()` reject
+ * any stage that doesn't match, preventing the LLM from self-driving past
+ * the breakout boundary.
+ *
+ * Uses raw Node `fs` (not `SessionToolContext.fs`) because the orchestrator
+ * doesn't have a `SessionToolContext`. Matches `PipelineState.saveTo()` pattern.
+ *
+ * @param sessionPath — Absolute path to the session directory (e.g., `sessions/{id}`)
+ * @param agentSlug — The agent slug
+ * @param breakoutStage — Stage number to lock scope to
+ */
+export function setBreakoutScope(
+  sessionPath: string,
+  agentSlug: string,
+  breakoutStage: number,
+): void {
+  const stateFile = join(sessionPath, 'data', 'agents', agentSlug, 'current-run-state.json');
+  if (!existsSync(stateFile)) return;
+
+  try {
+    const state = JSON.parse(readFileSync(stateFile, 'utf-8')) as RunState;
+    state.breakoutStage = breakoutStage;
+    const dir = join(sessionPath, 'data', 'agents', agentSlug);
+    mkdirSync(dir, { recursive: true });
+    const tmpFile = stateFile + '.tmp';
+    writeFileSync(tmpFile, JSON.stringify(state, null, 2), 'utf-8');
+    renameSync(tmpFile, stateFile);
+  } catch (err) {
+    console.warn(`[agent-stage-gate] setBreakoutScope failed for '${agentSlug}':`, err);
+  }
+}
+
+/**
+ * Clear the breakout scope from the agent's run state.
+ *
+ * Called by the orchestrator when resuming from an SDK breakout. After this,
+ * `handleStart()` and `handleComplete()` allow any stage again.
+ *
+ * @param sessionPath — Absolute path to the session directory
+ * @param agentSlug — The agent slug
+ */
+export function clearBreakoutScope(
+  sessionPath: string,
+  agentSlug: string,
+): void {
+  const stateFile = join(sessionPath, 'data', 'agents', agentSlug, 'current-run-state.json');
+  if (!existsSync(stateFile)) return;
+
+  try {
+    const state = JSON.parse(readFileSync(stateFile, 'utf-8')) as RunState;
+    delete state.breakoutStage;
+    const dir = join(sessionPath, 'data', 'agents', agentSlug);
+    mkdirSync(dir, { recursive: true });
+    const tmpFile = stateFile + '.tmp';
+    writeFileSync(tmpFile, JSON.stringify(state, null, 2), 'utf-8');
+    renameSync(tmpFile, stateFile);
+  } catch (err) {
+    console.warn(`[agent-stage-gate] clearBreakoutScope failed for '${agentSlug}':`, err);
+  }
 }
 
 // ============================================================

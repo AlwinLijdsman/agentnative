@@ -266,6 +266,9 @@ export default function AgentInfoPage({ agentSlug, workspaceId }: AgentInfoPageP
                     <span className="text-muted-foreground text-xs truncate">
                       {stage.description}
                     </span>
+                    {stage.mode === 'sdk_breakout' && (
+                      <Info_Badge color="default">sdk_breakout</Info_Badge>
+                    )}
                     {agent.config.controlFlow.pauseAfterStages.includes(stage.id) && (
                       <Info_Badge color="warning">pause</Info_Badge>
                     )}
@@ -295,38 +298,42 @@ export default function AgentInfoPage({ agentSlug, workspaceId }: AgentInfoPageP
             </div>
           </Info_Section>
 
-          {/* Verification Thresholds */}
-          <Info_Section title="Verification">
-            <Info_Table>
-              <Info_Table.Row label="Entity Grounding">
-                ≥ {agent.config.verification.entityGrounding.threshold}
-              </Info_Table.Row>
-              <Info_Table.Row label="Relation Preservation">
-                ≥ {agent.config.verification.relationPreservation.threshold}
-              </Info_Table.Row>
-              <Info_Table.Row label="Citation Accuracy">
-                ≥ {agent.config.verification.citationAccuracy.threshold}
-              </Info_Table.Row>
-              <Info_Table.Row label="Contradictions">
-                max {agent.config.verification.contradictions.maxUnresolved} unresolved
-              </Info_Table.Row>
-            </Info_Table>
-          </Info_Section>
+          {/* Verification Thresholds (ISA agents only) */}
+          {agent.config.verification && (
+            <Info_Section title="Verification">
+              <Info_Table>
+                <Info_Table.Row label="Entity Grounding">
+                  ≥ {agent.config.verification.entityGrounding.threshold}
+                </Info_Table.Row>
+                <Info_Table.Row label="Relation Preservation">
+                  ≥ {agent.config.verification.relationPreservation.threshold}
+                </Info_Table.Row>
+                <Info_Table.Row label="Citation Accuracy">
+                  ≥ {agent.config.verification.citationAccuracy.threshold}
+                </Info_Table.Row>
+                <Info_Table.Row label="Contradictions">
+                  max {agent.config.verification.contradictions.maxUnresolved} unresolved
+                </Info_Table.Row>
+              </Info_Table>
+            </Info_Section>
+          )}
 
-          {/* Depth Modes */}
-          <Info_Section title="Depth Modes">
-            <div className="px-4 py-3 space-y-2">
-              {Object.entries(agent.config.depthModes).map(([modeName, mode]) => (
-                <div key={modeName} className="flex items-start gap-3 py-1 text-sm">
-                  <Info_Badge color="default">{modeName}</Info_Badge>
-                  <span className="text-xs text-muted-foreground">
-                    {mode.maxSubQueries} sub-queries, {mode.maxParagraphsPerQuery} paragraphs, {mode.maxRepairIterations} repair iterations
-                    {mode.enableWebSearch && ', web search'}
-                  </span>
-                </div>
-              ))}
-            </div>
-          </Info_Section>
+          {/* Depth Modes (ISA agents only) */}
+          {agent.config.depthModes && Object.keys(agent.config.depthModes).length > 0 && (
+            <Info_Section title="Depth Modes">
+              <div className="px-4 py-3 space-y-2">
+                {Object.entries(agent.config.depthModes).map(([modeName, mode]) => (
+                  <div key={modeName} className="flex items-start gap-3 py-1 text-sm">
+                    <Info_Badge color="default">{modeName}</Info_Badge>
+                    <span className="text-xs text-muted-foreground">
+                      {mode.maxSubQueries} sub-queries, {mode.maxParagraphsPerQuery} paragraphs, {mode.maxRepairIterations} repair iterations
+                      {mode.enableWebSearch && ', web search'}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </Info_Section>
+          )}
 
           {/* Configuration */}
           <Info_Section title="Configuration">
@@ -339,13 +346,23 @@ export default function AgentInfoPage({ agentSlug, workspaceId }: AgentInfoPageP
                 {agent.config.logging.persistIntermediates && ', persist intermediates'}
                 {agent.config.logging.costTracking && ', cost tracking'}
               </Info_Table.Row>
-              <Info_Table.Row label="Follow-up">
-                {agent.config.followUp.enabled ? 'Enabled' : 'Disabled'}
-                {agent.config.followUp.enabled && ` (max ${agent.config.followUp.maxAccumulatedSections} sections)`}
-              </Info_Table.Row>
-              <Info_Table.Row label="Output">
-                {agent.config.output.progressiveDisclosure ? 'Progressive disclosure' : 'Full output'}
-              </Info_Table.Row>
+              {agent.config.followUp && (
+                <Info_Table.Row label="Follow-up">
+                  {agent.config.followUp.enabled ? 'Enabled' : 'Disabled'}
+                  {agent.config.followUp.enabled && ` (max ${agent.config.followUp.maxAccumulatedSections} sections)`}
+                </Info_Table.Row>
+              )}
+              {agent.config.output && (
+                <Info_Table.Row label="Output">
+                  {agent.config.output.progressiveDisclosure ? 'Progressive disclosure' : 'Full output'}
+                </Info_Table.Row>
+              )}
+              {agent.config.orchestrator?.enabled && (
+                <Info_Table.Row label="Orchestrator">
+                  {agent.config.orchestrator.model ?? 'default'}
+                  {agent.config.orchestrator.effort && `, effort: ${agent.config.orchestrator.effort}`}
+                </Info_Table.Row>
+              )}
               <Info_Table.Row label="Debug">
                 <button
                   onClick={handleToggleDebug}

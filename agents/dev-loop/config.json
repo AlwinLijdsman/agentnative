@@ -1,0 +1,174 @@
+{
+  "controlFlow": {
+    "stages": [
+      {
+        "id": 0,
+        "name": "analyze_request",
+        "description": "Parse feature request, assess scope and complexity, detect project type",
+        "pauseInstructions": "1. **Proceed** — scope looks correct, start planning\n2. **Amend** — adjust the scope or add details\n3. **Cancel** — abandon this request",
+        "pauseChoices": ["Proceed — scope looks correct", "Amend — adjust scope or add details", "Cancel — abandon"],
+        "pauseDisplayFields": [
+          { "key": "feature_description", "label": "Feature", "type": "text" },
+          { "key": "scope", "label": "Scope", "type": "text" },
+          { "key": "complexity", "label": "Complexity", "type": "text" },
+          { "key": "affected_areas", "label": "Affected Areas", "type": "list" },
+          { "key": "detected_stack", "label": "Tech Stack", "type": "key-value", "displayKeys": ["language", "runtime", "package_manager", "test_framework"] }
+        ]
+      },
+      {
+        "id": 1,
+        "name": "plan",
+        "description": "Research codebase and generate implementation plan with phases",
+        "mode": "sdk_breakout",
+        "pauseInstructions": "Review the implementation plan below. Check that the phases, key files, and testing strategy match your expectations.\n\n1. **Approve** — start adversarial review, then implement\n2. **Amend** — tell me what to change and I'll revise the plan\n3. **Cancel** — abandon this request"
+      },
+      {
+        "id": 2,
+        "name": "review",
+        "description": "Adversarial review of the plan — find bugs, security issues, design flaws"
+      },
+      {
+        "id": 3,
+        "name": "refine_plan",
+        "description": "Address review findings and produce refined implementation plan",
+        "pauseInstructions": "1. **Approve** — start implementation\n2. **Amend** — request further changes\n3. **Cancel** — abandon this request",
+        "pauseChoices": ["Approve — start implementation", "Amend — request further changes", "Cancel — abandon"],
+        "pauseDisplayFields": [
+          { "key": "refined_plan", "label": "Refined Approach", "type": "text" },
+          { "key": "addressed_findings", "label": "Addressed Findings", "type": "object-list", "itemTemplate": "**{finding_id}** ({severity}): {resolution}" },
+          { "key": "rejected_findings", "label": "Rejected Findings", "type": "object-list", "itemTemplate": "**{finding_id}** ({severity}): {reason}" },
+          { "key": "final_phases", "label": "Implementation Phases", "type": "object-list", "itemTemplate": "**Phase {phase}: {name}** — {description}" }
+        ]
+      },
+      {
+        "id": 4,
+        "name": "implement",
+        "description": "Execute refined plan phase by phase with typecheck and lint validation",
+        "mode": "sdk_breakout"
+      },
+      {
+        "id": 5,
+        "name": "test_and_diagnose",
+        "description": "Run tests, capture evidence, classify bugs, assess progress",
+        "mode": "sdk_breakout"
+      },
+      {
+        "id": 6,
+        "name": "decide",
+        "description": "Convergence assessment — done, restart inner loop, or escalate"
+      }
+    ],
+    "repairUnits": [
+      {
+        "stages": [4, 5],
+        "maxIterations": 5,
+        "feedbackField": "repair_feedback"
+      }
+    ],
+    "pauseAfterStages": [0, 3],
+    "autoAdvance": true,
+    "pauseOnErrors": ["auth", "config"],
+    "stageOutputSchemas": {
+      "0": {
+        "required": ["scope", "feature_description"],
+        "properties": {
+          "scope": { "type": "string" },
+          "workspace_type": { "type": "string" },
+          "feature_description": { "type": "string" },
+          "affected_areas": { "type": "array" },
+          "complexity": { "type": "string", "enum": ["low", "medium", "high"] },
+          "existing_tests": { "type": "object" },
+          "detected_stack": { "type": "object" }
+        }
+      },
+      "1": {
+        "required": ["plan_summary", "phases"],
+        "properties": {
+          "plan_summary": { "type": "string" },
+          "phases": { "type": "array", "minItems": 1 },
+          "key_files": { "type": "array" },
+          "risks": { "type": "array" },
+          "testing_strategy": { "type": "string" }
+        }
+      },
+      "2": {
+        "required": ["findings", "plan_verdict"],
+        "properties": {
+          "findings": { "type": "array" },
+          "severity_distribution": { "type": "object" },
+          "critical_count": { "type": "number" },
+          "plan_verdict": { "type": "string", "enum": ["pass", "warn", "fail"] }
+        },
+        "enforcement": "block",
+        "blockMessage": "Stage 2 BLOCKED: findings (array of review items) and plan_verdict (pass/warn/fail) are required. Review all plan phases and produce findings with severity levels."
+      },
+      "3": {
+        "required": ["refined_plan", "final_phases"],
+        "properties": {
+          "refined_plan": { "type": "string" },
+          "addressed_findings": { "type": "array" },
+          "rejected_findings": { "type": "array" },
+          "final_phases": { "type": "array", "minItems": 1 }
+        },
+        "enforcement": "block",
+        "blockMessage": "Stage 3 BLOCKED: refined_plan (string) and final_phases (array of implementation phases) are required. Address all critical findings and produce updated phases."
+      },
+      "4": {
+        "required": ["files_modified", "typecheck_passed"],
+        "properties": {
+          "files_modified": { "type": "array" },
+          "typecheck_passed": { "type": "boolean" },
+          "lint_passed": { "type": "boolean" },
+          "implementation_notes": { "type": "string" }
+        },
+        "enforcement": "block",
+        "blockMessage": "Stage 4 BLOCKED: files_modified (array of changed file paths) and typecheck_passed (boolean) are required. Run typecheck and lint, then complete with the results."
+      },
+      "5": {
+        "required": ["tests_passed", "total_tests", "needsRepair"],
+        "properties": {
+          "tests_passed": { "type": "boolean" },
+          "total_tests": { "type": "number" },
+          "failed_tests": { "type": "array" },
+          "bugs": { "type": "array" },
+          "progress": { "type": "string" },
+          "needsRepair": { "type": "boolean" },
+          "repair_feedback": { "type": "string" }
+        },
+        "enforcement": "block",
+        "blockMessage": "Stage 5 BLOCKED: tests_passed (boolean), total_tests (number), and needsRepair (boolean) are required. Run the test suite and report results. If tests fail, set needsRepair=true with repair_feedback describing what to fix."
+      },
+      "6": {
+        "required": ["decision"],
+        "properties": {
+          "decision": { "type": "string", "enum": ["done", "restart", "escalate"] },
+          "iteration_count": { "type": "number" },
+          "bug_summary": { "type": "string" },
+          "next_action": { "type": "string" }
+        },
+        "enforcement": "block",
+        "blockMessage": "Stage 6 BLOCKED: decision is required. Must be 'done' (all tests pass), 'restart' (try again with lessons learned), or 'escalate' (needs human intervention)."
+      }
+    }
+  },
+  "logging": {
+    "level": "verbose",
+    "persistIntermediates": true,
+    "costTracking": true
+  },
+  "orchestrator": {
+    "enabled": true,
+    "model": "claude-sonnet-4-5-20250929",
+    "thinking": { "type": "adaptive" },
+    "effort": "high",
+    "contextWindow": 200000,
+    "minOutputBudget": 4096,
+    "budgetUsd": 5.0,
+    "perStageDesiredTokens": {
+      "0": 8192,
+      "2": 16384,
+      "3": 16384,
+      "6": 4096
+    }
+  }
+}

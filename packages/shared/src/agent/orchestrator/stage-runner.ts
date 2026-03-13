@@ -19,6 +19,8 @@ import type { OrchestratorLlmClient } from './llm-client.ts';
 import type { PipelineState } from './pipeline-state.ts';
 import type {
   AgentConfig,
+  ContextWindowEntry,
+  OrchestratorContextWindowEntry,
   FollowUpContext,
   McpBridge,
   OnProgressCallback,
@@ -35,6 +37,9 @@ import { ZERO_USAGE } from './types.ts';
 import { buildStageContext, wrapXml } from './context-builder.ts';
 import { extractRawJson } from './json-extractor.ts';
 import { buildPriorContextHint } from './follow-up-context.ts';
+import { estimateTokens } from './context-budget.ts';
+import { appendContextWindowEntry as writeContextWindowEntry } from '../../sessions/context-window-writer.ts';
+import { writeDebugContextFile } from '../../sessions/debug-context-writer.ts';
 
 // BAML adapter — feature-flagged, uses dynamic imports (Phase 10)
 import { callBamlStage0, callBamlStage1, callBamlStage3 } from './baml-adapter.ts';
@@ -57,6 +62,7 @@ const MAX_STAGE1_WEB_QUERIES = 5;
 export class StageRunner {
   private toolUseCounter = 0;
   private _onProgress?: OnProgressCallback;
+  private _agentSlug: string | null = null;
 
   constructor(
     private readonly llmClient: OrchestratorLlmClient,
@@ -65,6 +71,14 @@ export class StageRunner {
     private readonly onStreamEvent?: (event: StreamEvent) => void,
     private readonly getAuthToken?: () => Promise<string>,
   ) {}
+
+  /**
+   * Set the agent slug for debug context file writing.
+   * Called by the orchestrator before each pipeline run.
+   */
+  setAgentSlug(slug: string): void {
+    this._agentSlug = slug;
+  }
 
   /**
    * Set the progress callback. Called by the orchestrator before each pipeline run
@@ -177,6 +191,7 @@ export class StageRunner {
     userMessage: string,
     agentConfig: AgentConfig,
     followUpContext?: FollowUpContext | null,
+    options?: { forceWorkspaceMetadata?: boolean },
   ): Promise<StageResult> {
     switch (stage.name) {
       case 'analyze_query':
@@ -192,10 +207,10 @@ export class StageRunner {
       case 'output':
         return this.runOutput(stage, state, agentConfig, followUpContext);
       default:
-        throw new Error(
-          `Unknown stage handler: '${stage.name}' (stage ${stage.id}). ` +
-          `Known handlers: analyze_query, websearch_calibration, retrieve, synthesize, verify, output`,
-        );
+        // Generic handler — loads prompt from agent's prompts/ directory.
+        // Enables new agents to define stages via prompt files + config.json
+        // without requiring hardcoded TypeScript handler code.
+        return this.runPromptDrivenStage(stage, state, userMessage, agentConfig, options?.forceWorkspaceMetadata);
     }
   }
 
@@ -227,6 +242,7 @@ export class StageRunner {
         const authToken = await this.getAuthToken();
         const bamlResult = await callBamlStage0(userMessage, authToken);
         if (bamlResult) {
+          // TODO: BAML path — context window not logged (BAML doesn't expose raw prompt/response)
           return {
             text: JSON.stringify(bamlResult, null, 2),
             summary: `Query plan: ${bamlResult.sub_queries.length} sub-queries (BAML)`,
@@ -272,6 +288,7 @@ export class StageRunner {
     const llmToolId = this.generateToolUseId('llm-analyze');
     this.emitProgress({ type: 'llm_start', stageId: stage.id, stageName: 'analyze_query', toolUseId: llmToolId });
 
+    const callStart = Date.now();
     const result = await this.llmClient.call({
       systemPrompt,
       userMessage: enhancedMessage,
@@ -281,6 +298,33 @@ export class StageRunner {
     });
 
     this.emitProgress({ type: 'llm_complete', text: result.text.slice(0, 200), toolUseId: llmToolId, isIntermediate: true });
+
+    // Context window logging — capture full LLM I/O
+    this.appendContextWindowEntry({
+      source: 'orchestrator',
+      stageId: stage.id,
+      stageName: 'analyze_query',
+      repairIteration: null,
+      timestamp: new Date(callStart).toISOString(),
+      durationMs: Date.now() - callStart,
+      llm: {
+        model: result.model,
+        effort: this.getStageEffort(orchestratorConfig),
+        desiredMaxTokens: desiredTokens,
+      },
+      input: {
+        systemPrompt,
+        userMessage: enhancedMessage,
+        estimatedInputTokens: estimateTokens(systemPrompt + enhancedMessage),
+      },
+      output: {
+        responseText: result.text,
+        thinkingSummary: result.thinkingSummary ?? null,
+        redactedThinkingBlocks: result.redactedThinkingBlocks,
+        stopReason: result.stopReason,
+      },
+      usage: { inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens },
+    });
 
     // Parse structured output — extract JSON from LLM text
     const parsed = extractRawJson(result.text);
@@ -451,6 +495,7 @@ export class StageRunner {
           authToken,
         );
         if (bamlResult) {
+          // TODO: BAML path — context window not logged (BAML doesn't expose raw prompt/response)
           return {
             text: JSON.stringify(bamlResult, null, 2),
             summary: `Calibrated ${bamlResult.queries.length} queries with ${execution.resultsCount} web results (BAML)`,
@@ -497,6 +542,7 @@ export class StageRunner {
     const calibLlmToolId = this.generateToolUseId('llm-calibrate');
     this.emitProgress({ type: 'llm_start', stageId: stage.id, stageName: 'websearch_calibration', toolUseId: calibLlmToolId });
 
+    const callStart = Date.now();
     const result = await this.llmClient.call({
       systemPrompt,
       userMessage: userContent + webContext,
@@ -506,6 +552,34 @@ export class StageRunner {
     });
 
     this.emitProgress({ type: 'llm_complete', text: result.text.slice(0, 200), toolUseId: calibLlmToolId, isIntermediate: true });
+
+    // Context window logging — capture full LLM I/O
+    const fullUserMessage = userContent + webContext;
+    this.appendContextWindowEntry({
+      source: 'orchestrator',
+      stageId: stage.id,
+      stageName: 'websearch_calibration',
+      repairIteration: null,
+      timestamp: new Date(callStart).toISOString(),
+      durationMs: Date.now() - callStart,
+      llm: {
+        model: result.model,
+        effort: this.getStageEffort(orchestratorConfig),
+        desiredMaxTokens: desiredTokens,
+      },
+      input: {
+        systemPrompt,
+        userMessage: fullUserMessage,
+        estimatedInputTokens: estimateTokens(systemPrompt + fullUserMessage),
+      },
+      output: {
+        responseText: result.text,
+        thinkingSummary: result.thinkingSummary ?? null,
+        redactedThinkingBlocks: result.redactedThinkingBlocks,
+        stopReason: result.stopReason,
+      },
+      usage: { inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens },
+    });
 
     // 4. Parse calibrated query plan
     const parsed = extractRawJson(result.text);
@@ -732,6 +806,7 @@ export class StageRunner {
           repairFeedback,
         );
         if (bamlResult) {
+          // TODO: BAML path — context window not logged (BAML doesn't expose raw prompt/response)
           this.emitProgress({ type: 'mcp_result', toolUseId: bamlStepId, toolName: 'orch_synthesis_step', result: `BAML synthesis complete — ${bamlResult.citations.length} citations` });
           // Run deterministic post-processing to ensure inline labels exist (Section 19)
           const ppToolId = this.generateToolUseId('synth-postprocess');
@@ -804,6 +879,7 @@ export class StageRunner {
     // Create streaming progress tracker to surface section headings and thinking milestones
     const streamTracker = this.createStreamProgressTracker(this.onStreamEvent);
 
+    const callStart = Date.now();
     const result = await this.llmClient.call({
       systemPrompt,
       userMessage: userContent,
@@ -816,6 +892,34 @@ export class StageRunner {
     streamTracker.flush();
 
     this.emitProgress({ type: 'llm_complete', text: 'Synthesis complete', toolUseId: synthLlmToolId, isIntermediate: true });
+
+    // Context window logging — capture full LLM I/O
+    const repairIterationValue = (lastRepairEvent?.data['repairIteration'] as number | undefined) ?? null;
+    this.appendContextWindowEntry({
+      source: 'orchestrator',
+      stageId: stage.id,
+      stageName: 'synthesize',
+      repairIteration: repairIterationValue,
+      timestamp: new Date(callStart).toISOString(),
+      durationMs: Date.now() - callStart,
+      llm: {
+        model: result.model,
+        effort: this.getStageEffort(orchestratorConfig),
+        desiredMaxTokens: desiredTokens,
+      },
+      input: {
+        systemPrompt,
+        userMessage: userContent,
+        estimatedInputTokens: estimateTokens(systemPrompt + userContent),
+      },
+      output: {
+        responseText: result.text,
+        thinkingSummary: result.thinkingSummary ?? null,
+        redactedThinkingBlocks: result.redactedThinkingBlocks,
+        stopReason: result.stopReason,
+      },
+      usage: { inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens },
+    });
 
     const extractToolId = this.generateToolUseId('synth-extract');
     this.emitProgress({ type: 'mcp_start', toolName: 'orch_synthesis_step', toolUseId: extractToolId, input: { step: 'extract_json' } });
@@ -1139,6 +1243,130 @@ export class StageRunner {
   }
 
   // ──────────────────────────────────────────────────────────────────────────
+  // GENERIC PROMPT-DRIVEN STAGE HANDLER
+  // ──────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Generic stage handler for agents that don't have hardcoded stage dispatchers.
+   *
+   * Loads the system prompt from `agents/{slug}/prompts/stage-{id}-{name}.md`,
+   * builds XML context from prior stage outputs, makes 1 LLM call, extracts JSON.
+   *
+   * This is the fallback used by the `default:` case in `runStage()` — it enables
+   * new agents (e.g., dev-loop) to define stages purely via prompt files + config.json
+   * without requiring new TypeScript handler code.
+   */
+  private async runPromptDrivenStage(
+    stage: StageConfig,
+    state: PipelineState,
+    userMessage: string,
+    agentConfig: AgentConfig,
+    forceWorkspaceMetadata?: boolean,
+  ): Promise<StageResult> {
+    const orchestratorConfig = agentConfig.orchestrator;
+    const desiredTokens = this.getDesiredTokens(stage.id, orchestratorConfig, 8_000);
+
+    // Load prompt from agent's prompts directory (required for generic stages)
+    const systemPrompt = getStageSystemPrompt(
+      stage.id, stage.name, agentConfig,
+      // Fallback: minimal prompt that instructs the LLM to process the context
+      () => [
+        `You are stage ${stage.id} (${stage.name}) of the ${agentConfig.name} pipeline.`,
+        stage.description ? `Task: ${stage.description}` : '',
+        '',
+        'Analyze the provided context and return a JSON object with your results.',
+        'Your response must be valid JSON.',
+      ].filter(Boolean).join('\n'),
+    );
+
+    // Build context from prior stage outputs (stageOutputs is a ReadonlyMap)
+    const previousOutputs: Record<string, unknown> = {};
+    for (const [stageId, output] of state.stageOutputs) {
+      if (output != null) {
+        previousOutputs[`stage_${stageId}`] = output.data;
+      }
+    }
+
+    // Gather workspace metadata for first-stage context (e.g., analyze_request)
+    // Also force-gather on amend re-runs so the stage sees fresh workspace state (F2)
+    const workspaceMetadata = ((Object.keys(previousOutputs).length === 0 || forceWorkspaceMetadata) && agentConfig.workspacePath)
+      ? gatherWorkspaceMetadata(agentConfig.workspacePath)
+      : undefined;
+
+    // Inject agent state for convergence stages (e.g., decide)
+    const agentState = (stage.name === 'decide')
+      ? readAgentStateForContext(this.sessionPath, agentConfig.slug)
+      : undefined;
+
+    const stageContext = buildStageContext({
+      stageName: stage.name,
+      previousOutputs,
+      agentConfig,
+      workspaceMetadata,
+      agentState,
+    });
+
+    const enhancedMessage = stageContext
+      ? `${userMessage}\n\n${stageContext}`
+      : userMessage;
+
+    // LLM call with progress tracking
+    const llmToolId = this.generateToolUseId(`llm-${stage.name}`);
+    this.emitProgress({ type: 'llm_start', stageId: stage.id, stageName: stage.name, toolUseId: llmToolId });
+
+    const callStart = Date.now();
+    const result = await this.llmClient.call({
+      systemPrompt,
+      userMessage: enhancedMessage,
+      desiredMaxTokens: desiredTokens,
+      effort: this.getStageEffort(orchestratorConfig),
+      onStreamEvent: this.onStreamEvent,
+    });
+
+    this.emitProgress({ type: 'llm_complete', text: result.text.slice(0, 200), toolUseId: llmToolId, isIntermediate: true });
+
+    // Context window logging
+    this.appendContextWindowEntry({
+      source: 'orchestrator',
+      stageId: stage.id,
+      stageName: stage.name,
+      repairIteration: null,
+      timestamp: new Date(callStart).toISOString(),
+      durationMs: Date.now() - callStart,
+      llm: {
+        model: result.model,
+        effort: this.getStageEffort(orchestratorConfig),
+        desiredMaxTokens: desiredTokens,
+      },
+      input: {
+        systemPrompt,
+        userMessage: enhancedMessage,
+        estimatedInputTokens: estimateTokens(systemPrompt + enhancedMessage),
+      },
+      output: {
+        responseText: result.text,
+        thinkingSummary: result.thinkingSummary ?? null,
+        redactedThinkingBlocks: result.redactedThinkingBlocks,
+        stopReason: result.stopReason,
+      },
+      usage: { inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens },
+    });
+
+    // Parse structured output
+    const parsed = extractRawJson(result.text);
+    const data = (parsed != null && typeof parsed === 'object')
+      ? parsed as Record<string, unknown>
+      : { rawText: result.text };
+
+    return {
+      text: result.text,
+      summary: `${stage.name}: processed (generic handler)`,
+      usage: result.usage,
+      data,
+    };
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
   // PER-STAGE CONFIGURATION HELPERS
   // ──────────────────────────────────────────────────────────────────────────
 
@@ -1162,6 +1390,73 @@ export class StageRunner {
     orchestratorConfig: OrchestratorConfig | undefined,
   ): 'max' | 'high' | 'medium' | 'low' {
     return (orchestratorConfig?.effort ?? 'max') as 'max' | 'high' | 'medium' | 'low';
+  }
+
+  /**
+   * Append a context window log entry to the session's context-windows.json.
+   * Reads existing array (or initializes empty), pushes new entry, writes back.
+   *
+   * File path: sessions/{id}/data/context-windows.json
+   *
+   * Captures the full LLM I/O (system prompt, user message, response)
+   * for every orchestrator API call — enabling post-hoc debugging, prompt
+   * iteration, and token usage analysis.
+   */
+  private appendContextWindowEntry(entry: OrchestratorContextWindowEntry): void {
+    writeContextWindowEntry(this.sessionPath, entry);
+
+    // Write human-readable debug context file when agent slug is available (Phase 6)
+    if (this._agentSlug) {
+      const step = entry.repairIteration !== null
+        ? `repair_iter${entry.repairIteration}`
+        : 'main';
+      writeDebugContextFile({
+        sessionPath: this.sessionPath,
+        agentSlug: this._agentSlug,
+        stage: entry.stageId,
+        stageName: entry.stageName,
+        step,
+        turnIndex: 0,
+        model: entry.llm.model,
+        durationMs: entry.durationMs,
+        usage: {
+          inputTokens: entry.usage.inputTokens,
+          outputTokens: entry.usage.outputTokens,
+          cacheReadTokens: entry.usage.cacheReadTokens,
+        },
+        systemPrompt: entry.input.systemPrompt,
+        userMessage: entry.input.userMessage,
+        response: entry.output.responseText,
+      });
+    }
+  }
+
+  /**
+   * Load the system prompt for a stage — public accessor for SDK breakout.
+   *
+   * The orchestrator calls this to get the stage prompt before yielding
+   * an `orchestrator_sdk_breakout` event. The SDK conversation uses this
+   * prompt as its system context.
+   *
+   * @param stageId - Stage number
+   * @param stageName - Stage name (used for file resolution)
+   * @param agentConfig - Agent config (provides promptsDir and name)
+   * @returns Loaded prompt text, or a minimal fallback if no prompt file exists
+   */
+  getStagePrompt(
+    stageId: number,
+    stageName: string,
+    agentConfig: AgentConfig,
+  ): string {
+    return getStageSystemPrompt(
+      stageId, stageName, agentConfig,
+      () => [
+        `You are stage ${stageId} (${stageName}) of the ${agentConfig.name} pipeline.`,
+        `Task: ${agentConfig.controlFlow.stages.find(s => s.id === stageId)?.description ?? stageName}`,
+        '',
+        'You have full tool access. Complete the task and call stage_gate(complete) with your results.',
+      ].join('\n'),
+    );
   }
 }
 
@@ -1276,7 +1571,7 @@ export function extractWebResearchContext(stageData: Record<string, unknown>): s
 // PROMPT LOADING — Per-stage prompts from agent directory or fallback
 // ============================================================================
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'fs';
 import { dirname, join } from 'path';
 
 /**
@@ -1415,4 +1710,96 @@ function buildSynthesisPromptFallback(agentConfig: AgentConfig): string {
     '- "sections": array of { "title": string, "content": string }',
     '- "confidence": number 0-1 indicating answer completeness',
   ].join('\n');
+}
+
+// ============================================================================
+// WORKSPACE METADATA GATHERING — For generic agent context injection
+// ============================================================================
+
+/**
+ * Gather workspace metadata from the filesystem for context injection.
+ *
+ * Reads package.json, tsconfig.json, and top-level directory structure.
+ * Returns a formatted string suitable for XML wrapping in buildStageContext().
+ *
+ * Designed to be lightweight — reads only a few small config files.
+ * Returns empty string if workspace path doesn't exist or has no config files.
+ */
+function gatherWorkspaceMetadata(workspacePath: string): string | undefined {
+  if (!existsSync(workspacePath)) return undefined;
+
+  const sections: string[] = [];
+
+  // package.json
+  const pkgPath = join(workspacePath, 'package.json');
+  if (existsSync(pkgPath)) {
+    try {
+      const raw = readFileSync(pkgPath, 'utf-8');
+      const pkg = JSON.parse(raw) as Record<string, unknown>;
+      const summary: Record<string, unknown> = {
+        name: pkg['name'],
+        version: pkg['version'],
+        scripts: pkg['scripts'],
+        dependencies: pkg['dependencies'] ? Object.keys(pkg['dependencies'] as Record<string, unknown>) : [],
+        devDependencies: pkg['devDependencies'] ? Object.keys(pkg['devDependencies'] as Record<string, unknown>) : [],
+      };
+      sections.push(`package.json:\n${JSON.stringify(summary, null, 2)}`);
+    } catch {
+      // Ignore parse errors
+    }
+  }
+
+  // tsconfig.json
+  const tscPath = join(workspacePath, 'tsconfig.json');
+  if (existsSync(tscPath)) {
+    try {
+      const raw = readFileSync(tscPath, 'utf-8');
+      sections.push(`tsconfig.json:\n${raw.slice(0, 2000)}`);
+    } catch {
+      // Ignore
+    }
+  }
+
+  // Detect test framework
+  const testConfigs = [
+    'vitest.config.ts', 'vitest.config.js',
+    'jest.config.ts', 'jest.config.js', 'jest.config.json',
+    'playwright.config.ts', 'playwright.config.js',
+    'pytest.ini', 'pyproject.toml',
+  ];
+  const foundConfigs = testConfigs.filter(f => existsSync(join(workspacePath, f)));
+  if (foundConfigs.length > 0) {
+    sections.push(`Test config files found: ${foundConfigs.join(', ')}`);
+  }
+
+  // Top-level directory listing (just names, no recursion)
+  try {
+    const entries = readdirSync(workspacePath, { withFileTypes: true });
+    const dirs = entries.filter(e => e.isDirectory() && !e.name.startsWith('.') && e.name !== 'node_modules').map(e => e.name);
+    const files = entries.filter(e => e.isFile() && !e.name.startsWith('.')).map(e => e.name);
+    sections.push(`Top-level directories: ${dirs.join(', ')}`);
+    sections.push(`Top-level files: ${files.join(', ')}`);
+  } catch {
+    // Ignore
+  }
+
+  return sections.length > 0 ? sections.join('\n\n') : undefined;
+}
+
+/**
+ * Read agent state from disk for context injection into convergence/decide stages.
+ *
+ * Reads the state.json file from the agent's session data directory.
+ * Returns the serialized state or undefined if not found.
+ */
+function readAgentStateForContext(sessionPath: string, agentSlug: string): string | undefined {
+  const statePath = join(sessionPath, 'data', 'agents', agentSlug, 'state.json');
+  if (!existsSync(statePath)) return undefined;
+
+  try {
+    const raw = readFileSync(statePath, 'utf-8');
+    return raw;
+  } catch {
+    return undefined;
+  }
 }

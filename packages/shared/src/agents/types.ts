@@ -47,6 +47,23 @@ export interface AgentMetadata {
 // ============================================================
 
 /**
+ * Declarative field rendering spec for pause messages.
+ * Each entry maps a key in the stage output data to a human-readable rendering.
+ */
+export interface PauseDisplayField {
+  /** Key in the stage output data object. */
+  key: string;
+  /** Human-readable label shown before the value. */
+  label: string;
+  /** Rendering type: text (inline), list (bullets), key-value (object keys), object-list (templated). */
+  type: 'text' | 'list' | 'key-value' | 'object-list';
+  /** For 'key-value': only show these keys from the object. */
+  displayKeys?: string[];
+  /** For 'object-list': template string with {field} placeholders. */
+  itemTemplate?: string;
+}
+
+/**
  * A single stage in the agent pipeline
  */
 export interface StageDefinition {
@@ -58,6 +75,12 @@ export interface StageDefinition {
   description: string;
   /** Optional user-facing instruction used when this stage triggers a pause */
   pauseInstructions?: string;
+  /** Execution mode — 'orchestrator' (default) or 'sdk_breakout' */
+  mode?: 'orchestrator' | 'sdk_breakout';
+  /** Declarative fields to render in pause messages (renders data above pauseInstructions). */
+  pauseDisplayFields?: PauseDisplayField[];
+  /** Choice labels shown at pause point — gates resume intent parsing (e.g., ['Proceed', 'Amend', 'Cancel']). */
+  pauseChoices?: string[];
 }
 
 /**
@@ -198,14 +221,14 @@ export interface DebugOverrides {
 export interface AgentConfig {
   /** Control flow pipeline definition */
   controlFlow: AgentControlFlowConfig;
-  /** Depth mode presets */
-  depthModes: Record<string, DepthModeConfig>;
-  /** Verification thresholds */
-  verification: VerificationConfig;
+  /** Depth mode presets (ISA-specific, optional for other agents) */
+  depthModes?: Record<string, DepthModeConfig>;
+  /** Verification thresholds (ISA-specific, optional for other agents) */
+  verification?: VerificationConfig;
   /** Logging configuration */
   logging: AgentLoggingConfig;
-  /** Follow-up query configuration */
-  followUp: FollowUpConfig;
+  /** Follow-up query configuration (ISA-specific, optional for other agents) */
+  followUp?: FollowUpConfig;
   /** Output formatting configuration */
   output: AgentOutputConfig;
   /** Debug overrides (optional) */

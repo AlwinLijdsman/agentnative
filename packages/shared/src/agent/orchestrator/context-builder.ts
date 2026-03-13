@@ -47,6 +47,10 @@ export interface BuildStageContextOptions {
   followupNumber?: number;
   /** Prior research context hint for decomposition awareness (Section 18, F11). */
   priorContextHint?: string;
+  /** Pre-gathered workspace metadata string for dev-loop and generic agents. */
+  workspaceMetadata?: string;
+  /** Serialized agent_state for injection into decide/convergence stages. */
+  agentState?: string;
 }
 
 // ============================================================================
@@ -207,7 +211,17 @@ export function buildStageContext(options: BuildStageContextOptions): string {
     }
   }
 
-  // 8. Repair feedback (if in repair iteration — G15)
+  // 8. Workspace metadata — for generic agents (dev-loop Stage 0, etc.)
+  if (options.workspaceMetadata) {
+    sections.push(wrapXml('WORKSPACE_METADATA', options.workspaceMetadata));
+  }
+
+  // 9. Agent state — for convergence/decide stages (dev-loop Stage 6, etc.)
+  if (options.agentState) {
+    sections.push(wrapXml('AGENT_STATE', options.agentState));
+  }
+
+  // 10. Repair feedback (if in repair iteration — G15)
   if (options.repairFeedback) {
     sections.push(wrapXml('REPAIR_FEEDBACK', options.repairFeedback));
   }
