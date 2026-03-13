@@ -4,6 +4,7 @@ import type { StoredSession, SessionHeader } from './types.js'
 import { getSessionFilePath, ensureSessionsDir, ensureSessionDir } from './storage.js'
 import { toPortablePath } from '../utils/paths.js'
 import { createSessionHeader, makeSessionPathPortable } from './jsonl.js'
+import { truncateMessageForTransfer } from '../utils/large-response.js'
 import { debug } from '../utils/debug.js'
 
 interface PendingWrite {
@@ -80,7 +81,13 @@ class SessionPersistenceQueue {
       const sessionDir = dirname(filePath)
       const lines = [
         makeSessionPathPortable(JSON.stringify(header), sessionDir),
-        ...persistableMessages.map(m => makeSessionPathPortable(JSON.stringify(m), sessionDir)),
+        // Safety net: truncate oversized message fields before serialization.
+        // Primary truncation happens at event time (200K chars for toolResult),
+        // but messages from older sessions or edge cases may bypass that guard.
+        ...persistableMessages.map(m => makeSessionPathPortable(
+          JSON.stringify(truncateMessageForTransfer(m)),
+          sessionDir,
+        )),
       ]
 
       // Atomic write: write to .tmp then rename over the real file.

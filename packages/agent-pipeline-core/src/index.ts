@@ -76,6 +76,8 @@ export {
   handleAgentState,
   handleAgentValidate,
   handleAgentRenderOutput,
+  setBreakoutScope,
+  clearBreakoutScope,
 } from './handlers/index.ts';
 
 export type {
@@ -84,3 +86,14 @@ export type {
   AgentValidateArgs,
   AgentRenderOutputArgs,
 } from './handlers/index.ts';
+
+// Stage output schema validation (shared with orchestrator pipeline)
+export {
+  validateStageOutput,
+} from './stage-output-validation.ts';
+
+export type {
+  StageOutputSchema,
+  StageOutputSchemaProperty,
+  StageOutputValidationResult,
+} from './stage-output-validation.ts';

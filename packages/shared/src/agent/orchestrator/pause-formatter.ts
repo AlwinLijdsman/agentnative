@@ -604,6 +604,10 @@ export interface FormatPauseOptions {
     outputTokens: number;
     costUsd: number;
   };
+  /** User-facing pause instruction template from stage config (for non-ISA agents). */
+  pauseInstructions?: string;
+  /** Declarative fields to render in pause messages (renders data above pauseInstructions). */
+  pauseDisplayFields?: import('../../agents/types.ts').PauseDisplayField[];
 }
 
 /** Result from formatPauseMessage — message + audit trail data. */
@@ -611,7 +615,7 @@ export interface FormatPauseResult {
   /** Formatted markdown message for UI display. */
   message: string;
   /** Which normalization path was used (for pause_formatted event audit). */
-  normalizationPath: 'baml' | 'zod' | 'fallback';
+  normalizationPath: 'baml' | 'zod' | 'fallback' | 'pauseInstructions';
 }
 
 /**
@@ -645,6 +649,19 @@ export function formatPauseMessage(
     rawJson = rawText;
   }
 
+  // Generic pause instructions — takes PRIORITY over ISA-specific normalizers when present.
+  // ISA agents don't set pauseInstructions (they use built-in stage 0/1 formatters).
+  // Non-ISA agents (e.g., dev-loop) define pauseInstructions in config.json for any stage.
+  if (options?.pauseInstructions) {
+    onDebug?.(`[pause-formatter] Stage ${stageId} (${stageName}): using pauseInstructions from config`);
+    const message = buildPauseInstructionsMessage(
+      stageId, stageName, options.pauseInstructions, data, rawJson, costInfo,
+      options.pauseDisplayFields,
+    );
+    return { message, normalizationPath: 'pauseInstructions' };
+  }
+
+  // ISA-specific handlers — only reached when pauseInstructions is absent.
   // Stage 0: analyze_query
   if (stageId === 0) {
     const normalized = normalizeStage0Data(data, onDebug);
@@ -690,6 +707,72 @@ export function formatPauseMessage(
     message: buildFallbackMessage(stageId, stageName, rawJson, rawText, costInfo),
     normalizationPath: 'fallback',
   };
+}
+
+// ============================================================================
+// GENERIC PAUSE INSTRUCTIONS FORMATTER
+// ============================================================================
+
+/**
+ * Build a pause message for non-ISA agents using pauseInstructions from config.
+ *
+ * When pauseDisplayFields are provided, renders human-readable stage output
+ * between the header and the choice instructions. Otherwise, only shows
+ * the collapsible JSON block.
+ *
+ * Rendering order:
+ * 1. Header
+ * 2. Rendered display fields (human-readable data)
+ * 3. User-facing choice instructions (pauseInstructions)
+ * 4. Collapsible raw JSON
+ * 5. Cost footer
+ */
+function buildPauseInstructionsMessage(
+  stageId: number,
+  stageName: string,
+  pauseInstructions: string,
+  data: Record<string, unknown>,
+  rawJson: string,
+  costInfo?: { inputTokens: number; outputTokens: number; costUsd: number },
+  displayFields?: PauseDisplayField[],
+): string {
+  const lines: string[] = [];
+
+  // 1. Header
+  lines.push(`**Stage ${stageId} (${stageName}) Complete**`);
+  lines.push('');
+
+  // 2. Rendered display fields (human-readable stage output)
+  if (displayFields && displayFields.length > 0) {
+    const fieldLines = renderDisplayFields(displayFields, data);
+    if (fieldLines.length > 0) {
+      lines.push(...fieldLines);
+    }
+  }
+
+  // 3. User-facing choice instructions from stage config
+  lines.push(pauseInstructions);
+  lines.push('');
+
+  // 4. Collapsible stage output
+  lines.push('<details>');
+  lines.push(`<summary>[DATA] Stage ${stageId} Output (JSON)</summary>`);
+  lines.push('');
+  lines.push('```json');
+  lines.push(rawJson);
+  lines.push('```');
+  lines.push('');
+  lines.push('</details>');
+  lines.push('');
+
+  // 5. Cost footer
+  if (costInfo) {
+    lines.push('---');
+    lines.push(`*Stage ${stageId} used ${costInfo.inputTokens} input + ${costInfo.outputTokens} output tokens (~$${costInfo.costUsd.toFixed(4)} equivalent)*`);
+    lines.push('');
+  }
+
+  return lines.join('\n');
 }
 
 // ============================================================================
@@ -739,6 +822,108 @@ function buildFallbackMessage(
   }
 
   return lines.join('\n');
+}
+
+// ============================================================================
+// DISPLAY FIELD RENDERERS
+// ============================================================================
+
+import type { PauseDisplayField } from '../../agents/types.ts';
+
+/**
+ * Render declarative display fields from stage output data.
+ * Each field spec maps a data key to a human-readable rendering.
+ * Missing/invalid data is silently skipped (no crash, no placeholder).
+ */
+export function renderDisplayFields(
+  fields: PauseDisplayField[],
+  data: Record<string, unknown>,
+): string[] {
+  const lines: string[] = [];
+  for (const field of fields) {
+    const value = data[field.key];
+    if (value == null) continue;
+
+    const rendered = renderSingleField(field, value);
+    if (rendered.length > 0) {
+      lines.push(...rendered);
+      lines.push('');
+    }
+  }
+  return lines;
+}
+
+/** Dispatch to the appropriate renderer based on field type. */
+function renderSingleField(field: PauseDisplayField, value: unknown): string[] {
+  switch (field.type) {
+    case 'text':
+      return renderTextField(field.label, value);
+    case 'list':
+      return renderListField(field.label, value);
+    case 'key-value':
+      return renderKeyValueField(field.label, value, field.displayKeys);
+    case 'object-list':
+      return renderObjectListField(field.label, value, field.itemTemplate);
+    default:
+      return [];
+  }
+}
+
+/** Render a string value as `**Label**: value`. */
+function renderTextField(label: string, value: unknown): string[] {
+  if (typeof value === 'string' && value.length > 0) {
+    return [`**${label}**: ${value}`];
+  }
+  if (typeof value === 'number' || typeof value === 'boolean') {
+    return [`**${label}**: ${String(value)}`];
+  }
+  return [];
+}
+
+/** Render a string array as a bulleted list. */
+function renderListField(label: string, value: unknown): string[] {
+  if (!Array.isArray(value) || value.length === 0) return [];
+  const items = value
+    .map(item => typeof item === 'string' ? item : String(item))
+    .filter(item => item.length > 0);
+  if (items.length === 0) return [];
+  return [`**${label}**`, ...items.map(item => `- ${item}`)];
+}
+
+/** Render an object's values as a comma-separated summary, optionally filtered by displayKeys. */
+function renderKeyValueField(label: string, value: unknown, displayKeys?: string[]): string[] {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return [];
+  const obj = value as Record<string, unknown>;
+  const keys = displayKeys ?? Object.keys(obj);
+  const parts: string[] = [];
+  for (const key of keys) {
+    const val = obj[key];
+    if (val != null && val !== '' && val !== false) {
+      parts.push(String(val));
+    }
+  }
+  if (parts.length === 0) return [];
+  return [`**${label}**: ${parts.join(', ')}`];
+}
+
+/** Render an array of objects using a template string with {field} placeholders. */
+function renderObjectListField(label: string, value: unknown, itemTemplate?: string): string[] {
+  if (!Array.isArray(value) || value.length === 0) return [];
+  const template = itemTemplate ?? '{0}';
+  const items: string[] = [];
+  for (const item of value) {
+    if (item == null || typeof item !== 'object') continue;
+    const obj = item as Record<string, unknown>;
+    const rendered = template.replace(/\{(\w+)\}/g, (_match, key: string) => {
+      const val = obj[key];
+      return val != null ? String(val) : '';
+    });
+    if (rendered.trim().length > 0) {
+      items.push(`- ${rendered}`);
+    }
+  }
+  if (items.length === 0) return [];
+  return [`**${label}**`, ...items];
 }
 
 // ============================================================================

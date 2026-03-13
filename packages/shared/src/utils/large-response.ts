@@ -285,3 +285,66 @@ export async function handleLargeResponse(
 
   return { message, filePath: absolutePath, wasSummarized: !!summary };
 }
+
+// ============================================================
+// Message Field Size Guard (for IPC transfer and persistence)
+// ============================================================
+
+/** Max bytes for a single message field before truncation as a safety net.
+ *  Primary truncation happens at event time (200K chars for toolResult).
+ *  This is a defensive backstop for messages that bypass event-time guards
+ *  (e.g., restored from older sessions, or toolInput which has no event-time guard).
+ */
+const MAX_MESSAGE_FIELD_BYTES = 500_000;
+
+const TRUNCATION_MARKER = '\n\n[Content truncated — original size: ';
+
+/**
+ * Truncate oversized string fields on a message for safe IPC transfer
+ * and persistence. Returns a shallow copy with truncated fields if needed,
+ * or the original object if no truncation was necessary.
+ *
+ * Only truncates `content`, `toolResult`, and stringified `toolInput`.
+ * Does NOT mutate the original message.
+ */
+export function truncateMessageForTransfer<T extends { content?: string; toolResult?: string; toolInput?: unknown }>(
+  message: T,
+  maxBytes = MAX_MESSAGE_FIELD_BYTES,
+): T {
+  let needsCopy = false;
+  const updates: Partial<{ content: string; toolResult: string; toolInput: unknown }> = {};
+
+  // Check toolResult
+  const toolResult = message.toolResult;
+  if (typeof toolResult === 'string' && toolResult.length > maxBytes) {
+    // Don't re-truncate if already marked as a large response
+    if (!toolResult.includes('[Large response') && !toolResult.includes(TRUNCATION_MARKER)) {
+      needsCopy = true;
+      updates.toolResult = toolResult.substring(0, maxBytes) + `${TRUNCATION_MARKER}${toolResult.length} chars]`;
+    }
+  }
+
+  // Check toolInput (object — check stringified size)
+  const toolInput = message.toolInput;
+  if (toolInput && typeof toolInput === 'object') {
+    try {
+      const stringified = JSON.stringify(toolInput);
+      if (stringified.length > maxBytes) {
+        needsCopy = true;
+        updates.toolInput = { _truncated: true, _originalSize: stringified.length };
+      }
+    } catch {
+      // Non-serializable input — leave as-is
+    }
+  }
+
+  // Check content
+  const content = message.content;
+  if (typeof content === 'string' && content.length > maxBytes) {
+    needsCopy = true;
+    updates.content = content.substring(0, maxBytes) + `${TRUNCATION_MARKER}${content.length} chars]`;
+  }
+
+  if (!needsCopy) return message;
+  return { ...message, ...updates };
+}

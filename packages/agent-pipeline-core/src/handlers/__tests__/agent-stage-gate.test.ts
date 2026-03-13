@@ -40,6 +40,9 @@ async function advanceToStage(ctx: SessionToolContext, targetStage: number) {
   await gate(ctx, 'start', 0);
   if (targetStage === 0) return;
   await gate(ctx, 'complete', 0);
+  // TEST_AGENT_CONFIG has pauseAfterStages: [0], so complete(0) locks the pipeline.
+  // Resume is required before start(1) can proceed.
+  await gate(ctx, 'resume', undefined, { decision: 'proceed' });
 
   for (let s = 1; s <= targetStage; s++) {
     await gate(ctx, 'start', s);
@@ -72,16 +75,19 @@ describe('Agent Stage Gate', () => {
       assert.match(result.runId as string, /^run-\d{3}$/);
     });
 
-    it('should complete stage 0', async () => {
+    it('should complete stage 0 (pauses due to pauseAfterStages)', async () => {
       await gate(ctx, 'start', 0);
       const result = parseResult(await gate(ctx, 'complete', 0, { query_plan: 'test' }));
-      assert.equal(result.allowed, true);
-      assert.ok((result.completedStages as number[]).includes(0));
+      // TEST_AGENT_CONFIG has pauseAfterStages: [0], so complete(0) returns pause
+      assert.equal(result.pauseRequired, true);
+      assert.equal(result.allowed, false);
     });
 
     it('should complete all 5 stages', async () => {
       await gate(ctx, 'start', 0);
       await gate(ctx, 'complete', 0);
+      // Resume after pause at stage 0
+      await gate(ctx, 'resume', undefined, { decision: 'proceed' });
       for (let s = 1; s <= 4; s++) {
         await gate(ctx, 'start', s);
         await gate(ctx, 'complete', s);
@@ -99,6 +105,8 @@ describe('Agent Stage Gate', () => {
     it('should block starting stage 2 without completing stage 1', async () => {
       await gate(ctx, 'start', 0);
       await gate(ctx, 'complete', 0);
+      // Resume after pause at stage 0 (pauseAfterStages: [0])
+      await gate(ctx, 'resume', undefined, { decision: 'proceed' });
       const result = parseResult(await gate(ctx, 'start', 2));
       assert.equal(result.allowed, false);
       assert.ok((result.reason as string).includes('Stage 1 must be completed'));
@@ -248,33 +256,43 @@ describe('Agent Stage Gate', () => {
   // ============================================================
 
   describe('error classification', () => {
-    it('should classify transient errors', async () => {
+    // Error classification tests use stage 1 (non-pause) to avoid pauseAfterStages
+    // overwriting the error classification reason with the pause message.
+
+    async function advancePastStage0() {
       await gate(ctx, 'start', 0);
-      const result = parseResult(await gate(ctx, 'complete', 0, { error: 'Request timed out' }));
+      await gate(ctx, 'complete', 0);
+      await gate(ctx, 'resume', undefined, { decision: 'proceed' });
+      await gate(ctx, 'start', 1);
+    }
+
+    it('should classify transient errors', async () => {
+      await advancePastStage0();
+      const result = parseResult(await gate(ctx, 'complete', 1, { error: 'Request timed out' }));
       assert.ok((result.reason as string).includes('Transient'));
     });
 
     it('should classify auth errors', async () => {
-      await gate(ctx, 'start', 0);
-      const result = parseResult(await gate(ctx, 'complete', 0, { error: 'Unauthorized: invalid API key' }));
+      await advancePastStage0();
+      const result = parseResult(await gate(ctx, 'complete', 1, { error: 'Unauthorized: invalid API key' }));
       assert.ok((result.reason as string).includes('Authentication'));
     });
 
     it('should classify config errors', async () => {
-      await gate(ctx, 'start', 0);
-      const result = parseResult(await gate(ctx, 'complete', 0, { error: 'Invalid config: missing field' }));
+      await advancePastStage0();
+      const result = parseResult(await gate(ctx, 'complete', 1, { error: 'Invalid config: missing field' }));
       assert.ok((result.reason as string).includes('Configuration'));
     });
 
     it('should classify resource errors', async () => {
-      await gate(ctx, 'start', 0);
-      const result = parseResult(await gate(ctx, 'complete', 0, { error: '404 not found' }));
+      await advancePastStage0();
+      const result = parseResult(await gate(ctx, 'complete', 1, { error: '404 not found' }));
       assert.ok((result.reason as string).includes('Resource not found'));
     });
 
     it('should classify unknown errors', async () => {
-      await gate(ctx, 'start', 0);
-      const result = parseResult(await gate(ctx, 'complete', 0, { error: 'Something bizarre' }));
+      await advancePastStage0();
+      const result = parseResult(await gate(ctx, 'complete', 1, { error: 'Something bizarre' }));
       assert.ok((result.reason as string).includes('Unknown'));
     });
   });
@@ -325,6 +343,8 @@ describe('Agent Stage Gate', () => {
     it('should NOT pause for non-pause stages', async () => {
       await gate(ctx, 'start', 0);
       await gate(ctx, 'complete', 0);
+      // Resume after pause at stage 0 (pauseAfterStages: [0])
+      await gate(ctx, 'resume', undefined, { decision: 'proceed' });
       await gate(ctx, 'start', 1);
       const result = parseResult(await gate(ctx, 'complete', 1));
       assert.equal(result.pauseRequired, false);
@@ -377,6 +397,8 @@ describe('Agent Stage Gate', () => {
     it('should write metadata.json with all required fields', async () => {
       await gate(ctx, 'start', 0, { depthMode: 'deep' });
       await gate(ctx, 'complete', 0);
+      // Resume after pause at stage 0 (pauseAfterStages: [0])
+      await gate(ctx, 'resume', undefined, { decision: 'proceed' });
       for (let s = 1; s <= 3; s++) {
         await gate(ctx, 'start', s);
         await gate(ctx, 'complete', s);
@@ -414,6 +436,8 @@ describe('Agent Stage Gate', () => {
     it('should emit verification_result event', async () => {
       await gate(ctx, 'start', 0);
       await gate(ctx, 'complete', 0);
+      // Resume after pause at stage 0 (pauseAfterStages: [0])
+      await gate(ctx, 'resume', undefined, { decision: 'proceed' });
       await gate(ctx, 'start', 1);
       await gate(ctx, 'complete', 1);
       await gate(ctx, 'start', 2);
@@ -708,7 +732,7 @@ describe('Agent Stage Gate', () => {
     async function schemaGate(action: string, stage?: number, data?: Record<string, unknown>) {
       return handleAgentStageGate(schemaCtx, {
         agentSlug: TEST_AGENT_SLUG,
-        action: action as 'start' | 'complete',
+        action: action as 'start' | 'complete' | 'resume',
         stage,
         data,
       });
@@ -723,7 +747,8 @@ describe('Agent Stage Gate', () => {
           depth_mode: 'standard',
         },
       }));
-      assert.equal(result.allowed, true);
+      // Stage 0 is in pauseAfterStages, so complete returns pause (not a schema issue)
+      assert.equal(result.pauseRequired, true);
       assert.equal(result.validationWarnings, undefined);
     });
 
@@ -732,7 +757,8 @@ describe('Agent Stage Gate', () => {
       const result = parseResult(await schemaGate('complete', 0, {
         not_query_plan: 'wrong key',
       }));
-      assert.equal(result.allowed, true); // Warnings, not errors
+      // Stage completes with warnings (warn mode), then pauses (pauseAfterStages: [0])
+      assert.equal(result.pauseRequired, true);
       assert.ok(result.validationWarnings);
       assert.ok((result.validationWarnings as string[]).some(w => w.includes('query_plan') && w.includes('required')));
     });
@@ -742,7 +768,7 @@ describe('Agent Stage Gate', () => {
       const result = parseResult(await schemaGate('complete', 0, {
         query_plan: 'not an object',
       }));
-      assert.equal(result.allowed, true);
+      assert.equal(result.pauseRequired, true);
       assert.ok(result.validationWarnings);
       assert.ok((result.validationWarnings as string[]).some(w => w.includes('type')));
     });
@@ -756,7 +782,7 @@ describe('Agent Stage Gate', () => {
           depth_mode: 'invalid_mode',
         },
       }));
-      assert.equal(result.allowed, true);
+      assert.equal(result.pauseRequired, true);
       assert.ok(result.validationWarnings);
       assert.ok((result.validationWarnings as string[]).some(w => w.includes('enum')));
     });
@@ -769,7 +795,7 @@ describe('Agent Stage Gate', () => {
           // sub_queries missing, depth_mode missing
         },
       }));
-      assert.equal(result.allowed, true);
+      assert.equal(result.pauseRequired, true);
       assert.ok(result.validationWarnings);
       assert.ok((result.validationWarnings as string[]).some(w => w.includes('sub_queries') && w.includes('required')));
     });
@@ -783,7 +809,7 @@ describe('Agent Stage Gate', () => {
           depth_mode: 'standard',
         },
       }));
-      assert.equal(result.allowed, true);
+      assert.equal(result.pauseRequired, true);
       assert.ok(result.validationWarnings);
       assert.ok((result.validationWarnings as string[]).some(w => w.includes('minItems') || w.includes('minimum')));
     });
@@ -791,6 +817,8 @@ describe('Agent Stage Gate', () => {
     it('should skip validation when no schema defined for stage', async () => {
       await schemaGate('start', 0);
       await schemaGate('complete', 0, { query_plan: { original_query: 'x', sub_queries: ['q'], depth_mode: 'quick' } });
+      // Resume after pause at stage 0 (pauseAfterStages: [0])
+      await schemaGate('resume', undefined, { decision: 'proceed' });
       await schemaGate('start', 1);
       const result = parseResult(await schemaGate('complete', 1, { anything: 'goes' }));
       assert.equal(result.allowed, true);
@@ -800,7 +828,7 @@ describe('Agent Stage Gate', () => {
     it('should warn on empty data for required fields', async () => {
       await schemaGate('start', 0);
       const result = parseResult(await schemaGate('complete', 0, {}));
-      assert.equal(result.allowed, true);
+      assert.equal(result.pauseRequired, true);
       assert.ok(result.validationWarnings);
       assert.ok((result.validationWarnings as string[]).length > 0);
     });

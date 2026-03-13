@@ -1,22 +1,23 @@
 ---
 name: "AN: Implement Full"
-description: "Execute all plan.md phases continuously without pausing"
+description: "Execute all plan.md phases continuously without pausing — build, validate, and verify"
 alwaysAllow: ["Bash", "Write", "Edit"]
 ---
 
 # Full Continuous Implementation for Agentnative
 
-Execute ALL phases in `./plan.md` continuously without pausing for approval.
+Execute ALL phases in `./plan.md` continuously without pausing for approval. You use the currently selected model for thorough implementation.
 
 If no specific instructions are given, read `./plan.md` and execute all uncompleted phases.
 
 ## Core Principles
 
 1. **CLAUDE.md is the Rulebook**: Always read `CLAUDE.md` first
-2. **Continuous Execution**: Run ALL phases to completion without stopping
-3. **Always Validate**: TypeScript typecheck is a hard gate — fix before continuing
-4. **Track Progress**: Update `plan.md` with status markers as you go
-5. **Fix On The Fly**: If something fails, fix it immediately and continue
+2. **plan.md is the Spec**: Read `./plan.md` and execute phases in order
+3. **Continuous Execution**: Run ALL phases to completion without stopping
+4. **Always Validate**: TypeScript typecheck is a hard gate — fix before continuing
+5. **Track Progress**: Update `plan.md` with status markers as you go
+6. **Fix On The Fly**: If something fails, fix it immediately and continue
 
 ## Status Markers
 
@@ -42,7 +43,7 @@ Use these markers in `plan.md`:
 | [N] | [name] |
 | [N+1] | [name] |
 
-[INFO] Starting continuous implementation...
+Starting continuous implementation...
 ```
 
 ### Step 2: Execute All Phases
@@ -66,7 +67,7 @@ For each phase sequentially:
 - [x] Step 2 — result
 - Validation: typecheck PASS, lint PASS
 
-[INFO] Continuing to Phase [N+1]...
+Continuing to Phase [N+1]...
 ---
 ```
 
@@ -92,7 +93,7 @@ After all phases:
 ```markdown
 ---
 
-## [DONE] Implementation Complete
+## Implementation Complete
 
 ### All Phases
 | Phase | Name | Status |
@@ -110,18 +111,48 @@ After all phases:
 - Lint: PASS
 - Tests: PASS
 
-### Next Steps
-- Run `/an-adversarial-reviewer` to review the changes
-- Test with `pnpm run electron:dev`
-
 ---
 ```
+
+### Step 5: Finalize & Push
+
+After presenting the summary, ask the user:
+
+> "All phases complete and validated. Ready to commit and push to the current branch? (yes / no)"
+
+**If user says yes**, execute this sequence:
+
+1. **Branch safety check**: Run `git branch --show-current`
+   - If on `main` — **WARN**: "You're on main. It's safer to create a feature branch first. Continue anyway? (yes / create branch)"
+   - If user wants a branch: `git checkout -b feature/{plan-slug}`
+2. **Archive plan.md**: Copy `./plan.md` to `./plans/YYMMDD-{slug}.md` (use current date)
+3. **Clean plan.md**: Replace contents with a stub:
+   ```
+   # Plan
+   > No active plan. Use `/an-research-and-plan` to create one.
+   ```
+4. **Stage changes**: Run `git add -A`
+   - If `git add` fails (e.g., `nul` file on Windows), retry with explicit paths excluding `nul`
+5. **Secrets scan**: Run `git diff --staged --name-only` and check for files matching patterns: `session.jsonl`, `credentials`, `secret`, `*.pem`, `*.key`
+   - If found, **WARN**: "These staged files may contain secrets: [list]. Remove them from staging? (yes / no)"
+   - If yes: `git reset HEAD -- {files}` for each
+6. **Show staged summary**: Run `git diff --staged --stat` and display to user
+7. **Generate commit message**: Derive from plan title — format: `feat: {plan-title-slug}`
+   - Show to user: "Commit message: `feat: {title}`. OK or amend?"
+   - If user amends, use their message
+8. **Commit**: Run `git commit -m "{message}"`
+9. **Push**: Run `git push -u origin {branch}` (the `-u` sets upstream for new branches)
+10. **Report result**: Show the push output and confirm success
+
+**If user says no**, skip this step entirely and offer next steps:
+- Run `/an-adversarial-reviewer` to review the changes
+- Test with `pnpm run electron:dev`
 
 ## Environment Notes
 
 - **Windows ARM64**: `pnpm` + `tsx`, not `bun`
-- **Shell**: bash (MINGW64) — use Unix-style paths
 - Use `npx tsx` to run TypeScript scripts directly
+- Use workspace protocol (`workspace:*`) for internal package imports
 
 ## Constraints
 

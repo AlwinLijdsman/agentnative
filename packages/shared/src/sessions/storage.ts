@@ -40,7 +40,7 @@ import type { Plan } from '../agent/plan-types.ts';
 import { validateSessionStatus } from '../statuses/validation.ts';
 import { debug } from '../utils/debug.ts';
 import { getStatusCategory } from '../statuses/storage.ts';
-import { readSessionHeader, readSessionJsonl } from './jsonl.ts';
+import { readSessionHeader, readSessionJsonl, readSessionJsonlAsync } from './jsonl.ts';
 import { sessionPersistenceQueue } from './persistence-queue.ts';
 
 // Re-export types for convenience
@@ -322,6 +322,27 @@ export function loadSession(workspaceRootPath: string, sessionId: string): Store
   const jsonlPath = getSessionFilePath(workspaceRootPath, sessionId);
   if (existsSync(jsonlPath)) {
     const session = readSessionJsonl(jsonlPath);
+    if (session) {
+      end();
+      return session;
+    }
+  }
+
+  end();
+  return null;
+}
+
+/**
+ * Async version of loadSession using streaming JSONL reader.
+ * Reads the file line-by-line without loading entirely into memory,
+ * preventing main-process event loop blocking for large sessions.
+ */
+export async function loadSessionAsync(workspaceRootPath: string, sessionId: string): Promise<StoredSession | null> {
+  const end = perf.start('session.loadSessionAsync', { sessionId });
+
+  const jsonlPath = getSessionFilePath(workspaceRootPath, sessionId);
+  if (existsSync(jsonlPath)) {
+    const session = await readSessionJsonlAsync(jsonlPath);
     if (session) {
       end();
       return session;

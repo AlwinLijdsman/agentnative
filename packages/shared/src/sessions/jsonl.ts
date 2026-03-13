@@ -5,8 +5,9 @@
  * Format: Line 1 = SessionHeader, Lines 2+ = StoredMessage (one per line)
  */
 
-import { openSync, readSync, closeSync, readFileSync, writeFileSync, renameSync, unlinkSync } from 'fs';
+import { openSync, readSync, closeSync, readFileSync, createReadStream, writeFileSync, renameSync, unlinkSync } from 'fs';
 import { open, readFile } from 'fs/promises';
+import { createInterface } from 'readline';
 import { dirname } from 'path';
 import type { SessionHeader, StoredSession, StoredMessage, SessionTokenUsage } from './types.ts';
 import { toPortablePath, expandPath, normalizePath } from '../utils/paths.ts';
@@ -106,6 +107,66 @@ export function readSessionJsonl(sessionFile: string): StoredSession | null {
     } as StoredSession;
   } catch (error) {
     debug('[jsonl] Failed to read session:', sessionFile, error);
+    return null;
+  }
+}
+
+/**
+ * Async streaming version of readSessionJsonl.
+ * Uses createReadStream + readline to parse line-by-line without loading the
+ * entire file into memory. Prevents main-process event loop blocking for
+ * large session files (hundreds of messages with large tool results).
+ */
+export async function readSessionJsonlAsync(sessionFile: string): Promise<StoredSession | null> {
+  try {
+    const sessionDir = dirname(sessionFile);
+    let header: SessionHeader | null = null;
+    const messages: StoredMessage[] = [];
+    let isFirstLine = true;
+
+    const rl = createInterface({
+      input: createReadStream(sessionFile, { encoding: 'utf-8' }),
+      crlfDelay: Infinity,
+    });
+
+    for await (const rawLine of rl) {
+      if (!rawLine) continue;
+
+      const line = expandSessionPath(rawLine, sessionDir);
+
+      if (isFirstLine) {
+        isFirstLine = false;
+        header = safeJsonParse(line) as SessionHeader;
+        if (!header) {
+          debug('[jsonl] Failed to parse session header (async):', sessionFile);
+          return null;
+        }
+        continue;
+      }
+
+      // Parse messages resiliently: skip corrupted lines
+      try {
+        messages.push(JSON.parse(line) as StoredMessage);
+      } catch {
+        debug('[jsonl] Skipping corrupted message line (async):', rawLine.substring(0, 100));
+      }
+    }
+
+    if (!header) return null;
+
+    const workingDir = header.workingDirectory ? expandPath(header.workingDirectory) : undefined;
+    const sdkCwd = header.sdkCwd ? expandPath(header.sdkCwd) : workingDir;
+
+    return {
+      ...pickSessionFields(header),
+      workspaceRootPath: expandPath(header.workspaceRootPath),
+      workingDirectory: workingDir,
+      sdkCwd,
+      messages,
+      tokenUsage: header.tokenUsage,
+    } as StoredSession;
+  } catch (error) {
+    debug('[jsonl] Failed to read session (async):', sessionFile, error);
     return null;
   }
 }

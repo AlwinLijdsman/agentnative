@@ -42,6 +42,8 @@ import {
 } from './mode-manager.ts';
 import { type PermissionsContext, permissionsConfigCache } from './permissions-config.ts';
 import { getSessionPlansPath, getSessionPath } from '../sessions/storage.ts';
+import type { ConversationContextWindowEntry } from './orchestrator/types.ts';
+import { writeDebugContextFile } from '../sessions/debug-context-writer.ts';
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'fs';
 import { tmpdir } from 'node:os';
 import { join } from 'path';
@@ -90,7 +92,7 @@ export {
 // Documentation is served via local files at ~/.craft-agent/docs/
 
 // Import and re-export AgentEvent from core (single source of truth)
-import type { AgentEvent } from '@craft-agent/core/types';
+import type { AgentEvent, AgentEventUsage } from '@craft-agent/core/types';
 export type { AgentEvent };
 
 // Stateless tool matching — pure functions for SDK message → AgentEvent conversion
@@ -141,6 +143,8 @@ export interface ClaudeAgentConfig {
   systemPromptPreset?: 'default' | 'mini' | string;
   /** Workspace-level HookSystem instance (shared across all agents in the workspace) */
   hookSystem?: HookSystem;
+  /** Auth token provider for orchestrator LLM calls. Bypasses process.env race condition. */
+  getAuthToken?: () => Promise<string | null>;
 }
 
 // Permission request tracking
@@ -595,6 +599,8 @@ export class ClaudeAgent extends BaseAgent {
   // In-process MCP servers for source API integrations
   private sourceApiServers: Record<string, ReturnType<typeof createSdkMcpServer>> = {};
   // Source state tracking is now managed by this.sourceManager (inherited from BaseAgent)
+  // Auth token provider for orchestrator LLM calls (injected to bypass process.env race condition)
+  private getAuthTokenFn: (() => Promise<string | null>) | null = null;
   // Safe mode state - user-controlled read-only exploration mode
   private safeMode: boolean = false;
   // SDK tools list (captured from init message)
@@ -621,6 +627,44 @@ export class ClaudeAgent extends BaseAgent {
   // Cached context window size from modelUsage (for real-time usage_update events)
   // This is captured from the first result message and reused for subsequent usage updates
   private cachedContextWindow?: number;
+
+  // ── SDK breakout state ──
+  // Stores context from an orchestrator_sdk_breakout event so runOrchestrator()
+  // can enter an SDK conversation after the generator exits.
+  private _sdkBreakoutContext: {
+    stage: number;
+    name: string;
+    prompt: string;
+    priorOutputs: Record<string, unknown>;
+    agentSlug: string;
+    runId: string;
+  } | null = null;
+
+  // ── Active SDK breakout metadata ──
+  // Set during executeSdkBreakoutStage() to track the in-progress breakout.
+  // Used by checkBreakoutStageCompletion() and auto-resume after SDK completes.
+  private _activeBreakoutMeta: {
+    agentSlug: string;
+    stage: number;
+    stageName: string;
+    runId: string;
+    agent: LoadedAgent;
+  } | null = null;
+
+  // ── SDK breakout system prompt append ──
+  // When set, this is appended to the system prompt during query() construction.
+  // Consumed (read and cleared) by the options builder in chat().
+  private _breakoutSystemPromptAppend: string | null = null;
+
+  // ── Context window logging state ──
+  // Callback for context window entry emission — set by SessionManager to write to context-windows.json
+  public onContextWindowEntry: ((entry: ConversationContextWindowEntry) => void) | null = null;
+  // System prompt append captured at query() construction (Claude Code preset is internal to SDK)
+  private _cwSystemPromptAppend: string = '';
+  // User message captured at query() construction
+  private _cwUserMessage: string = '';
+  // Turn index within the current query() call (0-based, incremented per assistant message)
+  private _cwTurnIndex: number = 0;
 
   /**
    * Get the session ID for mode operations.
@@ -695,6 +739,7 @@ export class ClaudeAgent extends BaseAgent {
     super(backendConfig, DEFAULT_MODEL, CLAUDE_CONTEXT_WINDOW);
 
     this.isHeadless = config.isHeadless ?? false;
+    this.getAuthTokenFn = config.getAuthToken ?? null;
 
     // Log which model is being used (helpful for debugging custom models)
     this.debug(`Using model: ${model}`);
@@ -1052,6 +1097,17 @@ export class ClaudeAgent extends BaseAgent {
         }
       }
 
+      // ── SDK BREAKOUT EXECUTION ─────────────────────────────────────
+      // When an orchestrator stage exits with sdk_breakout, _sdkBreakoutContext
+      // is stored. The user's NEXT chat() call triggers an SDK conversation
+      // for that stage. After the SDK conversation completes and calls
+      // stage_gate(complete), we auto-resume the pipeline.
+      if (this._sdkBreakoutContext) {
+        debug(`[chat] SDK breakout context detected for stage ${this._sdkBreakoutContext.stage} (${this._sdkBreakoutContext.name}) — entering SDK breakout execution`);
+        yield* this.executeSdkBreakoutStage(userMessage, attachments);
+        return;
+      }
+
       // ── ORCHESTRATOR DETECTION (with breakout resume check) ─────────
       // FIRST: Check if the mentioned agent has a resumable broken-out pipeline.
       // If so, offer to resume instead of blindly starting fresh.
@@ -1093,7 +1149,7 @@ export class ClaudeAgent extends BaseAgent {
           }
 
           debug(`[chat] Detected orchestratable agent: ${orchestratableAgent.slug} — delegating to orchestrator`);
-          yield* this.runOrchestrator(userMessage, orchestratableAgent);
+          yield* this.runOrchestrator(userMessage, orchestratableAgent, attachments);
           return;
         }
       }
@@ -1207,12 +1263,21 @@ export class ClaudeAgent extends BaseAgent {
               type: 'preset' as const,
               preset: 'claude_code' as const,
               // Working directory included for monorepo context file discovery
-              append: getSystemPrompt(
-                this.pinnedPreferencesPrompt ?? undefined,
-                this.config.debugMode,
-                this.workspaceRootPath,
-                this.config.session?.workingDirectory
-              ),
+              // SDK breakout: append stage context when breakout is active.
+              // F2 fix: conditional on _activeBreakoutMeta (not consumed-and-nulled).
+              // Normal chat turns after breakout completion get a clean system prompt.
+              append: (() => {
+                const base = getSystemPrompt(
+                  this.pinnedPreferencesPrompt ?? undefined,
+                  this.config.debugMode,
+                  this.workspaceRootPath,
+                  this.config.session?.workingDirectory
+                );
+                if (this._activeBreakoutMeta && this._breakoutSystemPromptAppend) {
+                  return base + '\n\n' + this._breakoutSystemPromptAppend;
+                }
+                return base;
+              })(),
             },
         // Use sdkCwd for SDK session storage - this is set once at session creation and never changes.
         // This ensures SDK can always find session transcripts regardless of workingDirectory changes.
@@ -1816,20 +1881,38 @@ export class ClaudeAgent extends BaseAgent {
         !attachments?.length;
 
       // Create the query - handle slash commands, binary attachments, or regular messages
+      // Reset context window logging state for this query()
+      this._cwTurnIndex = 0;
       if (isSlashCommand) {
         // Send slash commands directly to SDK without context wrapping.
         // The SDK processes these as internal commands (e.g., /compact triggers compaction).
         debug(`[chat] Detected SDK slash command: ${trimmedMessage}`);
+        this._cwSystemPromptAppend = '';
+        this._cwUserMessage = trimmedMessage;
         this.currentQuery = query({ prompt: trimmedMessage, options: optionsWithAbort });
       } else if (hasBinaryAttachments) {
         const sdkMessage = this.buildSDKUserMessage(userMessage, attachments);
         async function* singleMessage(): AsyncIterable<SDKUserMessage> {
           yield sdkMessage;
         }
+        this._cwSystemPromptAppend = getSystemPrompt(
+          this.pinnedPreferencesPrompt ?? undefined,
+          this.config.debugMode,
+          this.workspaceRootPath,
+          this.config.session?.workingDirectory
+        );
+        this._cwUserMessage = userMessage;
         this.currentQuery = query({ prompt: singleMessage(), options: optionsWithAbort });
       } else {
         // Simple string prompt for text-only messages (may include text file contents)
         const prompt = this.buildTextPrompt(userMessage, attachments);
+        this._cwSystemPromptAppend = getSystemPrompt(
+          this.pinnedPreferencesPrompt ?? undefined,
+          this.config.debugMode,
+          this.workspaceRootPath,
+          this.config.session?.workingDirectory
+        );
+        this._cwUserMessage = prompt;
         this.currentQuery = query({ prompt, options: optionsWithAbort });
       }
 
@@ -1869,6 +1952,12 @@ export class ClaudeAgent extends BaseAgent {
 
       // Process SDK messages and convert to AgentEvents
       let receivedComplete = false;
+      // Deferred usage from a 'complete' event suppressed during SDK breakout.
+      // When _activeBreakoutMeta is set, we must NOT yield 'complete' (it would
+      // trigger generator.return() from the consumer, killing the chain before
+      // checkAndResumeBreakout() can execute). The usage is emitted post-loop
+      // via 'usage_update' so token tracking is preserved.
+      let deferredCompleteUsage: AgentEventUsage | undefined;
       // Track text waiting for stop_reason from message_delta
       let pendingTextForStopReason: string | null = null;
       // Track current turn ID from message_start (correlation ID for grouping events)
@@ -1996,6 +2085,15 @@ export class ClaudeAgent extends BaseAgent {
 
             if (event.type === 'complete') {
               receivedComplete = true;
+              // When inside an SDK breakout, defer the 'complete' yield.
+              // Yielding 'complete' triggers generator.return() from the consumer
+              // (sessions.ts), killing the yield* chain before post-loop code
+              // (checkAndResumeBreakout) can execute. Instead, capture usage and
+              // let the for-await loop exit naturally when the SDK has no more messages.
+              if (this._activeBreakoutMeta) {
+                deferredCompleteUsage = event.usage;
+                continue;
+              }
             }
             yield event;
           }
@@ -2033,6 +2131,26 @@ export class ClaudeAgent extends BaseAgent {
         if (pendingTextForStopReason) {
           yield { type: 'text_complete', text: pendingTextForStopReason, isIntermediate: false, turnId: currentTurnId || undefined };
           pendingTextForStopReason = null;
+        }
+
+        // Post-turn breakout completion check — runs on EVERY turn while
+        // breakout is active. If the stage was completed via stage_gate(complete),
+        // auto-resumes the orchestrator pipeline. (F3 fix: precise insertion point
+        // after for-await loop + pending flush, before defensive yield complete.)
+        if (this._activeBreakoutMeta) {
+          // Emit deferred usage via usage_update before auto-resume check.
+          // Can't yield 'complete' here (would trigger generator.return()),
+          // but usage_update lets sessions.ts track tokens without ending the turn.
+          if (deferredCompleteUsage) {
+            yield { type: 'usage_update', usage: deferredCompleteUsage };
+          }
+          yield* this.checkAndResumeBreakout();
+          // Only reachable if auto-resume did NOT fire (stage not completed).
+          // Auto-resume path: generator.return() from the eventual 'complete'
+          // inside the orchestrator kills the chain before reaching here.
+          // Yield 'complete' without usage (already tracked via usage_update above).
+          yield { type: 'complete' };
+          return;
         }
 
         // Defensive: emit complete if SDK didn't send result message
@@ -2772,6 +2890,76 @@ export class ClaudeAgent extends BaseAgent {
           if (block.type === 'text') {
             textContent += block.text;
           }
+        }
+
+        // ── Context window logging — emit per-turn entry ──
+        try {
+          if (this.onContextWindowEntry) {
+            const cwIsSidechain = message.parent_tool_use_id !== null;
+            const cwEntry: ConversationContextWindowEntry = {
+              source: 'conversation',
+              timestamp: new Date().toISOString(),
+              durationMs: null, // per-turn timing not available from SDK
+              turnIndex: this._cwTurnIndex,
+              turnId: message.message.id ?? null,
+              isSidechain: cwIsSidechain,
+              parentToolUseId: message.parent_tool_use_id ?? null,
+              model: message.message.model,
+              input: {
+                systemPromptAppend: cwIsSidechain
+                  ? '[subagent — system prompt unknown]'
+                  : this._cwSystemPromptAppend,
+                userMessage: cwIsSidechain
+                  ? '[subagent — message unknown]'
+                  : (this._cwTurnIndex === 0 ? this._cwUserMessage : '[SDK-managed turn]'),
+                inputTokens: message.message.usage?.input_tokens ?? 0,
+              },
+              output: {
+                responseText: textContent,
+                stopReason: message.message.stop_reason ?? null,
+              },
+              usage: {
+                inputTokens: message.message.usage?.input_tokens ?? 0,
+                outputTokens: message.message.usage?.output_tokens ?? 0,
+                cacheReadTokens: message.message.usage?.cache_read_input_tokens ?? undefined,
+                cacheCreationTokens: message.message.usage?.cache_creation_input_tokens ?? undefined,
+              },
+              costUsd: null,        // cumulative only — available from result message
+              contextWindow: null,  // cumulative only — available from result message
+            };
+            this.onContextWindowEntry(cwEntry);
+            this._cwTurnIndex++;
+          }
+        } catch (cwErr) {
+          // Context window logging is a diagnostic side-effect — never crash the conversation
+          console.warn('[ClaudeAgent] Failed to emit context window entry:', cwErr);
+        }
+
+        // ── Debug context file writing — SDK/breakout turns (Phase 7) ──
+        // Only writes debug files during agent breakout conversations.
+        // Normal chat produces no debug files (intentional — F5 fix).
+        if (this._activeBreakoutMeta && sessionDir) {
+          const meta = this._activeBreakoutMeta;
+          writeDebugContextFile({
+            sessionPath: sessionDir,
+            agentSlug: meta.agentSlug,
+            stage: meta.stage,
+            stageName: meta.stageName,
+            step: `sdk_turn_${this._cwTurnIndex - 1}`,
+            turnIndex: this._cwTurnIndex - 1,
+            model: message.message.model,
+            durationMs: null,
+            usage: {
+              inputTokens: message.message.usage?.input_tokens ?? 0,
+              outputTokens: message.message.usage?.output_tokens ?? 0,
+              cacheReadTokens: message.message.usage?.cache_read_input_tokens ?? undefined,
+            },
+            systemPrompt: this._cwSystemPromptAppend,
+            userMessage: this._cwTurnIndex <= 1
+              ? this._cwUserMessage
+              : '[SDK-managed turn]',
+            response: textContent,
+          });
         }
 
         // Stateless tool start extraction — uses SDK's parent_tool_use_id directly.
@@ -3738,20 +3926,39 @@ export class ClaudeAgent extends BaseAgent {
    */
   private writeOrchestratorBridgeState(
     sessionPath: string, agentSlug: string, stage: number, runId: string,
+    options?: { breakout?: boolean },
   ): void {
+    const isBreakout = options?.breakout === true;
     const agentDataDir = join(sessionPath, 'data', 'agents', agentSlug);
     mkdirSync(agentDataDir, { recursive: true });
     const statePath = join(agentDataDir, 'current-run-state.json');
-    writeFileSync(statePath, JSON.stringify({
+
+    // Breakout vs pause produce different bridge states:
+    // - Pause: sets pausedAtStage (blocks stage_gate(complete) until resumed),
+    //   marks all stages up to and including this one as complete.
+    // - Breakout: sets breakoutStage (scope-locks to this stage only),
+    //   does NOT set pausedAtStage (so stage_gate(complete) succeeds),
+    //   marks only stages BEFORE this one as complete (breakout stage is in-progress).
+    const bridgeState: Record<string, unknown> = {
       runId,
-      pausedAtStage: stage,
       orchestratorMode: true,
       currentStage: stage,
-      completedStages: Array.from({ length: stage + 1 }, (_, i) => i),
       startedAt: new Date().toISOString(),
       lastEventAt: new Date().toISOString(),
-    }, null, 2), 'utf-8');
-    this.onDebug?.(`[orchestrator] writeOrchestratorBridgeState: agent=${agentSlug} stage=${stage} runId=${runId} path=${statePath}`);
+    };
+
+    if (isBreakout) {
+      bridgeState.breakoutStage = stage;
+      // Breakout stage is in-progress — only prior stages are complete
+      bridgeState.completedStages = Array.from({ length: stage }, (_, i) => i);
+    } else {
+      bridgeState.pausedAtStage = stage;
+      // Pause stage is complete (output already stored by orchestrator)
+      bridgeState.completedStages = Array.from({ length: stage + 1 }, (_, i) => i);
+    }
+
+    writeFileSync(statePath, JSON.stringify(bridgeState, null, 2), 'utf-8');
+    this.onDebug?.(`[orchestrator] writeOrchestratorBridgeState: agent=${agentSlug} stage=${stage} runId=${runId} breakout=${isBreakout} path=${statePath}`);
   }
 
   /**
@@ -3976,8 +4183,19 @@ export class ClaudeAgent extends BaseAgent {
    */
   private async *resumeFromBreakoutOrchestrator(
     userMessage: string,
-    resumableInfo: { slug: string; agent: LoadedAgent; resumeFromStage: number },
+    resumableInfo: {
+      slug: string;
+      agent: LoadedAgent;
+      resumeFromStage: number;
+      breakoutStageResult?: { stageId: number; data: Record<string, unknown> };
+    },
   ): AsyncGenerator<AgentEvent> {
+    // Defensive cleanup: clear breakout state — the resume itself supersedes
+    // any active breakout. checkAndResumeBreakout() also clears before calling
+    // this method, but this is belt-and-suspenders for direct callers. (F1)
+    this._activeBreakoutMeta = null;
+    this._breakoutSystemPromptAppend = null;
+
     const sessionId = this.config.session?.id ?? `orch-${Date.now()}`;
     const sessionPath = getSessionPath(this.workspaceRootPath, sessionId);
     const agentConfig = this.toOrchestratorAgentConfig(resumableInfo.agent);
@@ -3997,10 +4215,15 @@ export class ClaudeAgent extends BaseAgent {
     const costTracker = new CostTracker({ budgetUsd });
 
     // ── MCP Bridge wiring (same as runOrchestrator / resumeOrchestrator) ──
+    // Debug mode: skip bridge — null guards handle all stages.
     let mcpBridge: OrchestratorMcpBridge_T | null = null;
     const mcpLifecycle = new McpLifecycleManager();
+    const isDebugMode = agentConfig.debug?.enabled || process.env['AGENT_DEBUG'] === '1';
 
     try {
+      if (isDebugMode) {
+        this.onDebug?.('[orchestrator] Debug mode active (resumeFromBreakout) — skipping MCP bridge connection');
+      } else {
       const mcpSourceSlug = resumableInfo.agent.metadata.sources
         ?.find(s => s.required)?.slug;
 
@@ -4027,6 +4250,7 @@ export class ClaudeAgent extends BaseAgent {
           );
         }
       }
+      } // end debug mode else
 
       // Create orchestrator instance for resume-from-breakout
       const orchTurnId = `orch-${runId}`;
@@ -4118,7 +4342,7 @@ export class ClaudeAgent extends BaseAgent {
 
       // ── Resume pipeline from breakout state ────────────────────────
       exitReason = yield* this.processOrchestratorEvents(
-        orchestrator.resumeFromBreakout(userMessage, agentConfig, fromStage),
+        orchestrator.resumeFromBreakout(userMessage, agentConfig, fromStage, resumableInfo.breakoutStageResult),
         agentSlug, runId, sessionPath,
       );
     } catch (error) {
@@ -4136,12 +4360,18 @@ export class ClaudeAgent extends BaseAgent {
 
     // G6: pipeline-summary.json is overwritten here — intentional.
     // The summary should reflect the latest state after resumption.
+    //
+    // AUTO-CHAIN: When exitReason is 'sdk_breakout', we skip the 'complete' yield
+    // so the generator stays alive. After cleanup in finally, we chain directly
+    // into executeSdkBreakoutStage() — eliminating the double-continue problem.
     try {
-      yield { type: 'complete' };
+      if (exitReason !== 'sdk_breakout') {
+        yield { type: 'complete' };
+      }
     } finally {
       this.onDebug?.(`[orchestrator] ResumeFromBreakout cleanup: exitReason=${exitReason}`);
       this.writePipelineSummary(sessionPath, agentConfig.controlFlow.stages.length, exitReason);
-      if (exitReason !== 'paused') {
+      if (exitReason !== 'paused' && exitReason !== 'sdk_breakout') {
         this.clearOrchestratorBridgeState(sessionPath, agentSlug);
       }
       try {
@@ -4149,6 +4379,14 @@ export class ClaudeAgent extends BaseAgent {
       } catch {
         // Best-effort MCP cleanup
       }
+    }
+
+    // AUTO-CHAIN: After orchestrator cleanup, chain directly into SDK breakout
+    // execution within the same turn. MCP lifecycle is closed, pipeline summary
+    // is written, bridge state is preserved — safe to start SDK conversation.
+    if (exitReason === 'sdk_breakout' && this._sdkBreakoutContext) {
+      this.onDebug?.(`[orchestrator] Auto-chaining into SDK breakout stage ${this._sdkBreakoutContext.stage} (${this._sdkBreakoutContext.name})`);
+      yield* this.executeSdkBreakoutStage(userMessage);
     }
   }
 
@@ -4222,6 +4460,146 @@ export class ClaudeAgent extends BaseAgent {
     return sessionId;
   }
 
+  // ──────────────────────────────────────────────────────────────────────
+  // DEV-LOOP OUTER LOOP HELPERS
+  // ──────────────────────────────────────────────────────────────────────
+
+  /**
+   * Check if a completed pipeline's last stage contains a restart/escalate decision.
+   * Returns the decision ('done', 'restart', 'escalate') or null if not a dev-loop agent.
+   */
+  private checkDevLoopRestartDecision(
+    sessionPath: string,
+    agentSlug: string,
+    agentConfig: OrchestratorAgentConfig,
+  ): 'done' | 'restart' | 'escalate' | null {
+    // Only applies to agents with a 'decide' stage
+    const decideStage = agentConfig.controlFlow.stages.find(s => s.name === 'decide');
+    if (!decideStage) return null;
+
+    try {
+      const state = PipelineState.loadFrom(sessionPath);
+      if (!state) return null;
+
+      const stageOutput = state.getStageOutput(decideStage.id);
+      if (!stageOutput?.data) return null;
+
+      const decision = stageOutput.data['decision'];
+      if (decision === 'restart' || decision === 'escalate' || decision === 'done') {
+        this.onDebug?.(`[orchestrator] Dev-loop decision: ${decision}`);
+        return decision;
+      }
+    } catch (error) {
+      this.onDebug?.(
+        `[orchestrator] checkDevLoopRestartDecision error: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    return null;
+  }
+
+  /**
+   * Update the dev-loop agent's persistent state with iteration tracking.
+   * Writes to the agent_state file (same format as agent_state MCP tool).
+   */
+  private updateDevLoopIterationState(
+    sessionPath: string,
+    agentSlug: string,
+    outerLoopCount: number,
+  ): void {
+    const stateDir = join(sessionPath, 'data', 'agents', agentSlug);
+    const statePath = join(stateDir, 'state.json');
+
+    try {
+      if (!existsSync(stateDir)) {
+        mkdirSync(stateDir, { recursive: true });
+      }
+
+      let currentState: Record<string, unknown> = {};
+      if (existsSync(statePath)) {
+        const raw = readFileSync(statePath, 'utf-8');
+        currentState = JSON.parse(raw) as Record<string, unknown>;
+      }
+
+      // Update iteration tracking
+      const iterationHistory = (currentState['iteration_history'] as Record<string, unknown>) ?? {};
+      iterationHistory['outer_loop_count'] = outerLoopCount;
+
+      // Capture bug history from Stage 5 output if available
+      try {
+        const state = PipelineState.loadFrom(sessionPath);
+        const stage5Output = state?.getStageOutput(5);
+        if (stage5Output?.data) {
+          const bugHistory = (currentState['bug_history'] as unknown[]) ?? [];
+          bugHistory.push({
+            iteration: outerLoopCount,
+            timestamp: new Date().toISOString(),
+            total_tests: stage5Output.data['total_tests'],
+            failed_count: stage5Output.data['failed_tests']
+              ? (stage5Output.data['failed_tests'] as unknown[]).length
+              : 0,
+            bugs: stage5Output.data['bugs'],
+          });
+          currentState['bug_history'] = bugHistory;
+        }
+      } catch {
+        // Best-effort bug history capture
+      }
+
+      currentState['iteration_history'] = iterationHistory;
+      writeFileSync(statePath, JSON.stringify(currentState, null, 2), 'utf-8');
+      this.onDebug?.(`[orchestrator] Dev-loop state updated: outerLoop=${outerLoopCount}`);
+    } catch (error) {
+      this.onDebug?.(
+        `[orchestrator] updateDevLoopIterationState error: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  /**
+   * Build an escalation report from the pipeline's Stage 6 output and iteration history.
+   */
+  private buildEscalationReport(sessionPath: string, agentSlug: string): string {
+    const lines: string[] = [];
+    lines.push('**Escalation Report**');
+    lines.push('');
+    lines.push('The development loop has determined that the remaining issues cannot be resolved automatically.');
+    lines.push('');
+
+    try {
+      const state = PipelineState.loadFrom(sessionPath);
+      const stage6Output = state?.getStageOutput(6);
+      if (stage6Output?.data) {
+        const bugSummary = stage6Output.data['bug_summary'];
+        const nextAction = stage6Output.data['next_action'];
+        if (typeof bugSummary === 'string') {
+          lines.push(`**Bug Summary**: ${bugSummary}`);
+          lines.push('');
+        }
+        if (typeof nextAction === 'string') {
+          lines.push(`**Recommended Action**: ${nextAction}`);
+          lines.push('');
+        }
+      }
+
+      // Include iteration history from agent state
+      const statePath = join(sessionPath, 'data', 'agents', agentSlug, 'state.json');
+      if (existsSync(statePath)) {
+        const raw = readFileSync(statePath, 'utf-8');
+        const agentState = JSON.parse(raw) as Record<string, unknown>;
+        const iterationHistory = agentState['iteration_history'] as Record<string, unknown> | undefined;
+        if (iterationHistory) {
+          lines.push(`**Iterations**: ${iterationHistory['outer_loop_count'] ?? 0} outer loop restarts`);
+          lines.push('');
+        }
+      }
+    } catch {
+      // Best-effort report building
+    }
+
+    lines.push('Please review the issues above and provide manual guidance to continue.');
+    return lines.join('\n');
+  }
+
   /**
    * Convert a LoadedAgent's config to the orchestrator's AgentConfig type.
    * Maps from the richer agents/types.ts AgentConfig to the simpler orchestrator/types.ts AgentConfig.
@@ -4236,8 +4614,13 @@ export class ClaudeAgent extends BaseAgent {
           id: s.id,
           name: s.name,
           description: s.description,
+          ...(s.mode ? { mode: s.mode } : {}),
+          ...(s.pauseInstructions ? { pauseInstructions: s.pauseInstructions } : {}),
+          ...(s.pauseDisplayFields ? { pauseDisplayFields: s.pauseDisplayFields } : {}),
+          ...(s.pauseChoices ? { pauseChoices: s.pauseChoices } : {}),
         })),
         pauseAfterStages: cfg.controlFlow.pauseAfterStages,
+        autoAdvance: cfg.controlFlow.autoAdvance,
         repairUnits: cfg.controlFlow.repairUnits?.map(ru => ({
           stages: Array.isArray(ru.stages) ? [...ru.stages] : [],
           maxIterations: ru.maxIterations,
@@ -4272,10 +4655,18 @@ export class ClaudeAgent extends BaseAgent {
         : undefined,
       // Resolve per-stage prompt files from agent directory (Phase 7)
       promptsDir: agent.path ? join(agent.path, 'prompts') : undefined,
+      // Workspace root for metadata gathering (dev-loop Stage 0 context)
+      workspacePath: this.workspaceRootPath,
       // Follow-up configuration for delta retrieval gating (Section 18)
       followUp: cfg.followUp ? {
         enabled: cfg.followUp.enabled,
         deltaRetrieval: cfg.followUp.deltaRetrieval,
+      } : undefined,
+      // Debug overrides — skip MCP bridge when enabled (config.json or AGENT_DEBUG=1)
+      debug: cfg.debug?.enabled ? {
+        enabled: true,
+        skipWebSearch: cfg.debug.skipWebSearch,
+        skipVerification: cfg.debug.skipVerification,
       } : undefined,
     };
   }
@@ -4286,6 +4677,13 @@ export class ClaudeAgent extends BaseAgent {
    * OAuth token is preferred; falls back to API key.
    */
   private async getOrchestratorAuthToken(): Promise<string> {
+    // Prefer injected provider (immune to env var race condition)
+    if (this.getAuthTokenFn) {
+      const token = await this.getAuthTokenFn();
+      if (token) return token;
+    }
+
+    // Fallback: env vars (for tests and non-Electron contexts)
     const oauthToken = process.env['CLAUDE_CODE_OAUTH_TOKEN'];
     if (oauthToken) return oauthToken;
 
@@ -4293,6 +4691,57 @@ export class ClaudeAgent extends BaseAgent {
     if (apiKey) return apiKey;
 
     throw new Error('No auth token available for orchestrator. Set CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY.');
+  }
+
+  /**
+   * Embed attachment content inline in the user message for orchestrator context.
+   *
+   * Text attachments are inlined as XML blocks (capped at 20KB each).
+   * Image/PDF attachments get a path reference only (LLM can't see binary in orchestrator mode).
+   * Checks `attachment.text` first (F7), then falls back to `readFileSync(storedPath)`.
+   */
+  private embedAttachmentContext(userMessage: string, attachments?: FileAttachment[]): string {
+    if (!attachments || attachments.length === 0) return userMessage;
+
+    const blocks: string[] = [];
+    const MAX_BYTES = 20 * 1024; // 20KB cap per attachment
+
+    for (const att of attachments) {
+      if (att.type === 'text' || att.type === 'office') {
+        // Text-based: inline content
+        let content = att.text; // F7: check in-memory text first
+        if (content === undefined && att.storedPath) {
+          try {
+            content = readFileSync(att.storedPath, 'utf-8');
+          } catch {
+            content = undefined;
+          }
+        }
+        // Office files may have markdown conversion
+        if (content === undefined && att.markdownPath) {
+          try {
+            content = readFileSync(att.markdownPath, 'utf-8');
+          } catch {
+            content = undefined;
+          }
+        }
+        if (content) {
+          if (content.length > MAX_BYTES) {
+            content = content.slice(0, MAX_BYTES) + `\n\n[Truncated — file exceeds 20KB limit. Full file: ${att.name}]`;
+          }
+          blocks.push(`<ATTACHED_FILE name="${att.name}">\n${content}\n</ATTACHED_FILE>`);
+        } else {
+          blocks.push(`[Attached: ${att.name} (content could not be read)]`);
+        }
+      } else {
+        // Image/PDF/unknown: path reference only
+        const pathRef = att.storedPath ?? att.path;
+        blocks.push(`[Attached: ${att.name} (${att.type}, stored at: ${pathRef})]`);
+      }
+    }
+
+    if (blocks.length === 0) return userMessage;
+    return userMessage + '\n\n' + blocks.join('\n\n');
   }
 
   /**
@@ -4314,7 +4763,12 @@ export class ClaudeAgent extends BaseAgent {
   private async *runOrchestrator(
     userMessage: string,
     loadedAgent: LoadedAgent,
+    attachments?: FileAttachment[],
   ): AsyncGenerator<AgentEvent> {
+    // Defensive cleanup: clear stale breakout state from any previous run (F1)
+    this._activeBreakoutMeta = null;
+    this._breakoutSystemPromptAppend = null;
+
     const sessionId = this.config.session?.id ?? `orch-${Date.now()}`;
     const sessionPath = getSessionPath(this.workspaceRootPath, sessionId);
     const agentConfig = this.toOrchestratorAgentConfig(loadedAgent);
@@ -4333,10 +4787,15 @@ export class ClaudeAgent extends BaseAgent {
     // ── MCP Bridge wiring ──────────────────────────────────────────────
     // Connect to the agent's required MCP source for programmatic tool calls.
     // The lifecycle manager ensures cleanup on completion or error.
+    // Debug mode (config.json or AGENT_DEBUG=1): skip bridge — null guards handle all stages.
     let mcpBridge: OrchestratorMcpBridge_T | null = null;
     const mcpLifecycle = new McpLifecycleManager();
+    const isDebugMode = agentConfig.debug?.enabled || process.env['AGENT_DEBUG'] === '1';
 
     try {
+      if (isDebugMode) {
+        this.onDebug?.('[orchestrator] Debug mode active — skipping MCP bridge connection');
+      } else {
       // Find first required MCP source from agent metadata
       const mcpSourceSlug = loadedAgent.metadata.sources
         ?.find(s => s.required)?.slug;
@@ -4375,6 +4834,7 @@ export class ClaudeAgent extends BaseAgent {
           );
         }
       }
+      } // end debug mode else
 
       // ── Follow-up auto-detection (Section 21) ─────────────────────
       // Check if a prior completed orchestrator run exists in the same session.
@@ -4481,11 +4941,49 @@ export class ClaudeAgent extends BaseAgent {
         agentConfig.orchestrator ?? undefined,
       );
 
-      // ── Pipeline event loop ────────────────────────────────────────
-      exitReason = yield* this.processOrchestratorEvents(
-        orchestrator.run(userMessage, agentConfig),
-        agentSlug, runId, sessionPath,
-      );
+      // Embed attachment content in the user message (Phase 2: initial run only, not resume)
+      const enrichedMessage = this.embedAttachmentContext(userMessage, attachments);
+
+      // ── Pipeline event loop (with outer loop restart support) ──────
+      let outerLoopCount = 0;
+      const maxOuterLoops = 3;
+
+      while (true) {
+        exitReason = yield* this.processOrchestratorEvents(
+          outerLoopCount === 0
+            ? orchestrator.run(enrichedMessage, agentConfig)
+            : orchestrator.run(enrichedMessage, agentConfig), // Fresh pipeline run on restart
+          agentSlug, runId, sessionPath,
+        );
+
+        // Check for dev-loop outer loop restart decision
+        if (exitReason === 'completed' && outerLoopCount < maxOuterLoops) {
+          const restartDecision = this.checkDevLoopRestartDecision(sessionPath, agentSlug, agentConfig);
+          if (restartDecision === 'restart') {
+            outerLoopCount++;
+            this.updateDevLoopIterationState(sessionPath, agentSlug, outerLoopCount);
+            yield {
+              type: 'text_complete',
+              text: `**Outer Loop Restart** (iteration ${outerLoopCount}/${maxOuterLoops})\n\nTests are still failing but progress is being made. Restarting the implementation cycle with lessons learned.`,
+              isIntermediate: false,
+              turnId: `orch-${runId}-restart-${outerLoopCount}`,
+            };
+            this.onDebug?.(`[orchestrator] Outer loop restart: iteration ${outerLoopCount}`);
+            continue;
+          }
+          if (restartDecision === 'escalate') {
+            const escalationReport = this.buildEscalationReport(sessionPath, agentSlug);
+            yield {
+              type: 'text_complete',
+              text: escalationReport,
+              isIntermediate: false,
+              turnId: `orch-${runId}-escalate`,
+            };
+          }
+          // 'done' or no decision stage — fall through to normal completion
+        }
+        break; // Exit outer loop on non-restart outcomes
+      }
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
       this.onDebug?.(`[orchestrator] Pipeline error: ${errorMessage}`);
@@ -4503,15 +5001,21 @@ export class ClaudeAgent extends BaseAgent {
     // Section 16: Wrap in try/finally so MCP cleanup runs even when
     // sessions.ts returns from the for-await loop on 'complete' (which
     // calls generator.return(), making post-yield code unreachable).
-    // Bridge state is only cleared on 'completed' exit — preserved on 'paused' for resume detection.
+    // Bridge state is only cleared on 'completed' exit — preserved on 'paused' and 'sdk_breakout'.
+    //
+    // AUTO-CHAIN: When exitReason is 'sdk_breakout', we skip the 'complete' yield
+    // so the generator stays alive. After cleanup in finally, we chain directly
+    // into executeSdkBreakoutStage() — eliminating the double-continue problem.
     try {
-      yield { type: 'complete' };
+      if (exitReason !== 'sdk_breakout') {
+        yield { type: 'complete' };
+      }
     } finally {
       this.onDebug?.(`[orchestrator] Cleanup: exitReason=${exitReason}`);
       // Write pipeline summary for context injection on subsequent turns
       this.writePipelineSummary(sessionPath, agentConfig.controlFlow.stages.length, exitReason);
-      // Only clear bridge state when pipeline is done — preserve on pause for resume detection (G4)
-      if (exitReason !== 'paused') {
+      // Only clear bridge state when pipeline is done — preserve on pause and sdk_breakout
+      if (exitReason !== 'paused' && exitReason !== 'sdk_breakout') {
         this.clearOrchestratorBridgeState(sessionPath, agentSlug);
       }
       // Ensure MCP client is closed — guaranteed by finally block (all exit paths)
@@ -4520,6 +5024,14 @@ export class ClaudeAgent extends BaseAgent {
       } catch {
         // Best-effort MCP cleanup
       }
+    }
+
+    // AUTO-CHAIN: After orchestrator cleanup, chain directly into SDK breakout
+    // execution within the same turn. MCP lifecycle is closed, pipeline summary
+    // is written, bridge state is preserved — safe to start SDK conversation.
+    if (exitReason === 'sdk_breakout' && this._sdkBreakoutContext) {
+      this.onDebug?.(`[orchestrator] Auto-chaining into SDK breakout stage ${this._sdkBreakoutContext.stage} (${this._sdkBreakoutContext.name})`);
+      yield* this.executeSdkBreakoutStage(userMessage);
     }
   }
 
@@ -4534,6 +5046,10 @@ export class ClaudeAgent extends BaseAgent {
     userMessage: string,
     loadedAgent: LoadedAgent,
   ): AsyncGenerator<AgentEvent> {
+    // Defensive cleanup: clear stale breakout state (F1)
+    this._activeBreakoutMeta = null;
+    this._breakoutSystemPromptAppend = null;
+
     const sessionId = this.config.session?.id ?? `orch-${Date.now()}`;
     const sessionPath = getSessionPath(this.workspaceRootPath, sessionId);
     const agentConfig = this.toOrchestratorAgentConfig(loadedAgent);
@@ -4554,10 +5070,15 @@ export class ClaudeAgent extends BaseAgent {
     const costTracker = new CostTracker({ budgetUsd });
 
     // ── MCP Bridge wiring (same as runOrchestrator) ────────────────
+    // Debug mode: skip bridge — null guards handle all stages.
     let mcpBridge: OrchestratorMcpBridge_T | null = null;
     const mcpLifecycle = new McpLifecycleManager();
+    const isDebugMode = agentConfig.debug?.enabled || process.env['AGENT_DEBUG'] === '1';
 
     try {
+      if (isDebugMode) {
+        this.onDebug?.('[orchestrator] Debug mode active (resume) — skipping MCP bridge connection');
+      } else {
       const mcpSourceSlug = loadedAgent.metadata.sources
         ?.find(s => s.required)?.slug;
 
@@ -4592,6 +5113,7 @@ export class ClaudeAgent extends BaseAgent {
           );
         }
       }
+      } // end debug mode else
 
       // Create orchestrator instance for resume
       // Compute orchTurnId so the real-time callback and generator use the same turnId
@@ -4704,15 +5226,21 @@ export class ClaudeAgent extends BaseAgent {
     // Section 16: Wrap in try/finally so MCP cleanup runs even when
     // sessions.ts returns from the for-await loop on 'complete' (which
     // calls generator.return(), making post-yield code unreachable).
-    // Bridge state is only cleared on 'completed' exit — preserved on 'paused' for resume detection.
+    // Bridge state is only cleared on 'completed' exit — preserved on 'paused' and 'sdk_breakout'.
+    //
+    // AUTO-CHAIN: When exitReason is 'sdk_breakout', we skip the 'complete' yield
+    // so the generator stays alive. After cleanup in finally, we chain directly
+    // into executeSdkBreakoutStage() — eliminating the double-continue problem.
     try {
-      yield { type: 'complete' };
+      if (exitReason !== 'sdk_breakout') {
+        yield { type: 'complete' };
+      }
     } finally {
       this.onDebug?.(`[orchestrator] Resume cleanup: exitReason=${exitReason}`);
       // Write pipeline summary for context injection on subsequent turns
       this.writePipelineSummary(sessionPath, agentConfig.controlFlow.stages.length, exitReason);
-      // Only clear bridge state when pipeline is done — preserve on pause for resume detection (G4)
-      if (exitReason !== 'paused') {
+      // Only clear bridge state when pipeline is done — preserve on pause and sdk_breakout
+      if (exitReason !== 'paused' && exitReason !== 'sdk_breakout') {
         this.clearOrchestratorBridgeState(sessionPath, agentSlug);
       }
       // Ensure MCP client is closed — guaranteed by finally block (all exit paths)
@@ -4721,6 +5249,14 @@ export class ClaudeAgent extends BaseAgent {
       } catch {
         // Best-effort MCP cleanup
       }
+    }
+
+    // AUTO-CHAIN: After orchestrator cleanup, chain directly into SDK breakout
+    // execution within the same turn. MCP lifecycle is closed, pipeline summary
+    // is written, bridge state is preserved — safe to start SDK conversation.
+    if (exitReason === 'sdk_breakout' && this._sdkBreakoutContext) {
+      this.onDebug?.(`[orchestrator] Auto-chaining into SDK breakout stage ${this._sdkBreakoutContext.stage} (${this._sdkBreakoutContext.name})`);
+      yield* this.executeSdkBreakoutStage(userMessage);
     }
   }
 
@@ -4904,11 +5440,279 @@ export class ClaudeAgent extends BaseAgent {
           });
           exitReason = 'error';
           break;
+
+        case 'orchestrator_sdk_breakout':
+          // Store breakout context for runOrchestrator() to pick up after generator exits
+          this._sdkBreakoutContext = {
+            stage: event.stage,
+            name: event.name,
+            prompt: event.prompt,
+            priorOutputs: event.priorOutputs,
+            agentSlug,
+            runId,
+          };
+
+          // Write bridge state for breakout — sets breakoutStage (scope-locks),
+          // does NOT set pausedAtStage (so stage_gate(complete) succeeds),
+          // does NOT pre-mark the breakout stage as complete.
+          this.writeOrchestratorBridgeState(sessionPath, agentSlug, event.stage, runId, { breakout: true });
+
+          this.onDebug?.(
+            `[orchestrator] SDK breakout: stage ${event.stage} (${event.name}) — switching to SDK conversation`,
+          );
+
+          exitReason = 'sdk_breakout';
+          break;
       }
     }
 
     this.onDebug?.(`[orchestrator] processOrchestratorEvents exiting: exitReason=${exitReason}`);
     return exitReason;
+  }
+
+  // ============================================================
+  // SDK BREAKOUT EXECUTION
+  // ============================================================
+
+  /**
+   * Build the system prompt append for an SDK breakout stage.
+   *
+   * Creates an XML-structured context block that gives the SDK conversation:
+   * - The stage prompt (what to accomplish)
+   * - Prior stage outputs (context from earlier stages)
+   * - Completion instructions (how to call stage_gate(complete) with required schema)
+   */
+  private buildBreakoutSystemPromptAppend(
+    ctx: NonNullable<typeof this._sdkBreakoutContext>,
+  ): string {
+    // Look up required schema fields for completion.
+    // stageOutputSchemas is in config.json but not on the AgentControlFlowConfig type —
+    // access it via the raw config object which preserves all JSON fields.
+    const agent = loadAgent(this.workspaceRootPath, ctx.agentSlug);
+    const rawControlFlow = agent?.config?.controlFlow as Record<string, unknown> | undefined;
+    const schemas = rawControlFlow?.stageOutputSchemas as Record<string, Record<string, unknown>> | undefined;
+    const stageSchema = schemas?.[String(ctx.stage)];
+    const requiredFields: string[] = stageSchema?.required as string[] ?? [];
+    const properties = stageSchema?.properties as Record<string, Record<string, unknown>> ?? {};
+
+    // Build schema description for completion instructions
+    const schemaLines = requiredFields.map((field: string) => {
+      const prop = properties[field];
+      const typeStr = prop?.type ?? 'unknown';
+      const enumValues = prop?.enum as string[] | undefined;
+      const enumStr = enumValues ? ` (one of: ${enumValues.join(', ')})` : '';
+      return `  - "${field}": ${typeStr}${enumStr}`;
+    });
+
+    const priorOutputsJson = JSON.stringify(ctx.priorOutputs, null, 2);
+
+    return [
+      '<SDK_BREAKOUT_CONTEXT>',
+      '',
+      '<STAGE_PROMPT>',
+      ctx.prompt,
+      '</STAGE_PROMPT>',
+      '',
+      '<PRIOR_STAGE_OUTPUTS>',
+      priorOutputsJson,
+      '</PRIOR_STAGE_OUTPUTS>',
+      '',
+      '<COMPLETION_INSTRUCTIONS>',
+      `You are executing stage ${ctx.stage} (${ctx.name}) of an agent pipeline.`,
+      'You have full tool access. Complete the task described in STAGE_PROMPT.',
+      '',
+      'When you are done, you MUST call the agent_stage_gate tool to complete this stage:',
+      '',
+      '  agent_stage_gate({',
+      `    agentSlug: "${ctx.agentSlug}",`,
+      '    action: "complete",',
+      `    stage: ${ctx.stage},`,
+      '    data: {',
+      ...schemaLines.map((l: string) => `      ${l}`),
+      '    }',
+      '  })',
+      '',
+      requiredFields.length > 0
+        ? `Required fields: ${requiredFields.join(', ')}`
+        : 'No specific fields required — pass a summary of your work in the data object.',
+      '',
+      'Do NOT skip calling stage_gate(complete) — the pipeline cannot continue without it.',
+      '</COMPLETION_INSTRUCTIONS>',
+      '',
+      '<SCOPE_BOUNDARY>',
+      `CRITICAL: You are scoped to stage ${ctx.stage} ONLY.`,
+      '- After calling stage_gate(complete), STOP working. Do NOT start the next stage.',
+      '- The orchestrator controls stage progression. You CANNOT advance past stage ' + ctx.stage + '.',
+      '- If the user says "carry on" or "continue" after a pause, call stage_gate(resume) and then STOP.',
+      '- The stage_gate handler will REJECT any attempt to start stage ' + (ctx.stage + 1) + '.',
+      '</SCOPE_BOUNDARY>',
+      '',
+      '</SDK_BREAKOUT_CONTEXT>',
+    ].join('\n');
+  }
+
+  /**
+   * Execute an SDK breakout stage.
+   *
+   * This method is called when _sdkBreakoutContext is set (from a previous
+   * orchestrator run that hit an sdk_breakout stage). It:
+   * 1. Consumes the breakout context
+   * 2. Sets up the breakout system prompt append
+   * 3. Delegates to the normal chat() flow (which picks up the append)
+   * 4. After chat() completes, checks if stage_gate(complete) was called
+   * 5. If so, auto-resumes the orchestrator pipeline
+   */
+  private async *executeSdkBreakoutStage(
+    userMessage: string,
+    attachments?: FileAttachment[],
+  ): AsyncGenerator<AgentEvent> {
+    const ctx = this._sdkBreakoutContext;
+    if (!ctx) return;
+
+    // Consume breakout context (one-shot)
+    this._sdkBreakoutContext = null;
+
+    // Resolve the agent for auto-resume later
+    const agent = loadAgent(this.workspaceRootPath, ctx.agentSlug);
+    if (!agent) {
+      yield {
+        type: 'error',
+        message: `SDK breakout: agent "${ctx.agentSlug}" not found. Cannot execute breakout stage.`,
+      };
+      return;
+    }
+
+    // Store metadata for post-completion check
+    this._activeBreakoutMeta = {
+      agentSlug: ctx.agentSlug,
+      stage: ctx.stage,
+      stageName: ctx.name,
+      runId: ctx.runId,
+      agent,
+    };
+
+    this.onDebug?.(
+      `[sdk-breakout] Starting SDK conversation for stage ${ctx.stage} (${ctx.name}) agent=${ctx.agentSlug}`,
+    );
+
+    // Set the breakout system prompt append — consumed by the options builder in chat()
+    this._breakoutSystemPromptAppend = this.buildBreakoutSystemPromptAppend(ctx);
+
+    // Yield a status message so the user sees the stage context
+    yield {
+      type: 'text_complete',
+      text: `**Executing Stage ${ctx.stage} (${ctx.name})** with full tool access...`,
+      isIntermediate: true,
+      turnId: `breakout-${ctx.runId}-start`,
+    };
+
+    // Delegate to normal chat() flow — the system prompt append is already set,
+    // so the SDK conversation will have the stage context injected.
+    // We use yield* to forward all events from chat() to our caller.
+    yield* this.chat(userMessage, attachments);
+
+    // After chat() completes, check if breakout was already handled by the
+    // post-turn check in chat() (step 3.4). If _activeBreakoutMeta was cleared,
+    // that means checkAndResumeBreakout() already triggered auto-resume.
+    if (!this._activeBreakoutMeta) {
+      // F8: Sequential breakout handling — if resumeFromBreakoutOrchestrator()
+      // was called by checkAndResumeBreakout() and another stage is sdk_breakout,
+      // the orchestrator yields again, setting new _sdkBreakoutContext +
+      // _breakoutSystemPromptAppend. The clear-then-set order is correct.
+      return;
+    }
+
+    // Stage was NOT completed during this turn — user must continue working
+    const meta = this._activeBreakoutMeta;
+    this.onDebug?.(
+      `[sdk-breakout] Stage ${meta.stage} NOT completed — user must call stage_gate(complete) or re-invoke agent`,
+    );
+    yield {
+      type: 'text_complete',
+      text: `Stage ${meta.stage} (${meta.stageName}) has not been completed yet. Call \`stage_gate(complete)\` with your results, or send another message to continue working.`,
+      isIntermediate: false,
+      turnId: `breakout-${meta.runId}-pending`,
+    };
+  }
+
+  /**
+   * Post-turn breakout completion check.
+   *
+   * Runs after every chat() turn while _activeBreakoutMeta is set.
+   * If the stage was completed (via stage_gate(complete)), clears breakout
+   * state and auto-resumes the orchestrator pipeline.
+   *
+   * F1 fix: Clears _activeBreakoutMeta and _breakoutSystemPromptAppend
+   * BEFORE calling resumeFromBreakoutOrchestrator() to prevent stale meta
+   * from triggering infinite auto-resume loops on subsequent turns.
+   */
+  private async *checkAndResumeBreakout(): AsyncGenerator<AgentEvent> {
+    const meta = this._activeBreakoutMeta;
+    if (!meta) return;
+
+    const completionData = this.checkBreakoutStageCompletion(meta.agentSlug, meta.stage);
+    if (completionData) {
+      // Clear breakout state BEFORE resuming (F1: prevents infinite auto-resume)
+      this._activeBreakoutMeta = null;
+      this._breakoutSystemPromptAppend = null;
+
+      this.onDebug?.(
+        `[sdk-breakout] Stage ${meta.stage} completed — auto-resuming pipeline`,
+      );
+
+      yield* this.resumeFromBreakoutOrchestrator('', {
+        slug: meta.agentSlug,
+        agent: meta.agent,
+        resumeFromStage: meta.stage + 1,
+        breakoutStageResult: { stageId: meta.stage, data: completionData.data },
+      });
+    }
+    // If NOT completed: do nothing — let user continue working in SDK.
+    // The breakout system prompt (still active) guides the LLM.
+  }
+
+  /**
+   * Check if a breakout stage was completed by reading agent-events.jsonl.
+   *
+   * Looks for a stage_completed event matching the breakout stage ID.
+   * Returns the completion data if found, null otherwise.
+   */
+  private checkBreakoutStageCompletion(
+    agentSlug: string,
+    breakoutStageId: number,
+  ): { data: Record<string, unknown> } | null {
+    try {
+      const sessionId = this.config.session?.id;
+      if (!sessionId) return null;
+
+      const eventsPath = `${this.workspaceRootPath}/sessions/${sessionId}/data/agents/${agentSlug}/agent-events.jsonl`;
+
+      if (!existsSync(eventsPath)) return null;
+
+      const content = readFileSync(eventsPath, 'utf-8');
+      const lines = content.trim().split('\n').filter(Boolean);
+
+      // Scan from the end for the most recent stage_completed event for this stage
+      for (let i = lines.length - 1; i >= 0; i--) {
+        try {
+          const event = JSON.parse(lines[i]!);
+          if (event.type === 'stage_completed' && event.data?.stage === breakoutStageId) {
+            // Extract stage output data (everything except internal fields)
+            const { stage: _s, name: _n, ...stageData } = event.data as Record<string, unknown>;
+            return { data: stageData };
+          }
+        } catch {
+          // Skip malformed lines
+        }
+      }
+
+      return null;
+    } catch (err) {
+      this.onDebug?.(
+        `[sdk-breakout] checkBreakoutStageCompletion error: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return null;
+    }
   }
 
   // ============================================================

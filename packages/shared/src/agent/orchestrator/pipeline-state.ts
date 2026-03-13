@@ -39,6 +39,8 @@ interface PipelineStateSnapshot {
   readonly agentSlug?: string;
   /** Session ID of the previous session — enables follow-up context reload across resume boundaries (Section 20 F1/F4/F5). */
   readonly previousSessionId?: string;
+  /** Original user message (with embedded attachments) — enables amend re-run with full context. */
+  readonly originalUserMessage?: string;
   readonly events: readonly StageEvent[];
   readonly currentStage: number;
   /** Stage outputs as a plain object (Map serialized to Record). */
@@ -60,6 +62,9 @@ export class PipelineState {
 
   /** Session ID of the previous session — enables follow-up context reload across resume boundaries (Section 20 F1/F4/F5). */
   readonly previousSessionId?: string;
+
+  /** Original user message (with embedded attachments) — enables amend re-run with full context. */
+  readonly originalUserMessage?: string;
 
   /** Append-only event log — complete audit trail. */
   readonly events: readonly StageEvent[];
@@ -86,18 +91,20 @@ export class PipelineState {
     stageOutputs: ReadonlyMap<number, StageResult>,
     agentSlug: string = '',
     previousSessionId?: string,
+    originalUserMessage?: string,
   ) {
     this.sessionId = sessionId;
     this.agentSlug = agentSlug;
     this.previousSessionId = previousSessionId;
+    this.originalUserMessage = originalUserMessage;
     this.events = events;
     this.currentStage = currentStage;
     this.stageOutputs = stageOutputs;
   }
 
   /** Create a fresh pipeline state for a new session. */
-  static create(sessionId: string, agentSlug: string = '', previousSessionId?: string): PipelineState {
-    return new PipelineState(sessionId, [], -1, new Map(), agentSlug, previousSessionId);
+  static create(sessionId: string, agentSlug: string = '', previousSessionId?: string, originalUserMessage?: string): PipelineState {
+    return new PipelineState(sessionId, [], -1, new Map(), agentSlug, previousSessionId, originalUserMessage);
   }
 
   // ──────────────────────────────────────────────────────────────────────────
@@ -130,7 +137,7 @@ export class PipelineState {
   get isPaused(): boolean {
     const pauseEvents = this.events.filter((e) => e.type === 'pause_requested');
     const resolveEvents = this.events.filter(
-      (e) => e.type === 'resumed' || e.type === 'breakout',
+      (e) => e.type === 'resumed' || e.type === 'breakout' || e.type === 'amended' || e.type === 'cancelled',
     );
     return pauseEvents.length > resolveEvents.length;
   }
@@ -263,9 +270,16 @@ export class PipelineState {
     return { inputTokens, outputTokens };
   }
 
-  /** Count of completed stages. */
+  /** Deduplicated completed stage IDs — handles re-runs from amend (F6). */
+  get uniqueCompletedStages(): number[] {
+    return [...new Set(
+      this.events.filter(e => e.type === 'stage_completed').map(e => e.stage),
+    )].sort((a, b) => a - b);
+  }
+
+  /** Count of unique completed stages (deduped for amend re-runs). */
   get completedStageCount(): number {
-    return this.events.filter((e) => e.type === 'stage_completed').length;
+    return this.uniqueCompletedStages.length;
   }
 
   /** Count of failed stages. */
@@ -307,6 +321,7 @@ export class PipelineState {
       this.stageOutputs,
       this.agentSlug,
       this.previousSessionId,
+      this.originalUserMessage,
     );
   }
 
@@ -326,6 +341,7 @@ export class PipelineState {
       newOutputs,
       this.agentSlug,
       this.previousSessionId,
+      this.originalUserMessage,
     );
   }
 
@@ -436,11 +452,8 @@ export class PipelineState {
     const stage5 = this.getStageOutput(5);
     const outputPath = (stage5?.data?.['outputPath'] as string) ?? null;
 
-    // Completed stages derived from events
-    const completedStages = this.events
-      .filter((e) => e.type === 'stage_completed')
-      .map((e) => e.stage)
-      .sort((a, b) => a - b);
+    // Completed stages derived from events (deduped for amend re-runs — F6)
+    const completedStages = this.uniqueCompletedStages;
 
     const wasPartial = exitReason !== 'completed' || completedStages.length < totalStages;
 
@@ -508,6 +521,7 @@ export class PipelineState {
       sessionId: this.sessionId,
       ...(this.agentSlug ? { agentSlug: this.agentSlug } : {}),
       ...(this.previousSessionId ? { previousSessionId: this.previousSessionId } : {}),
+      ...(this.originalUserMessage ? { originalUserMessage: this.originalUserMessage } : {}),
       events: this.events,
       currentStage: this.currentStage,
       stageOutputs,
@@ -530,6 +544,7 @@ export class PipelineState {
       stageOutputs,
       snapshot.agentSlug ?? '',
       snapshot.previousSessionId,
+      snapshot.originalUserMessage,
     );
   }
 

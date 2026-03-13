@@ -204,6 +204,20 @@ export function SessionMetadataPanel({ sessionId, closeButton }: SessionMetadata
           </div>
         </div>
 
+        {/* Session ID */}
+        <div>
+          <label className="text-xs font-medium text-muted-foreground block mb-1.5 select-none">
+            Session ID
+          </label>
+          <div className="rounded-lg bg-foreground-2 shadow-minimal">
+            <Input
+              value={session.id}
+              readOnly
+              className="h-9 py-2 text-sm border-0 shadow-none bg-transparent focus-visible:ring-0 text-muted-foreground cursor-default"
+            />
+          </div>
+        </div>
+
         {/* Notes */}
         <div>
           <label className="text-xs font-medium text-muted-foreground block mb-1.5 select-none">

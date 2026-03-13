@@ -17,7 +17,7 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "npx tsx --test src/handlers/__tests__/*.test.ts src/handlers/agent-render-output/__tests__/*.test.ts"
+    "test": "npx tsx --test src/handlers/__tests__/*.test.ts src/handlers/agent-render-output/__tests__/*.test.ts src/__tests__/*.test.ts"
   },
   "dependencies": {
     "gray-matter": "^4.0.3"

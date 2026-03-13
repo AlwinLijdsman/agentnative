@@ -29,6 +29,7 @@
  */
 
 import { dirname } from 'path';
+import { clearBreakoutScope, validateStageOutput } from '@craft-agent/agent-pipeline-core';
 import { loadFollowUpContext } from './follow-up-context.ts';
 import { OrchestratorLlmClient } from './llm-client.ts';
 import { PipelineState } from './pipeline-state.ts';
@@ -42,6 +43,8 @@ import type {
   OrchestratorConfig,
   OrchestratorEvent,
   OrchestratorOptions,
+  ResumeAction,
+  StageConfig,
   StreamEvent,
   SubstepEvent,
 } from './types.ts';
@@ -91,6 +94,8 @@ export type {
   OrchestratorEvent,
   OrchestratorOptions,
   PipelineExitReason,
+  ResumeAction,
+  StageMode,
 } from './types.ts';
 
 // ============================================================================
@@ -106,8 +111,13 @@ export interface ResumeIntent {
 /**
  * Parse the user's resume response to detect stage-skip intent.
  *
- * Only active at the Stage 0→1 boundary (pausedAtStage === 0).
+ * Only active at the Stage 0→websearch_calibration boundary.
  * Conservative matching with default-to-run fallback (F6).
+ *
+ * The `nextStageName` parameter gates skip detection to ISA agents
+ * (whose Stage 1 is `websearch_calibration`). Non-ISA agents like
+ * dev-loop have different Stage 1 names (e.g., `plan`) and are
+ * never affected by skip patterns.
  *
  * Recognized skip patterns:
  * - "B" or "b." (option B from Stage 0 prompt)
@@ -118,11 +128,17 @@ export interface ResumeIntent {
  *
  * @param userResponse - The user's text response to the pause prompt
  * @param pausedAtStage - The stage number the pipeline was paused at
+ * @param nextStageName - Name of the next stage (skip only applies when 'websearch_calibration')
  * @returns ResumeIntent with skipNextStage flag
  */
-export function parseResumeIntent(userResponse: string, pausedAtStage: number): ResumeIntent {
-  // Only apply skip detection at Stage 0→1 boundary
-  if (pausedAtStage !== 0) {
+export function parseResumeIntent(
+  userResponse: string,
+  pausedAtStage: number,
+  nextStageName?: string,
+): ResumeIntent {
+  // Only apply skip detection at Stage 0→websearch_calibration boundary.
+  // Non-ISA agents (e.g., dev-loop) have different Stage 1 names and are never affected.
+  if (pausedAtStage !== 0 || nextStageName !== 'websearch_calibration') {
     return { skipNextStage: false };
   }
 
@@ -140,6 +156,52 @@ export function parseResumeIntent(userResponse: string, pausedAtStage: number): 
 
   const skipNextStage = skipPatterns.some(p => p.test(text));
   return { skipNextStage };
+}
+
+/**
+ * Parse the user's resume response to detect amend/cancel/proceed intent.
+ *
+ * Only active when the paused stage has `pauseChoices` configured — ISA agents
+ * have no pauseChoices and are never affected (F5 guard).
+ *
+ * Matching priority:
+ * 1. Numeric choice index ("1" → proceed, "2" → amend, "3" → cancel)
+ * 2. Keyword matching (case-insensitive)
+ * 3. Default: 'proceed' (conservative — don't block on ambiguous input)
+ *
+ * @param userResponse - The user's text response to the pause prompt
+ * @param pauseChoices - Choice labels from stage config (undefined for ISA agents)
+ * @returns ResumeAction ('proceed' | 'amend' | 'cancel')
+ */
+export function parseGenericResumeAction(
+  userResponse: string,
+  pauseChoices?: string[],
+): ResumeAction {
+  // F5 guard: no pauseChoices → always proceed (ISA agents never affected)
+  if (!pauseChoices || pauseChoices.length === 0) {
+    return 'proceed';
+  }
+
+  const text = userResponse.trim();
+
+  // Match numeric choice index
+  if (/^1\.?\s*$/.test(text)) return 'proceed';
+  if (/^2\.?\s*$/.test(text)) return 'amend';
+  if (/^3\.?\s*$/.test(text)) return 'cancel';
+
+  const lower = text.toLowerCase();
+
+  // Match cancel keywords first (more specific)
+  if (/\b(cancel|abort|stop|quit|abandon)\b/.test(lower)) return 'cancel';
+
+  // Match amend keywords
+  if (/\b(amend|adjust|change|modify|revise|update)\b/.test(lower)) return 'amend';
+
+  // Match proceed keywords
+  if (/\b(proceed|approve|go|looks\s+good|confirm|yes|ok|lgtm|accept)\b/.test(lower)) return 'proceed';
+
+  // Default: proceed (conservative — don't block on ambiguous input)
+  return 'proceed';
 }
 
 // ============================================================================
@@ -262,7 +324,7 @@ export class AgentOrchestrator {
       );
     }
 
-    const state = PipelineState.create(this.sessionId, agentConfig.slug, this.previousSessionId);
+    const state = PipelineState.create(this.sessionId, agentConfig.slug, this.previousSessionId, userMessage);
     yield* this.executePipeline(state, userMessage, agentConfig, 0, followUpContext);
   }
 
@@ -302,21 +364,75 @@ export class AgentOrchestrator {
 
     // Record resume event with the user's response
     const pausedStage = state.pausedAtStage;
-    const resumedState = state.addEvent({
+    let resumedState = state.addEvent({
       type: 'resumed',
       stage: pausedStage,
       data: { userResponse },
     });
 
-    // Parse skip intent (Section 20 — F2, F3, F6)
-    const intent = parseResumeIntent(userResponse, pausedStage);
+    // ── Generic resume action parsing (Phase 4 — amend/cancel) ────────
+    // Only active when the paused stage has pauseChoices configured (F5 guard).
+    const stages = agentConfig.controlFlow.stages;
+    const pausedStageConfig = stages[pausedStage];
+    const action = parseGenericResumeAction(userResponse, pausedStageConfig?.pauseChoices);
+
+    this.onDebug?.(
+      `[orchestrator] Resume from stage ${pausedStage}: action=${action}`,
+    );
+
+    // ── Cancel path ───────────────────────────────────────────────────
+    if (action === 'cancel') {
+      resumedState = resumedState.addEvent({
+        type: 'cancelled',
+        stage: pausedStage,
+        data: { userResponse },
+      });
+      resumedState.saveTo(this.sessionPath);
+      yield { type: 'orchestrator_complete', totalCostUsd: 0, stageCount: pausedStage + 1 };
+      return;
+    }
+
+    // ── Amend path — re-run current stage with original context + amendment ──
+    if (action === 'amend') {
+      resumedState = resumedState.addEvent({
+        type: 'amended',
+        stage: pausedStage,
+        data: { amendment: userResponse },
+      });
+      resumedState.saveTo(this.sessionPath);
+
+      // Build re-run message with original context + amendment
+      const rerunMessage = resumedState.originalUserMessage
+        ? resumedState.originalUserMessage + '\n\n[User amendment]: ' + userResponse
+        : userResponse;
+
+      this.onDebug?.(
+        `[orchestrator] Amend re-run: stage=${pausedStage} hasOriginalMessage=${!!resumedState.originalUserMessage}`,
+      );
+
+      // Reload follow-up context for amend re-run
+      let followUpContext: FollowUpContext | null = null;
+      if (resumedState.previousSessionId) {
+        const sessionsDir = dirname(this.sessionPath);
+        followUpContext = loadFollowUpContext(sessionsDir, resumedState.previousSessionId);
+      }
+
+      // Re-run from the paused stage (not pausedStage + 1)
+      yield* this.executePipeline(resumedState, rerunMessage, agentConfig, pausedStage, followUpContext);
+      return;
+    }
+
+    // ── Proceed path (default) ────────────────────────────────────────
+    // Parse ISA skip intent (Section 20 — F2, F3, F6)
+    const nextStage = stages[pausedStage + 1];
+    const intent = parseResumeIntent(userResponse, pausedStage, nextStage?.name);
     const resumeFromStage = pausedStage + 1;
     const skipStages = intent.skipNextStage
       ? new Set<number>([resumeFromStage])
       : new Set<number>();
 
     this.onDebug?.(
-      `[orchestrator] Resume from stage ${pausedStage}: skipNextStage=${intent.skipNextStage}`,
+      `[orchestrator] Proceed: skipNextStage=${intent.skipNextStage}`,
     );
 
     // Reload follow-up context from PipelineState.previousSessionId (Section 20 — F1, F4)
@@ -349,15 +465,24 @@ export class AgentOrchestrator {
    * @param userMessage - The user's message (may include resume intent)
    * @param agentConfig - Agent configuration (must match the original run)
    * @param fromStage - Stage index to resume from (typically lastCompletedStageIndex + 1)
+   * @param breakoutStageResult - Optional result from the SDK breakout stage that just completed.
+   *   When provided, the breakout stage's output is recorded in PipelineState before continuing.
    * @yields OrchestratorEvent items for the remaining stages
    */
   async *resumeFromBreakout(
     userMessage: string,
     agentConfig: AgentConfig,
     fromStage: number,
+    breakoutStageResult?: { stageId: number; data: Record<string, unknown> },
   ): AsyncGenerator<OrchestratorEvent> {
+    // Clear breakout scope FIRST — allows stage gate handler to accept
+    // stage transitions for the remaining pipeline stages. Must happen
+    // before any state loading or event recording. (F9 confirmed: sequential
+    // execution means no race between clear and handler check.)
+    clearBreakoutScope(this.sessionPath, agentConfig.slug);
+
     // Load state from disk
-    const state = PipelineState.loadFrom(this.sessionPath);
+    let state = PipelineState.loadFrom(this.sessionPath);
     if (!state) {
       yield {
         type: 'orchestrator_error',
@@ -374,6 +499,20 @@ export class AgentOrchestrator {
         error: 'Pipeline is not in a resumable-after-breakout state. Cannot resume.',
       };
       return;
+    }
+
+    // If the SDK breakout stage produced a result, record it in PipelineState
+    if (breakoutStageResult) {
+      this.onDebug?.(
+        `[orchestrator] Recording breakout stage ${breakoutStageResult.stageId} result before resuming`,
+      );
+      state = state.setStageOutput(breakoutStageResult.stageId, {
+        text: '',
+        summary: 'SDK breakout stage completed',
+        usage: ZERO_USAGE,
+        data: breakoutStageResult.data,
+      });
+      state.saveTo(this.sessionPath);
     }
 
     // Record resume_from_breakout event
@@ -437,6 +576,9 @@ export class AgentOrchestrator {
     const skips = skipStages ?? new Set<number>();
     let state = initialState;
 
+    // Set agent slug for debug context file writing (Phase 6)
+    this.stageRunner.setAgentSlug(agentConfig.slug);
+
     for (let i = startStageIndex; i < stages.length; i++) {
       const stage = stages[i];
       if (!stage) continue;
@@ -450,7 +592,10 @@ export class AgentOrchestrator {
       if (skips.has(stage.id)) {
         this.onDebug?.(`[orchestrator] Stage ${stage.id} (${stage.name}) SKIPPED by resume intent`);
 
-        // Produce synthetic skipped result with pass-through Stage 0 queries
+        // Produce synthetic skipped result with pass-through Stage 0 queries.
+        // NOTE: This data shape is ISA-specific (websearch_calibration fields).
+        // This is acceptable because skip is gated to nextStageName === 'websearch_calibration'
+        // in parseResumeIntent(), so only ISA agents can reach this code path.
         const stage0Output = state.getStageOutput(0);
         const stage0Queries = stage0Output?.data?.['queries'] ?? [];
         const skippedResult = {
@@ -497,15 +642,72 @@ export class AgentOrchestrator {
       state = state.addEvent({ type: 'stage_started', stage: stage.id, data: {} });
       yield { type: 'orchestrator_stage_start', stage: stage.id, name: stage.name };
 
+      // ── 1b. SDK BREAKOUT — yield control to SDK conversation ────────
+      // Stages with mode: 'sdk_breakout' cannot be executed via direct LLM call.
+      // Instead, we yield a breakout event with the stage prompt and prior outputs,
+      // then exit the generator. The SDK conversation runs with full tool access,
+      // calls stage_gate(complete) to persist results, and the pipeline resumes
+      // via resumeFromBreakout().
+      if (stage.mode === 'sdk_breakout') {
+        // Load stage prompt via StageRunner
+        const prompt = this.stageRunner.getStagePrompt(stage.id, stage.name, agentConfig);
+
+        // Gather prior stage outputs for SDK context injection
+        const priorOutputs: Record<string, unknown> = {};
+        for (const [stageId, output] of state.stageOutputs) {
+          if (output != null) {
+            priorOutputs[`stage_${stageId}_${stages[stageId]?.name ?? 'unknown'}`] = output.data;
+          }
+        }
+
+        // Record breakout event so isResumableAfterBreakout detects this state
+        state = state.addEvent({
+          type: 'breakout',
+          stage: stage.id,
+          data: { reason: 'sdk_breakout', stageName: stage.name },
+        });
+
+        // NOTE: Breakout scope (breakoutStage field in current-run-state.json) is set
+        // by writeOrchestratorBridgeState(breakout: true) in processOrchestratorEvents
+        // (claude-agent.ts), which runs AFTER this yield. The clearBreakoutScope() in
+        // resumeFromBreakout() clears it when the orchestrator resumes.
+
+        // Checkpoint state before yielding breakout
+        state.saveTo(this.sessionPath);
+
+        this.onDebug?.(
+          `[orchestrator] SDK breakout: stage ${stage.id} (${stage.name}) — yielding to SDK conversation`,
+        );
+
+        // Yield breakout event — claude-agent.ts catches this and enters SDK query()
+        yield {
+          type: 'orchestrator_sdk_breakout',
+          stage: stage.id,
+          name: stage.name,
+          prompt,
+          priorOutputs,
+        };
+
+        // Exit generator — same pattern as pause (line 571)
+        // Pipeline continues via resumeFromBreakout() after SDK completes
+        return;
+      }
+
       // ── 2. Check if this is a pause-after stage ──────────────────────
       if (agentConfig.controlFlow.pauseAfterStages?.includes(stage.id)) {
         try {
           // Clear substep queue for this stage
           this.substepQueue.length = 0;
 
+          // Detect amend re-run: if there's an 'amended' event for this stage, force workspace metadata (F2)
+          const isAmendRerun = state.events.some(
+            e => e.type === 'amended' && e.stage === stage.id,
+          );
+
           // Run the stage to generate the pause message
           const pauseResult = await this.stageRunner.runStage(
             stage, state, userMessage, agentConfig, followUpContext,
+            isAmendRerun ? { forceWorkspaceMetadata: true } : undefined,
           );
 
           // Drain substep events collected during stage execution
@@ -521,11 +723,85 @@ export class AgentOrchestrator {
             data: { summary: pauseResult.summary, usage: pauseResult.usage },
           });
 
+          // ── Schema validation for orchestrator-driven pause stages ──
+          // Runs AFTER setStageOutput so state is consistent, but BEFORE
+          // checkpoint so a block enforcement can halt the pipeline.
+          const pauseSchemas = agentConfig.controlFlow.stageOutputSchemas;
+          const pauseStageSchema = pauseSchemas?.[String(stage.id)];
+          if (pauseStageSchema && pauseResult.data) {
+            const validation = validateStageOutput(
+              pauseResult.data as Record<string, unknown>,
+              pauseStageSchema,
+            );
+            if (!validation.valid) {
+              const enforcement = pauseStageSchema.enforcement ?? 'warn';
+              if (enforcement === 'block') {
+                this.onDebug?.(
+                  `[orchestrator] Schema BLOCK for pause stage ${stage.id}: ${validation.warnings.join(', ')}`,
+                );
+                yield {
+                  type: 'orchestrator_error',
+                  stage: stage.id,
+                  error: pauseStageSchema.blockMessage
+                    ?? `Stage ${stage.id} schema validation failed: ${validation.warnings.join(', ')}`,
+                };
+                return;
+              }
+              this.onDebug?.(
+                `[orchestrator] Schema warnings for pause stage ${stage.id}: ${validation.warnings.join(', ')}`,
+              );
+            }
+          }
+
           // Cost tracking even for pause stages
           this.costTracker.recordStage(stage.id, pauseResult.usage);
 
-          // Checkpoint before pausing
+          // Checkpoint state (shared by both auto-advance and pause paths)
           state.saveTo(this.sessionPath);
+
+          // ── BRANCH POINT (F2: after stage_completed, before pause_requested) ──
+          // Auto-advance: stages with pauseChoices ALWAYS pause (F1: preserves Amend/Cancel).
+          // Stages without pauseChoices auto-advance when autoAdvance is enabled.
+          const shouldAutoAdvance = agentConfig.controlFlow.autoAdvance === true
+            && !stage.pauseChoices?.length;
+
+          if (shouldAutoAdvance) {
+            // Format the stage output as informational text (reuse same formatter)
+            const { message: formattedMessage } = formatPauseMessage(
+              stage.id, stage.name, pauseResult.data, pauseResult.text,
+              {
+                onDebug: this.onDebug,
+                costInfo: {
+                  inputTokens: pauseResult.usage.inputTokens,
+                  outputTokens: pauseResult.usage.outputTokens,
+                  costUsd: this.costTracker.totalCostUsd,
+                },
+                pauseInstructions: stage.pauseInstructions,
+                pauseDisplayFields: stage.pauseDisplayFields,
+              },
+            );
+
+            this.onDebug?.(
+              `[orchestrator] Auto-advancing past stage ${stage.id} (${stage.name}) — no pauseChoices`,
+            );
+
+            // Yield stage output as informational text (not a pause event)
+            // F6: onAgentStagePause is correctly NOT called — no pause state exists
+            yield { type: 'text', text: formattedMessage };
+            yield {
+              type: 'orchestrator_stage_complete',
+              stage: stage.id,
+              name: stage.name,
+              stageOutput: pauseResult.data,
+            };
+
+            // F2: do NOT record pause_requested — prevents isPaused corruption
+            // F5: do NOT write bridge state — nothing to resume from
+            // Continue to next stage (no return)
+            continue;
+          }
+
+          // ── Normal pause path (pauseChoices present or autoAdvance disabled) ──
 
           // Record pause event
           state = state.addEvent({ type: 'pause_requested', stage: stage.id, data: {} });
@@ -541,6 +817,8 @@ export class AgentOrchestrator {
                 outputTokens: pauseResult.usage.outputTokens,
                 costUsd: this.costTracker.totalCostUsd,
               },
+              pauseInstructions: stage.pauseInstructions,
+              pauseDisplayFields: stage.pauseDisplayFields,
             },
           );
 
@@ -597,6 +875,38 @@ export class AgentOrchestrator {
           stage: stage.id,
           data: { summary: stageResult.summary, usage: stageResult.usage },
         });
+
+        // ── 4.5 Schema validation for orchestrator-driven stages ───────
+        // Validates LLM output against stageOutputSchemas from config.json.
+        // This is the orchestrator equivalent of the SDK path's validation
+        // in handleComplete() (agent-stage-gate.ts).
+        const runSchemas = agentConfig.controlFlow.stageOutputSchemas;
+        const runStageSchema = runSchemas?.[String(stage.id)];
+        if (runStageSchema && stageResult.data) {
+          const validation = validateStageOutput(
+            stageResult.data as Record<string, unknown>,
+            runStageSchema,
+          );
+          if (!validation.valid) {
+            const enforcement = runStageSchema.enforcement ?? 'warn';
+            if (enforcement === 'block') {
+              this.onDebug?.(
+                `[orchestrator] Schema BLOCK for stage ${stage.id}: ${validation.warnings.join(', ')}`,
+              );
+              state.saveTo(this.sessionPath);
+              yield {
+                type: 'orchestrator_error',
+                stage: stage.id,
+                error: runStageSchema.blockMessage
+                  ?? `Stage ${stage.id} schema validation failed: ${validation.warnings.join(', ')}`,
+              };
+              return;
+            }
+            this.onDebug?.(
+              `[orchestrator] Schema warnings for stage ${stage.id}: ${validation.warnings.join(', ')}`,
+            );
+          }
+        }
 
         // ── 5. Cost tracking ───────────────────────────────────────────
         this.costTracker.recordStage(stage.id, stageResult.usage);
@@ -656,7 +966,7 @@ export class AgentOrchestrator {
    */
   private async *executeRepairLoop(
     completedStageId: number,
-    stages: readonly { id: number; name: string; description?: string }[],
+    stages: readonly StageConfig[],
     repairUnits: readonly { stages: number[]; maxIterations: number; feedbackField: string }[],
     currentState: PipelineState,
     userMessage: string,
@@ -702,6 +1012,52 @@ export class AgentOrchestrator {
         });
 
         yield { type: 'orchestrator_stage_start', stage: repairStageId, name: repairStage.name };
+
+        // ── SDK breakout for repair stages ──────────────────────────────
+        // If a repair stage uses sdk_breakout mode, yield breakout event
+        // and return current state. The pipeline will resume via
+        // resumeFromBreakout() after the SDK completes the repair stage.
+        if (repairStage.mode === 'sdk_breakout') {
+          const prompt = this.stageRunner.getStagePrompt(repairStageId, repairStage.name, agentConfig);
+          const priorOutputs: Record<string, unknown> = {};
+          for (const [stageId, output] of state.stageOutputs) {
+            if (output != null) {
+              priorOutputs[`stage_${stageId}_${stages[stageId]?.name ?? 'unknown'}`] = output.data;
+            }
+          }
+          // Include repair feedback in prior outputs so SDK has context
+          if (feedback) {
+            priorOutputs['repair_feedback'] = feedback;
+            priorOutputs['repair_iteration'] = repairIteration;
+          }
+
+          // Record breakout event so isResumableAfterBreakout detects this state
+          state = state.addEvent({
+            type: 'breakout',
+            stage: repairStageId,
+            data: { reason: 'sdk_breakout', stageName: repairStage.name, repairIteration },
+          });
+
+          // NOTE: Breakout scope is set by writeOrchestratorBridgeState(breakout: true)
+          // in processOrchestratorEvents (claude-agent.ts), called after this yield.
+
+          state.saveTo(this.sessionPath);
+
+          this.onDebug?.(
+            `[orchestrator] SDK breakout in repair loop: stage ${repairStageId} (${repairStage.name}), iteration ${repairIteration}`,
+          );
+
+          yield {
+            type: 'orchestrator_sdk_breakout',
+            stage: repairStageId,
+            name: repairStage.name,
+            prompt,
+            priorOutputs,
+          };
+
+          // Exit — pipeline continues via resumeFromBreakout()
+          return state;
+        }
 
         // Clear substep queue for repair stage
         this.substepQueue.length = 0;
